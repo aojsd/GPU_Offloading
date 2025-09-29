@@ -1,0 +1,1 @@
+sudo podman run -it --rm --gpus all --userns=keep-id -v $(pwd):/work:Z -w /work nvcr.io/nvidia/cuda:12.6.0-devel-ubuntu22.04 make

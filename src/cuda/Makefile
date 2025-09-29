@@ -24,11 +24,15 @@ SRCS = pcie_overlap.cu
 all: $(TARGET)
 
 # Rule to build the target
-$(TARGET): $(SRCS)
+$(TARGET): $(SRCS) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $(BIN_DIR)/$@ $(LDFLAGS)
 
-test: test.cu
+test: test.cu | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $(BIN_DIR)/test $(LDFLAGS)
+
+# Rule to create the bin directory if it doesn't exist
+$(BIN_DIR):
+	mkdir -p $(BIN_DIR)
 
 # Rule to clean up generated files
 clean:

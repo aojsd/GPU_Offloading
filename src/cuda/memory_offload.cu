@@ -10,13 +10,9 @@
  * a fast, GPU-based verification function.
  *
  * Case 1: Explicit Overlap
- * - Uses two CUDA streams: one for computation, one for data transfer.
- * - The offloaded portion of A is allocated in pinned host memory.
- * - An async copy is launched on the transfer stream.
- * - Can occur over PCIe, NVLink, or C2C (for GH200)
- * - The first compute kernel (on resident data) is launched on the compute stream.
- * - A CUDA event ensures the compute stream waits for the transfer to finish before
- * launching the second compute kernel (on the now-transferred data).
+ * - Uses a CUDA Graph to model the dependencies.
+ * - Subcase 1 (default): Offloads to pinned host memory, transfers over PCIe (H2D).
+ * - Subcase 2 (--nvlink): Offloads to a peer GPU's memory, transfers over NVLink (D2D).
  *
  * Case 2: Overlap with UVM Prefetch
  * - Matrices are allocated with `cudaMallocManaged`.
@@ -366,10 +362,15 @@ void runSingleKernelTest(int N, int H, int S, int trials, bool use_uvm, int devi
 }
 
 
-void runExplicitOverlapTest(int N, int H, int S, float offload_ratio, int trials) {
-    std::cout << "\n--- Running Case 1: Explicit Overlap (CUDA Graph Version) ---\n";
+void runExplicitOverlapTest(int N, int H, int S, float offload_ratio, int trials, bool use_nvlink, int deviceId) {
+    if (use_nvlink) {
+        std::cout << "\n--- Running Case 1: Explicit Overlap with NVLink (D2D) ---\n";
+    } else {
+        std::cout << "\n--- Running Case 1: Explicit Overlap with PCIe (H2D) ---\n";
+    }
+
     if (offload_ratio == 0.0f) {
-        runSingleKernelTest(N, H, S, trials, false, 0);
+        runSingleKernelTest(N, H, S, trials, false, deviceId);
         return;
     }
 
@@ -382,15 +383,51 @@ void runExplicitOverlapTest(int N, int H, int S, float offload_ratio, int trials
     
     std::cout << "Resident Rows: " << N_resident << ", Offloaded Rows: " << N_offload << std::endl;
 
+    // --- Conditional Setup for PCIe vs NVLink ---
+    float* h_A_pinned_offload = nullptr; // For PCIe path
+    float* d_A_peer_offload = nullptr;   // For NVLink path
+    cudaMemcpyKind copyKind;
+    int peerDeviceId = -1;
+
+    if (use_nvlink) {
+        int device_count;
+        CHECK_CUDA(cudaGetDeviceCount(&device_count));
+        peerDeviceId = (deviceId + 1) % device_count;
+
+        int canAccessPeer;
+        CHECK_CUDA(cudaDeviceCanAccessPeer(&canAccessPeer, deviceId, peerDeviceId));
+        if (canAccessPeer) {
+            std::cout << "Enabling peer access from Device " << deviceId << " to Device " << peerDeviceId << std::endl;
+            CHECK_CUDA(cudaSetDevice(deviceId));
+            CHECK_CUDA(cudaDeviceEnablePeerAccess(peerDeviceId, 0));
+        } else {
+            std::cerr << "Error: Peer access between Device " << deviceId << " and " << peerDeviceId << " is not supported." << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        
+        CHECK_CUDA(cudaSetDevice(peerDeviceId));
+        CHECK_CUDA(cudaMalloc(&d_A_peer_offload, A_offload_size));
+        CHECK_CUDA(cudaSetDevice(deviceId)); // IMPORTANT: Switch back to primary device
+
+        copyKind = cudaMemcpyDeviceToDevice;
+    } else {
+        CHECK_CUDA(cudaHostAlloc(&h_A_pinned_offload, A_offload_size, cudaHostAllocDefault));
+        copyKind = cudaMemcpyHostToDevice;
+    }
+
     float *d_A, *d_B, *d_C;
-    float* h_A_pinned_offload;
     CHECK_CUDA(cudaMalloc(&d_A, A_size));
     CHECK_CUDA(cudaMalloc(&d_B, B_size));
     CHECK_CUDA(cudaMalloc(&d_C, C_size));
-    CHECK_CUDA(cudaHostAlloc(&h_A_pinned_offload, A_offload_size, cudaHostAllocDefault));
 
     init_matrices_on_gpu(d_A, d_B, N, H, S);
-    CHECK_CUDA(cudaMemcpy(h_A_pinned_offload, d_A + (size_t)N_resident * H, A_offload_size, cudaMemcpyDeviceToHost));
+
+    // Populate the offload source buffer (either on host or peer device)
+    if (use_nvlink) {
+        CHECK_CUDA(cudaMemcpy(d_A_peer_offload, d_A + (size_t)N_resident * H, A_offload_size, cudaMemcpyDeviceToDevice));
+    } else {
+        CHECK_CUDA(cudaMemcpy(h_A_pinned_offload, d_A + (size_t)N_resident * H, A_offload_size, cudaMemcpyDeviceToHost));
+    }
     
     cudaStream_t stream;
     CHECK_CUDA(cudaStreamCreate(&stream));
@@ -400,25 +437,24 @@ void runExplicitOverlapTest(int N, int H, int S, float offload_ratio, int trials
     cudaGraphExec_t graph_exec;
     CHECK_CUDA(cudaGraphCreate(&graph, 0));
 
-    // Create all events once
     cudaEvent_t start, stop, transferStart, transferStop, compute1Start, compute1Stop, compute2Start, compute2Stop;
     CHECK_CUDA(cudaEventCreate(&start)); CHECK_CUDA(cudaEventCreate(&stop));
     CHECK_CUDA(cudaEventCreate(&transferStart)); CHECK_CUDA(cudaEventCreate(&transferStop));
     CHECK_CUDA(cudaEventCreate(&compute1Start)); CHECK_CUDA(cudaEventCreate(&compute1Stop));
     CHECK_CUDA(cudaEventCreate(&compute2Start)); CHECK_CUDA(cudaEventCreate(&compute2Stop));
 
-    // Define nodes
     cudaGraphNode_t start_node, stop_node, memcpy_node, kernel1_node, kernel2_node, sync_node;
     cudaGraphNode_t event_transfer_start, event_transfer_stop, event_compute1_start, event_compute1_stop, event_compute2_start, event_compute2_stop;
 
     CHECK_CUDA(cudaGraphAddEventRecordNode(&start_node, graph, nullptr, 0, start));
 
-    // Branch 1: Transfer
+    // Branch 1: Transfer (Source buffer and copy kind are now dynamic)
+    void* memcpy_src = use_nvlink ? (void*)d_A_peer_offload : (void*)h_A_pinned_offload;
     CHECK_CUDA(cudaGraphAddEventRecordNode(&event_transfer_start, graph, &start_node, 1, transferStart));
-    CHECK_CUDA(cudaGraphAddMemcpyNode1D(&memcpy_node, graph, &event_transfer_start, 1, d_A + (size_t)N_resident * H, h_A_pinned_offload, A_offload_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaGraphAddMemcpyNode1D(&memcpy_node, graph, &event_transfer_start, 1, d_A + (size_t)N_resident * H, memcpy_src, A_offload_size, copyKind));
     CHECK_CUDA(cudaGraphAddEventRecordNode(&event_transfer_stop, graph, &memcpy_node, 1, transferStop));
 
-    // Branch 2: Compute on Resident Data
+    // Branch 2: Compute on Resident Data (unchanged)
     cudaKernelNodeParams kernel1_params = {0};
     kernel1_params.func = (void*)matMulKernel;
     kernel1_params.gridDim = calculate_grid_dims(S, N_resident);
@@ -430,11 +466,11 @@ void runExplicitOverlapTest(int N, int H, int S, float offload_ratio, int trials
     CHECK_CUDA(cudaGraphAddKernelNode(&kernel1_node, graph, &event_compute1_start, 1, &kernel1_params));
     CHECK_CUDA(cudaGraphAddEventRecordNode(&event_compute1_stop, graph, &kernel1_node, 1, compute1Stop));
 
-    // Synchronization Point: Wait for both branches to complete
+    // Synchronization Point (unchanged)
     cudaGraphNode_t sync_deps[] = {event_transfer_stop, event_compute1_stop};
     CHECK_CUDA(cudaGraphAddEmptyNode(&sync_node, graph, sync_deps, 2));
 
-    // Branch 3: Compute on Offloaded Data
+    // Branch 3: Compute on Offloaded Data (unchanged)
     cudaKernelNodeParams kernel2_params = {0};
     kernel2_params.func = (void*)matMulKernel;
     kernel2_params.gridDim = calculate_grid_dims(S, N_offload);
@@ -454,8 +490,9 @@ void runExplicitOverlapTest(int N, int H, int S, float offload_ratio, int trials
     const int WARMUP_COUNT = 5;
     std::cout << "Performing " << WARMUP_COUNT << " warm-up runs... " << std::flush;
     for (int i = 0; i < WARMUP_COUNT; ++i) {
-        // Must reset state before each run, even for warm-ups
-        CHECK_CUDA(cudaMemcpy(h_A_pinned_offload, d_A + (size_t)N_resident * H, A_offload_size, cudaMemcpyDeviceToHost));
+        if (!use_nvlink) { // Only reset state for the PCIe path
+            CHECK_CUDA(cudaMemcpy(h_A_pinned_offload, d_A + (size_t)N_resident * H, A_offload_size, cudaMemcpyDeviceToHost));
+        }
         CHECK_CUDA(cudaGraphLaunch(graph_exec, stream));
     }
     CHECK_CUDA(cudaStreamSynchronize(stream));
@@ -464,7 +501,9 @@ void runExplicitOverlapTest(int N, int H, int S, float offload_ratio, int trials
 
     std::vector<double> total_times, transfer_times, compute1_times, compute2_times;
     for (int i = 0; i < trials; ++i) {
-        CHECK_CUDA(cudaMemcpy(h_A_pinned_offload, d_A + (size_t)N_resident * H, A_offload_size, cudaMemcpyDeviceToHost));
+        if (!use_nvlink) { // Only reset state for the PCIe path
+            CHECK_CUDA(cudaMemcpy(h_A_pinned_offload, d_A + (size_t)N_resident * H, A_offload_size, cudaMemcpyDeviceToHost));
+        }
         
         CHECK_CUDA(cudaGraphLaunch(graph_exec, stream));
         CHECK_CUDA(cudaStreamSynchronize(stream));
@@ -480,15 +519,17 @@ void runExplicitOverlapTest(int N, int H, int S, float offload_ratio, int trials
         compute2_times.push_back(ms_compute2);
     }
     
-    // Reporting is unchanged
     auto avg = [](const std::vector<double>& v) { return std::accumulate(v.begin(), v.end(), 0.0f) / v.size(); };
+    std::string bw_label = use_nvlink ? "NVLink Transfer (D2D):" : "PCIe Transfer (HtoD): ";
+
     std::cout << "\n--- Timings (avg over " << trials << " trials) ---\n";
     std::cout << std::fixed << std::setprecision(3);
-    std::cout << "PCIe Transfer (HtoD):     " << std::setw(8) << avg(transfer_times) << " ms\n";
+    std::cout << bw_label << std::setw(8) << avg(transfer_times) << " ms\n";
     std::cout << "Compute (Resident Data):  " << std::setw(8) << avg(compute1_times) << " ms\n";
     std::cout << "Compute (Offloaded Data): " << std::setw(8) << avg(compute2_times) << " ms\n";
     std::cout << "--------------------------------------\n";
-    std::cout << "PCIe Bandwidth (GB/s): " << std::setw(8) << (A_offload_size / (1e6 * avg(transfer_times))) << " GB/s\n";
+    std::string bw_rate_label = use_nvlink ? "NVLink Bandwidth (GB/s): " : "PCIe Bandwidth (GB/s): ";
+    std::cout << bw_rate_label << std::setw(8) << (A_offload_size / (1e6 * avg(transfer_times))) << " GB/s\n";
     double total_compute_time = avg(compute1_times) + avg(compute2_times);
     std::cout << "GPU Throughput (GB/s): " << std::setw(8) << ((A_size + B_size) / (1e6 * total_compute_time)) << " GB/s\n";
     std::cout << "--------------------------------------\n";
@@ -497,7 +538,13 @@ void runExplicitOverlapTest(int N, int H, int S, float offload_ratio, int trials
     
     verify_result_gpu(d_A, d_B, d_C, N, H, S);
     
-    // Cleanup
+    // --- Conditional Cleanup ---
+    if (use_nvlink) {
+        CHECK_CUDA(cudaFree(d_A_peer_offload));
+        CHECK_CUDA(cudaDeviceDisablePeerAccess(peerDeviceId));
+    } else {
+        CHECK_CUDA(cudaFreeHost(h_A_pinned_offload));
+    }
     delete (int*)kernel1_args[6]; delete (int*)kernel1_args[7];
     delete (int*)kernel2_args[6]; delete (int*)kernel2_args[7];
     CHECK_CUDA(cudaGraphExecDestroy(graph_exec)); CHECK_CUDA(cudaGraphDestroy(graph));
@@ -506,7 +553,7 @@ void runExplicitOverlapTest(int N, int H, int S, float offload_ratio, int trials
     CHECK_CUDA(cudaEventDestroy(compute1Start)); CHECK_CUDA(cudaEventDestroy(compute1Stop));
     CHECK_CUDA(cudaEventDestroy(compute2Start)); CHECK_CUDA(cudaEventDestroy(compute2Stop));
     CHECK_CUDA(cudaFree(d_A)); CHECK_CUDA(cudaFree(d_B)); CHECK_CUDA(cudaFree(d_C));
-    CHECK_CUDA(cudaFreeHost(h_A_pinned_offload)); CHECK_CUDA(cudaStreamDestroy(stream));
+    CHECK_CUDA(cudaStreamDestroy(stream));
 }
 
 void runUvmTest(int N, int H, int S, float offload_ratio, int trials, int deviceId) {
@@ -794,7 +841,7 @@ void runFullCpuOffloadTest(int N, int H, int S, int trials, int deviceId) {
     CHECK_CUDA(cudaStreamDestroy(stream));
 }
 
-// Test case for UVM bandwidth extension on integrated systems like Grace Hopper.
+// NEW: Test case for UVM bandwidth extension on integrated systems like Grace Hopper.
 void runBandwidthExtensionTest(int N, int H, int S, float offload_ratio, int trials, int deviceId) {
     std::cout << "\n--- Running Case 3: Bandwidth Extension (UVM, Single Kernel) ---\n";
     
@@ -925,6 +972,7 @@ void print_usage(const char* prog_name) {
     std::cerr << "\nUsage: " << prog_name << " [options]\n\n";
     std::cerr << "Options:\n";
     std::cerr << "  -h, --help                         Show this help message and exit.\n";
+    std::cerr << "  --nvlink                           Use NVLink for D2D transfer (Case 1, requires 2+ GPUs).\n";
     std::cerr << "  --uvm                              Use UVM with Prefetch (Case 2).\n";
     std::cerr << "  --extend                           Use UVM for Bandwidth Extension (Case 3, for Grace Hopper).\n";
     std::cerr << "  -N, --N, --rows <int>              Number of rows for matrix A. (Default: 1000000)\n";
@@ -933,16 +981,18 @@ void print_usage(const char* prog_name) {
     std::cerr << "  -r, --ratio, --offload_ratio <f>   Fraction of matrix A to offload (0.0 to 1.0). (Default: 0.1)\n";
     std::cerr << "  -t, --trials <int>                 Number of timed trials to run. (Default: 1000)\n";
     std::cerr << "  -d, --device <id>                  ID of the GPU device to use. (Default: 0)\n\n";
-    std::cerr << "Note: Default is Explicit Overlap (Case 1). --uvm and --extend are mutually exclusive.\n";
+    std::cerr << "Note: Default is Explicit Overlap (PCIe). Test modes (--nvlink, --uvm, --extend) are mutually exclusive.\n";
 }
 
 // Simple command line parser with error handling
-bool parse_args(int argc, char** argv, int& N, int& H, int& S, float& ratio, int& trials, bool& use_uvm, bool& use_extension, int& device_id) {
+bool parse_args(int argc, char** argv, int& N, int& H, int& S, float& ratio, int& trials, bool& use_uvm, bool& use_extension, bool& use_nvlink, int& device_id) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return false; // Signal to exit
+        } else if (arg == "--nvlink") {
+            use_nvlink = true;
         } else if (arg == "--uvm") {
             use_uvm = true;
         } else if (arg == "--extend") {
@@ -967,8 +1017,8 @@ bool parse_args(int argc, char** argv, int& N, int& H, int& S, float& ratio, int
     }
 
     // Validate inputs
-    if (use_uvm && use_extension) {
-        std::cerr << "Error: --uvm and --extend flags are mutually exclusive." << std::endl;
+    if ((use_uvm && use_extension) || (use_uvm && use_nvlink) || (use_extension && use_nvlink)) {
+        std::cerr << "Error: --uvm, --extend, and --nvlink flags are mutually exclusive." << std::endl;
         print_usage(argv[0]);
         return false;
     }
@@ -992,6 +1042,10 @@ bool parse_args(int argc, char** argv, int& N, int& H, int& S, float& ratio, int
         std::cerr << "Error: Device ID " << device_id << " is invalid. Only " << device_count << " devices found on this system." << std::endl;
         return false;
     }
+    if (use_nvlink && device_count < 2) {
+        std::cerr << "Error: --nvlink mode requires at least 2 GPUs." << std::endl;
+        return false;
+    }
     return true; // Success
 }
 
@@ -1003,18 +1057,21 @@ int main(int argc, char** argv)
     int trials = 1000;
     bool use_uvm = false;
     bool use_extension = false;
+    bool use_nvlink = false;
     int device_id = 0;
 
-    if (!parse_args(argc, argv, N, H, S, offload_ratio, trials, use_uvm, use_extension, device_id)) {
+    if (!parse_args(argc, argv, N, H, S, offload_ratio, trials, use_uvm, use_extension, use_nvlink, device_id)) {
         return 1; // Exit if args are invalid or help was requested
     }
 
     CHECK_CUDA(cudaSetDevice(device_id));
 
     std::cout << "Configuration:\n";
-    std::string mode = "Explicit Overlap (Case 1)";
+    std::string mode = "Explicit Overlap with PCIe (Case 1)";
+    if (use_nvlink) mode = "Explicit Overlap with NVLink (Case 1)";
     if (use_uvm) mode = "UVM with Prefetch (Case 2)";
     if (use_extension) mode = "Bandwidth Extension (Case 3)";
+
 
     std::cout << "  Mode:          " << mode << "\n";
     std::cout << "  Device ID:     " << device_id << "\n";
@@ -1035,8 +1092,10 @@ int main(int argc, char** argv)
     } else if (use_uvm) {
         runUvmTest(N, H, S, offload_ratio, trials, device_id);
     } else {
-        runExplicitOverlapTest(N, H, S, offload_ratio, trials);
+        // This now handles both PCIe and NVLink based on the flag
+        runExplicitOverlapTest(N, H, S, offload_ratio, trials, use_nvlink, device_id);
     }
 
     return 0;
 }
+

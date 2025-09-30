@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# A script to sweep offload ratios for the 'pcie_overlap' binary
+# A script to sweep offload ratios for the 'memory_offload' binary
 # and collect performance data into a CSV file.
 
 # --- Configuration ---
 EXP_ROOT="/home/michael/GPU_Offloading"
-EXECUTABLE="$EXP_ROOT/src/cuda/pcie_overlap"
+EXECUTABLE="$EXP_ROOT/src/cuda/memory_offload"
 START_RATIO=0.005
 STEP=0.005
 END_RATIO=0.25

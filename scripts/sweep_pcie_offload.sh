@@ -4,8 +4,9 @@
 # and collect performance data into a CSV file.
 
 # --- Configuration ---
-EXP_ROOT="/home/michael/GPU_Offloading"
-EXECUTABLE="$EXP_ROOT/src/cuda/memory_offload"
+SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+EXP_ROOT="$SCRIPT_DIR/.."
+EXECUTABLE="$EXP_ROOT/bin/memory_offload"
 START_RATIO=0.005
 STEP=0.005
 END_RATIO=0.25
@@ -14,7 +15,7 @@ END_RATIO=0.25
 
 # Function to display usage information
 usage() {
-  echo "Usage: $0 [-H <height>] [-N <width>] [-S <inner_dim>] [-d] <output_filename.csv>"
+  echo "Usage: $0 [-H <hidden dimension>] [-N <rows>] [-S <seq length/batch size>] [-d] <output_filename.csv>"
   echo "  (Arguments can be in any order)"
   echo
   echo "  -H, -N, -S: Optional arguments to pass to the '$EXECUTABLE' binary."

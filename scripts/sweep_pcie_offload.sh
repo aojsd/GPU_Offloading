@@ -87,7 +87,7 @@ if [ ! -x "$EXECUTABLE" ]; then
 fi
 
 # Write the header row to the CSV file
-HEADER="OffloadRatio,PCIe_Transfer_ms,Compute_Resident_ms,Compute_Offloaded_ms,PCIe_Bandwidth_GBs,GPU_Throughput_GBs,Total_Kernel_Time_ms,Total_Compute_Time_ms"
+HEADER="OffloadRatio,Data_Transfer_ms,Compute_Resident_ms,Compute_Offloaded_ms,Comm_Bandwidth_GBs,GPU_Throughput_GBs,Total_Kernel_Time_ms,Total_Compute_Time_ms"
 echo "$HEADER" > "$OUTPUT_FILE"
 
 echo "Starting data collection..."
@@ -117,15 +117,16 @@ for r in $(seq $START_RATIO $STEP $END_RATIO); do
   fi
 
   results=$( echo "$program_output" | awk '
-      /PCIe Transfer \(HtoD\):/    { pcie_transfer=$4 }
+      /PCIe Transfer \(H2D\):/      { data_transfer=$4 }
+      /NVLink Transfer \(D2D\):/      { data_transfer=$4 }
       /Compute \(Resident Data\):/ { compute_resident=$4 }
       /Compute \(Offloaded Data\):/ { compute_offloaded=$4 }
-      /PCIe Bandwidth \(GB\/s\):/   { pcie_bw=$4 }
+      /Comm. Bandwidth \(GB\/s\):/   { comm_bw=$4 }
       /GPU Throughput \(GB\/s\):/  { gpu_tp=$4 }
       /Total Kernel Time:/          { kernel_time=$4 }
-      /Total Compute Time =/       { compute_time=$5 }
+      /Total Compute Time:/       { compute_time=$4 }
       END {
-          print pcie_transfer","compute_resident","compute_offloaded","pcie_bw","gpu_tp","kernel_time","compute_time
+          print data_transfer","compute_resident","compute_offloaded","comm_bw","gpu_tp","kernel_time","compute_time
       }
   ')
 

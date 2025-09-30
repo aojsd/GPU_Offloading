@@ -597,12 +597,12 @@ void runExplicitOverlapTest(int N, int H, int S, float offload_ratio, int trials
     std::cout << "Compute (Resident Data):  " << std::setw(8) << avg(compute1_times) << " ms\n";
     std::cout << "Compute (Offloaded Data): " << std::setw(8) << avg(compute2_times) << " ms\n";
     std::cout << "--------------------------------------\n";
-    std::string bw_rate_label = use_nvlink ? "NVLink Bandwidth (GB/s): " : "PCIe Bandwidth (GB/s):  ";
+    std::string bw_rate_label = "Comm. Bandwidth (GB/s):   ";
     std::cout << bw_rate_label << std::setw(8) << (A_offload_size / (1e6 * avg(transfer_times))) << "\n";
     double total_compute_time = avg(compute1_times) + avg(compute2_times);
-    std::cout << "Matrix A Bandwidth (GB/s):" << std::setw(8) << ((A_size) / (1e6 * total_compute_time)) << "\n";
+    std::cout << "GPU Throughput (GB/s):    " << std::setw(8) << ((A_size) / (1e6 * total_compute_time)) << "\n";
     std::cout << "--------------------------------------\n";
-    std::cout << "Total Wall Time:          " << std::setw(8) << avg(total_times) << " ms\n";
+    std::cout << "Total Kernel Time:        " << std::setw(8) << avg(total_times) << " ms\n";
     std::cout << "Total Compute Time:       " << total_compute_time << " ms\n";
     
     verify_result_gpu(d_A, d_B, d_C, N, H, S);

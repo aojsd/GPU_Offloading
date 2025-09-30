@@ -144,10 +144,35 @@ __global__ void interleavedScratchpadMatMulKernel(
     int N_resident,
     int interleave_ratio)
 {
+    // --- 1. Remapping Logic: Map Physical Block to Logical Tile ---
+    
     long long total_tile_rows = (N + TILE_DIM - 1) / TILE_DIM;
-    long long logical_tile_idx = (long long)blockIdx.z * gridDim.y + blockIdx.y;
+    long long linear_block_id = (long long)blockIdx.z * gridDim.y + blockIdx.y;
 
-    if (logical_tile_idx >= total_tile_rows) return;
+    if (linear_block_id >= total_tile_rows) return;
+
+    long long logical_tile_idx;
+
+    // If interleave_ratio is 0 or less, disable interleaving for baseline tests.
+    if (interleave_ratio <= 0) {
+        // No interleaving: physical block ID maps directly to logical tile ID.
+        logical_tile_idx = linear_block_id;
+    } else {
+        // Interleaving is enabled: use the two-pointer spatial logic.
+        long long group_size = interleave_ratio + 1;
+        long long group_id = linear_block_id / group_size;
+        long long idx_in_group = linear_block_id % group_size;
+
+        if (idx_in_group < interleave_ratio) {
+            // This block is assigned a tile from the FRONT of the matrix.
+            logical_tile_idx = group_id * interleave_ratio + idx_in_group;
+        } else {
+            // This block is assigned a tile from the BACK of the matrix.
+            logical_tile_idx = (total_tile_rows - 1) - group_id;
+        }
+    }
+
+    // --- 2. Shared Memory and Thread ID Setup ---
 
     __shared__ float sA[TILE_DIM][TILE_DIM];
     __shared__ float sB[TILE_DIM][TILE_DIM];
@@ -155,24 +180,24 @@ __global__ void interleavedScratchpadMatMulKernel(
     int tx = threadIdx.x;
     int ty = threadIdx.y;
     
-    // **KEY LOGIC:** The block computes the result for its assigned LOGICAL tile.
+    // --- 3. Tile Computation ---
+
     int logical_start_row = logical_tile_idx * TILE_DIM;
     int tile_start_col = blockIdx.x * TILE_DIM;
 
     float C_val = 0.0f;
+
     for (int t = 0; t < (H + TILE_DIM - 1) / TILE_DIM; ++t)
     {
-        // Load the tile for matrix A into shared memory (sA) row by row.
+        // --- 3a. Cooperative Data Loading ---
+        
         int row_to_load = logical_start_row + ty;
         int col_to_load = t * TILE_DIM + tx;
 
-        // Use a simple check against N_resident to determine the memory source for the LOGICAL row.
         if (row_to_load < N && col_to_load < H) {
             if (row_to_load < N_resident) {
-                // This row is in the resident (VRAM) buffer.
                 sA[ty][tx] = A_resident[ (long long)row_to_load * H + col_to_load ];
             } else {
-                // This row is in the offloaded (Zero-Copy) buffer.
                 long long offload_row_index = (long long)row_to_load - N_resident;
                 sA[ty][tx] = A_offload[ offload_row_index * H + col_to_load ];
             }
@@ -180,7 +205,6 @@ __global__ void interleavedScratchpadMatMulKernel(
             sA[ty][tx] = 0.0f;
         }
         
-        // Load tile for B into shared memory (sB) - always from VRAM.
         int b_row = t * TILE_DIM + ty;
         if (b_row < H && tile_start_col + tx < S) {
             sB[ty][tx] = B[ (long long)b_row * S + (tile_start_col + tx) ];
@@ -190,11 +214,17 @@ __global__ void interleavedScratchpadMatMulKernel(
         
         __syncthreads();
 
-        for (int k = 0; k < TILE_DIM; ++k) C_val += sA[ty][k] * sB[k][tx];
+        // --- 3b. Shared Memory Computation ---
+
+        for (int k = 0; k < TILE_DIM; ++k) {
+            C_val += sA[ty][k] * sB[k][tx];
+        }
+
         __syncthreads();
     }
 
-    // Write final result to C using the LOGICAL tile index to ensure correct, contiguous output.
+    // --- 4. Write Result to Global Memory ---
+
     int final_row = logical_start_row + ty;
     int final_col = tile_start_col + tx;
     if (final_row < N && final_col < S) {
@@ -901,8 +931,8 @@ bool parse_args(int argc, char** argv, int& N, int& H, int& S, float& ratio, int
         print_usage(argv[0]);
         return false;
     }
-    if (N <= 0 || H <= 0 || S <= 0 || trials <= 0 || interleave_ratio <= 0) {
-        std::cerr << "Error: Matrix dimensions, trial count, and interleave ratio must be positive." << std::endl;
+    if (N <= 0 || H <= 0 || S <= 0 || trials <= 0) {
+        std::cerr << "Error: Matrix dimensions, and trial count must be positive." << std::endl;
         print_usage(argv[0]);
         return false;
     }

@@ -568,7 +568,7 @@ void runExplicitOverlapTest(int N, int H, int S, float offload_ratio, int trials
                                  S, N_offload, H, &alpha,
                                  d_B, S,                                     // B is the same
                                  d_A + (size_t)N_resident * H, H, &beta,   // A starts at an offset
-                                 d_C + (size_t)N_resident, S));              // C also starts at an offset
+                                 d_C + (size_t)N_resident * S, S));              // C also starts at an offset
         CHECK_CUDA(cudaEventRecord(compute2Stop, compute_stream));
         
         CHECK_CUDA(cudaEventRecord(stop, compute_stream)); // Overall stop time
@@ -758,7 +758,7 @@ void runUvmTest(int N, int H, int S, float offload_ratio, int trials, int device
                                  S, N_offload, H, &alpha,
                                  B, S,
                                  A_offload_ptr, H, &beta,
-                                 C + (size_t)N_resident, S));
+                                 C + (size_t)N_resident * S, S));
         CHECK_CUDA(cudaEventRecord(stop_k2, streamCompute));
 
         CHECK_CUDA(cudaEventRecord(stop, streamCompute));

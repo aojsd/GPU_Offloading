@@ -29,7 +29,7 @@ NVCCFLAGS = -O3 -arch=native
 
 # Linker flags
 # Add the library path and set the runtime path (rpath) using the detected CUDA_PATH
-LDFLAGS = -L$(CUDA_PATH)/lib64 -lcurand
+LDFLAGS = -L$(CUDA_PATH)/lib64 -lcurand -lcublas
 LDFLAGS += -Xlinker -rpath -Xlinker $(CUDA_PATH)/lib64
 
 # Target executable name

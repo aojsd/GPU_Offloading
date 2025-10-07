@@ -59,6 +59,6 @@ $(BIN_DIR):
 
 # Rule to clean up
 clean:
-	rm -f $(BIN_DIR)/$(OFFLOAD) $(BIN_DIR)/test
+	rm -f $(BIN_DIR)/$(OFFLOAD) $(BIN_DIR)/$(MLP) $(BIN_DIR)/test
 
 .PHONY: all clean

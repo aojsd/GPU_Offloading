@@ -111,16 +111,27 @@ void runBaselineMlpTest(int H, int N, int num_layers, int trials) {
     }
     std::cout << " Done.\n";
 
-    // --- 4. Reporting ---
-    auto avg_ns_to_ms = [](const std::vector<double>& v) { if (v.empty()) return 0.0; return (std::accumulate(v.begin(), v.end(), 0.0) / v.size()) / 1.0e6; };
+    // --- 4. Reporting with GPU Throughput ---
+    auto avg_ns_to_ms = [](const std::vector<double>& v) { 
+        if (v.empty()) return 0.0; 
+        return (std::accumulate(v.begin(), v.end(), 0.0) / v.size()) / 1.0e6; 
+    };
     
     double avg_per_layer_ms = avg_ns_to_ms(all_layer_times);
     double avg_forward_pass_ms = avg_ns_to_ms(all_forward_pass_times);
+
+    // ✅ Add throughput calculation
+    double total_weights_size_gb = (double)num_layers * H * H * sizeof(float) / 1.0e9;
+    double observed_gpu_throughput = avg_forward_pass_ms > 0 ? (total_weights_size_gb / (avg_forward_pass_ms / 1000.0)) : 0.0;
 
     std::cout << "\n--- Baseline Performance (No Offloading) ---\n";
     std::cout << std::fixed << std::setprecision(4);
     std::cout << "Avg. Per-Layer Time:    " << std::setw(8) << avg_per_layer_ms << " ms\n";
     std::cout << "Avg. Forward Pass Time: " << std::setw(8) << avg_forward_pass_ms << " ms\n";
+    // ✅ Add throughput to output
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "Observed GPU Throughput:" << std::setw(8) << observed_gpu_throughput << " GB/s\n";
+
 
     // --- 5. Cleanup ---
     delete[] h_timestamps;

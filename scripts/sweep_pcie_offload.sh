@@ -6,7 +6,7 @@
 # --- Configuration ---
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 EXP_ROOT="$SCRIPT_DIR/.."
-EXECUTABLE="$EXP_ROOT/bin/memory_offload"
+EXECUTABLE=$(realpath "$EXP_ROOT/bin/memory_offload")
 START_RATIO=0.005
 STEP=0.005
 END_RATIO=0.25
@@ -24,58 +24,51 @@ usage() {
   exit 1
 }
 
-# --- Smart Argument Parsing ---
-
-# 1. Pre-parse arguments to separate the output file from the options
-declare -a options_array=()
+# --- Argument Parsing ---
+declare -a extra_args=()
 OUTPUT_FILE=""
-prev_arg_was_value_flag=false
+DEBUG=0
 
-for arg in "$@"; do
-  if [ "$prev_arg_was_value_flag" = true ]; then
-    # This argument is the value for the preceding flag (e.g., the '1000' in '-H 1000')
-    options_array+=("$arg")
-    prev_arg_was_value_flag=false
-  elif [[ "$arg" == "-H" || "$arg" == "-N" || "$arg" == "-S" ]]; then
-    # This is a flag that requires a value. Note it for the next iteration.
-    options_array+=("$arg")
-    prev_arg_was_value_flag=true
-  elif [[ "$arg" == -* ]]; then
-    # This is a simple flag (like -d)
-    options_array+=("$arg")
-    prev_arg_was_value_flag=false
-  else
-    # This is not a flag or a value for a flag, so it must be the output file.
-    if [ -n "$OUTPUT_FILE" ]; then
-      echo "Error: Multiple output files specified ('$OUTPUT_FILE' and '$arg')." >&2
+# Manually parse all arguments to support any order and long options
+while (( "$#" )); do
+  case "$1" in
+    -H|-N|-S) # These flags take a value
+      if [ -n "$2" ] && [[ "$2" != -* ]]; then
+        extra_args+=("$1" "$2")
+        shift 2
+      else
+        echo "Error: Argument for $1 is missing or invalid." >&2
+        usage
+      fi
+      ;;
+    --nvlink)
+      extra_args+=("$1")
+      shift 1
+      ;;
+    -d)
+      DEBUG=1
+      shift 1
+      ;;
+    -*) # Handle unknown options
+      echo "Error: Unknown option $1" >&2
       usage
-    fi
-    OUTPUT_FILE="$arg"
-  fi
+      ;;
+    *) # Handle the positional argument (output file)
+      if [ -n "$OUTPUT_FILE" ]; then
+        echo "Error: Multiple output files specified ('$OUTPUT_FILE' and '$1')." >&2
+        usage
+      fi
+      OUTPUT_FILE="$1"
+      shift 1
+      ;;
+  esac
 done
 
-# 2. Check if the mandatory output file was found
+# Check if the mandatory output file was provided
 if [ -z "$OUTPUT_FILE" ]; then
   echo "Error: Output filename is required."
   usage
 fi
-
-# 3. Reset the script's positional parameters to only contain the options
-set -- "${options_array[@]}"
-
-# 4. Now, parse the options using getopts as before
-declare -a extra_args=()
-DEBUG=0
-while getopts ":H:N:S:d" opt; do
-  case ${opt} in
-    H ) extra_args+=("-H" "$OPTARG") ;;
-    N ) extra_args+=("-N" "$OPTARG") ;;
-    S ) extra_args+=("-S" "$OPTARG") ;;
-    d ) DEBUG=1 ;;
-    \? ) echo "Invalid Option: -$OPTARG" >&2; usage ;;
-    : ) echo "Invalid Option: -$OPTARG requires an argument" >&2; usage ;;
-  esac
-done
 
 # --- Main Execution ---
 

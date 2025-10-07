@@ -79,6 +79,14 @@
         } \
     } while (0)
 
+/**
+ * @brief GPU-side timestamping kernel.
+ * Reads the 64-bit nanosecond-resolution global timer and writes it to memory.
+ */
+__global__ void recordTimestamp(unsigned long long* timestamp_out) {
+    asm("mov.u64 %0, %%globaltimer;" : "=l"(*timestamp_out));
+}
+
 // Kernel configuration
 constexpr int TILE_DIM = 32;
 // Maximum grid dimension size for Y and Z axes on modern GPUs
@@ -304,9 +312,12 @@ void verify_result_gpu(const float* d_A, const float* d_B, const float* d_C_orig
 }
 
 
-// This function handles the "fast path" case where offload_ratio is 0 for non-extension tests.
+/**
+ * @brief Measures the baseline performance of a single, fully-resident matrix multiplication
+ * using a reusable CUDA Graph and precise GPU-side timers.
+ */
 void runSingleKernelTest(int N, int H, int S, int trials, bool use_uvm, int device_id) {
-    std::cout << "Zero offload ratio detected. Running simplified single-kernel test (CUDA Stream Version with cuBLAS).\n";
+    std::cout << "Zero offload ratio detected. Running simplified single-kernel test (CUDA Graph Version).\n";
 
     size_t A_size = (size_t)N * H * sizeof(float);
     size_t B_size = (size_t)H * S * sizeof(float);
@@ -316,11 +327,11 @@ void runSingleKernelTest(int N, int H, int S, int trials, bool use_uvm, int devi
     cudaStream_t stream;
     CHECK_CUDA(cudaStreamCreate(&stream));
 
-    // --- cuBLAS Handle Initialization ---
     cublasHandle_t cublas_handle;
     CHECK_CUBLAS(cublasCreate(&cublas_handle));
     CHECK_CUBLAS(cublasSetStream(cublas_handle, stream));
 
+    // --- Memory Allocation (UVM or Standard) ---
     if (use_uvm) {
         CHECK_CUDA(cudaMallocManaged(&d_A, A_size));
         CHECK_CUDA(cudaMallocManaged(&d_B, B_size));
@@ -341,57 +352,52 @@ void runSingleKernelTest(int N, int H, int S, int trials, bool use_uvm, int devi
         init_matrices_on_gpu(d_A, d_B, N, H, S);
     }
 
-    // Events for timing the kernel
-    cudaEvent_t start, stop;
-    CHECK_CUDA(cudaEventCreate(&start));
-    CHECK_CUDA(cudaEventCreate(&stop));
+    // --- Graph Capture of the sgemm operation ---
+    unsigned long long* d_timestamps;
+    CHECK_CUDA(cudaMalloc(&d_timestamps, 2 * sizeof(unsigned long long)));
 
-    // --- cuBLAS sgemm setup ---
+    cudaGraph_t graph;
+    cudaGraphExec_t graph_exec;
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
+    CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    recordTimestamp<<<1, 1, 0, stream>>>(d_timestamps);
+    CHECK_CUBLAS(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                             S, N, H, &alpha,
+                             d_B, S,
+                             d_A, H, &beta,
+                             d_C, S));
+    recordTimestamp<<<1, 1, 0, stream>>>(d_timestamps + 1);
+    CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
+    CHECK_CUDA(cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0));
+
+    // --- Warm-up and Timed Trials using Graph Launch ---
     const int WARMUP_COUNT = 5;
     std::cout << "Performing " << WARMUP_COUNT << " warm-up runs... " << std::flush;
     for (int i = 0; i < WARMUP_COUNT; ++i) {
-        // C = A * B (row-major) is equivalent to C_T = B_T * A_T (col-major)
-        // We pass matrices in reverse order (B then A) to achieve this.
-        CHECK_CUBLAS(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                 S, N, H, &alpha,
-                                 d_B, S,
-                                 d_A, H, &beta,
-                                 d_C, S));
+        CHECK_CUDA(cudaGraphLaunch(graph_exec, stream));
     }
     CHECK_CUDA(cudaStreamSynchronize(stream));
     std::cout << "Done.\n";
 
-    std::vector<float> kernel_times;
+    std::vector<double> kernel_times_ns;
+    unsigned long long h_timestamps[2];
     for (int i = 0; i < trials; ++i) {
-        CHECK_CUDA(cudaEventRecord(start, stream));
-
-        CHECK_CUBLAS(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                 S, N, H, &alpha,
-                                 d_B, S,
-                                 d_A, H, &beta,
-                                 d_C, S));
-
-        CHECK_CUDA(cudaEventRecord(stop, stream));
-        
-        // Wait for the kernel to finish before getting the time
-        CHECK_CUDA(cudaEventSynchronize(stop));
-        
-        float ms;
-        CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
-        kernel_times.push_back(ms);
+        CHECK_CUDA(cudaGraphLaunch(graph_exec, stream));
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        CHECK_CUDA(cudaMemcpy(h_timestamps, d_timestamps, sizeof(h_timestamps), cudaMemcpyDeviceToHost));
+        kernel_times_ns.push_back((double)(h_timestamps[1] - h_timestamps[0]));
     }
 
-    auto avg = [](const std::vector<float>& v) { return std::accumulate(v.begin(), v.end(), 0.0f) / v.size(); };
-    double avg_time_ms = avg(kernel_times);
-    // Effective bandwidth calculation based on consuming matrix A
+    // --- Calculate and Report Metrics (Identical Output) ---
+    double avg_time_ns = std::accumulate(kernel_times_ns.begin(), kernel_times_ns.end(), 0.0) / kernel_times_ns.size();
+    double avg_time_ms = avg_time_ns / 1.0e6;
+    
     double effective_bandwidth = (A_size) / (avg_time_ms / 1000.0) / 1e9;
     double gflops = (2.0 * N * S * H) / (avg_time_ms / 1000.0) / 1e9;
 
-
-    std::cout << "\n--- Timings (avg over " << trials << " trials) ---\n";
+    std::cout << "\n--- Timings (avg over " << trials << " graph trials) ---\n";
     std::cout << std::fixed << std::setprecision(3);
     std::cout << "GFLOPS:                   " << std::setw(8) << gflops << "\n";
     std::cout << "Effective Bandwidth (GB/s): " << std::setw(8) << effective_bandwidth << "\n";
@@ -401,8 +407,9 @@ void runSingleKernelTest(int N, int H, int S, int trials, bool use_uvm, int devi
     
     // --- Cleanup ---
     CHECK_CUBLAS(cublasDestroy(cublas_handle));
-    CHECK_CUDA(cudaEventDestroy(start));
-    CHECK_CUDA(cudaEventDestroy(stop));
+    CHECK_CUDA(cudaGraphExecDestroy(graph_exec));
+    CHECK_CUDA(cudaGraphDestroy(graph));
+    CHECK_CUDA(cudaFree(d_timestamps));
     CHECK_CUDA(cudaFree(d_A));
     CHECK_CUDA(cudaFree(d_B));
     CHECK_CUDA(cudaFree(d_C));
@@ -425,25 +432,32 @@ void runSingleKernelTest(int N, int H, int S, int trials, bool use_uvm, int devi
  */
 void runExplicitOverlapTest(int N, int H, int S, float offload_ratio, int trials, bool use_nvlink, int device_id) {
     if (use_nvlink) {
-        std::cout << "\n--- Running Case 1: Explicit Overlap with NVLink (D2D) ---\n";
+        std::cout << "\n--- Running Case 1: Explicit Overlap with NVLink (CUDA Graph Version) ---\n";
     } else {
-        std::cout << "\n--- Running Case 1: Explicit Overlap with PCIe (H2D) ---\n";
+        std::cout << "\n--- Running Case 1: Explicit Overlap with PCIe (CUDA Graph Version) ---\n";
     }
 
     if (offload_ratio == 0.0f) {
-        // Fallback to the simpler test if no data is offloaded.
         runSingleKernelTest(N, H, S, trials, false, device_id);
         return;
     }
 
     // --- 1. Initial Setup and Data Partitioning ---
+    const int ALIGNMENT = 32;
+    if (N % ALIGNMENT != 0) {
+        int old_N = N;
+        N = (N / ALIGNMENT) * ALIGNMENT;
+        std::cout << "Adjusting N from " << old_N << " to " << N << " to be a multiple of " << ALIGNMENT << "\n";
+    }
+    int N_offload = static_cast<int>(round(N * offload_ratio));
+    N_offload = (N_offload / ALIGNMENT) * ALIGNMENT;
+    if (offload_ratio > 0.999f) N_offload = N;
+    int N_resident = N - N_offload;
+
     size_t A_size = (size_t)N * H * sizeof(float);
     size_t B_size = (size_t)H * S * sizeof(float);
     size_t C_size = (size_t)N * S * sizeof(float);
-    int N_offload = static_cast<int>(N * offload_ratio);
-    int N_resident = N - N_offload;
     size_t A_offload_size = (size_t)N_offload * H * sizeof(float);
-
     std::cout << "Resident Rows: " << N_resident << ", Offloaded Rows: " << N_offload << std::endl;
 
     float* h_A_pinned_offload = nullptr;
@@ -451,177 +465,154 @@ void runExplicitOverlapTest(int N, int H, int S, float offload_ratio, int trials
     cudaMemcpyKind copyKind;
     int peerDeviceId = -1;
 
-    // --- 2. Configure Offload Source (Peer GPU or Pinned Host Memory) ---
     if (use_nvlink) {
         int device_count;
         CHECK_CUDA(cudaGetDeviceCount(&device_count));
-        if (device_count < 2) {
-            std::cerr << "Error: NVLink test requires at least 2 GPUs." << std::endl;
-            exit(EXIT_FAILURE);
-        }
+        if (device_count < 2) { std::cerr << "Error: NVLink test requires at least 2 GPUs." << std::endl; exit(EXIT_FAILURE); }
         peerDeviceId = (device_id + 1) % device_count;
-
         int canAccessPeer;
         CHECK_CUDA(cudaDeviceCanAccessPeer(&canAccessPeer, device_id, peerDeviceId));
         if (canAccessPeer) {
             std::cout << "Enabling peer access from Device " << device_id << " to Device " << peerDeviceId << std::endl;
             CHECK_CUDA(cudaSetDevice(device_id));
             CHECK_CUDA(cudaDeviceEnablePeerAccess(peerDeviceId, 0));
-        } else {
-            std::cerr << "Error: Peer access between Device " << device_id << " and " << peerDeviceId << " is not supported." << std::endl;
-            exit(EXIT_FAILURE);
-        }
-
+        } else { std::cerr << "Error: Peer access is not supported." << std::endl; exit(EXIT_FAILURE); }
         CHECK_CUDA(cudaSetDevice(peerDeviceId));
         CHECK_CUDA(cudaMalloc(&d_A_peer_offload, A_offload_size));
-        CHECK_CUDA(cudaSetDevice(device_id)); // Switch back to primary device
-
+        CHECK_CUDA(cudaSetDevice(device_id));
         copyKind = cudaMemcpyDeviceToDevice;
     } else {
         CHECK_CUDA(cudaHostAlloc(&h_A_pinned_offload, A_offload_size, cudaHostAllocDefault));
         copyKind = cudaMemcpyHostToDevice;
     }
 
-    // --- 3. Allocate and Initialize Matrices on Primary GPU ---
+    // --- 2. Allocate and Initialize Matrices ---
     float *d_A, *d_B, *d_C;
     CHECK_CUDA(cudaMalloc(&d_A, A_size));
     CHECK_CUDA(cudaMalloc(&d_B, B_size));
     CHECK_CUDA(cudaMalloc(&d_C, C_size));
-
     init_matrices_on_gpu(d_A, d_B, N, H, S);
 
-    // Pre-copy the offloaded part to its source location
     if (use_nvlink) {
         CHECK_CUDA(cudaMemcpy(d_A_peer_offload, d_A + (size_t)N_resident * H, A_offload_size, cudaMemcpyDeviceToDevice));
     } else {
         CHECK_CUDA(cudaMemcpy(h_A_pinned_offload, d_A + (size_t)N_resident * H, A_offload_size, cudaMemcpyDeviceToHost));
     }
-    
-    // --- 4. Setup Streams, Events, and cuBLAS Handle ---
+
+    // --- 3. Setup Streams, cuBLAS, and Graph Primitives ---
     cudaStream_t copy_stream, compute_stream;
     CHECK_CUDA(cudaStreamCreate(&copy_stream));
     CHECK_CUDA(cudaStreamCreate(&compute_stream));
 
-    // Events for granular timing
-    cudaEvent_t start, stop, transferStart, transferStop, compute1Start, compute1Stop, compute2Start, compute2Stop;
-    CHECK_CUDA(cudaEventCreate(&start)); CHECK_CUDA(cudaEventCreate(&stop));
-    CHECK_CUDA(cudaEventCreate(&transferStart)); CHECK_CUDA(cudaEventCreate(&transferStop));
-    CHECK_CUDA(cudaEventCreate(&compute1Start)); CHECK_CUDA(cudaEventCreate(&compute1Stop));
-    CHECK_CUDA(cudaEventCreate(&compute2Start)); CHECK_CUDA(cudaEventCreate(&compute2Stop));
-
-    // Event to manage dependency between streams
-    cudaEvent_t copy_finished_event;
-    CHECK_CUDA(cudaEventCreate(&copy_finished_event));
-
     cublasHandle_t cublas_handle;
     CHECK_CUBLAS(cublasCreate(&cublas_handle));
-
     const float alpha = 1.0f;
     const float beta = 0.0f;
+    
+    unsigned long long* d_timestamps;
+    const int NUM_TIMESTAMPS = 8;
+    CHECK_CUDA(cudaMalloc(&d_timestamps, NUM_TIMESTAMPS * sizeof(unsigned long long)));
 
-    // --- 5. Warm-up Runs ---
+    // --- 4. Capture the Operations into a CUDA Graph ---
+    cudaGraph_t graph;
+    cudaGraphExec_t graph_exec;
+    
+    cudaEvent_t ghost_link_event, copy_finished_event;
+    CHECK_CUDA(cudaEventCreate(&ghost_link_event));
+    CHECK_CUDA(cudaEventCreate(&copy_finished_event));
+
+    CHECK_CUDA(cudaStreamBeginCapture(compute_stream, cudaStreamCaptureModeThreadLocal));
+
+    // -- Step A: Create a "ghost" dependency to pull the copy_stream into the graph --
+    recordTimestamp<<<1, 1, 0, compute_stream>>>(d_timestamps + 0); // Overall Start
+    CHECK_CUDA(cudaEventRecord(ghost_link_event, compute_stream));
+    CHECK_CUDA(cudaStreamWaitEvent(copy_stream, ghost_link_event, 0));
+
+    // -- Step B: Enqueue all the real concurrent work --
+    void* memcpy_src = use_nvlink ? (void*)d_A_peer_offload : (void*)h_A_pinned_offload;
+    recordTimestamp<<<1, 1, 0, copy_stream>>>(d_timestamps + 1); // Transfer Start
+    CHECK_CUDA(cudaMemcpyAsync(d_A + (size_t)N_resident * H, memcpy_src, A_offload_size, copyKind, copy_stream));
+    recordTimestamp<<<1, 1, 0, copy_stream>>>(d_timestamps + 2); // Transfer Stop
+    CHECK_CUDA(cudaEventRecord(copy_finished_event, copy_stream));
+
+    CHECK_CUBLAS(cublasSetStream(cublas_handle, compute_stream));
+    recordTimestamp<<<1, 1, 0, compute_stream>>>(d_timestamps + 3); // Compute1 Start
+    CHECK_CUBLAS(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, S, N_resident, H, &alpha, d_B, S, d_A, H, &beta, d_C, S));
+    recordTimestamp<<<1, 1, 0, compute_stream>>>(d_timestamps + 4); // Compute1 Stop
+
+    // -- Step C: Establish the real dependency, which is now valid --
+    CHECK_CUDA(cudaStreamWaitEvent(compute_stream, copy_finished_event, 0));
+    
+    // -- Step D: Enqueue the final dependent work --
+    recordTimestamp<<<1, 1, 0, compute_stream>>>(d_timestamps + 5); // Compute2 Start
+    CHECK_CUBLAS(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, S, N_offload, H, &alpha,
+                             d_B, S, d_A + (size_t)N_resident * H, H, &beta,
+                             d_C + (size_t)N_resident * S, S));
+    recordTimestamp<<<1, 1, 0, compute_stream>>>(d_timestamps + 6); // Compute2 Stop
+    recordTimestamp<<<1, 1, 0, compute_stream>>>(d_timestamps + 7); // Overall Stop
+
+    CHECK_CUDA(cudaStreamEndCapture(compute_stream, &graph));
+    CHECK_CUDA(cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0));
+
+    // --- 5. Execute the Graph and Get Timings ---
     const int WARMUP_COUNT = 5;
     std::cout << "Performing " << WARMUP_COUNT << " warm-up runs... " << std::flush;
     for (int i = 0; i < WARMUP_COUNT; ++i) {
-        void* memcpy_src = use_nvlink ? (void*)d_A_peer_offload : (void*)h_A_pinned_offload;
-        CHECK_CUDA(cudaMemcpyAsync(d_A + (size_t)N_resident * H, memcpy_src, A_offload_size, copyKind, copy_stream));
-        
-        CHECK_CUBLAS(cublasSetStream(cublas_handle, compute_stream));
-        CHECK_CUBLAS(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, S, N_resident, H, &alpha, d_B, S, d_A, H, &beta, d_C, S));
+        CHECK_CUDA(cudaGraphLaunch(graph_exec, compute_stream));
     }
-    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaStreamSynchronize(compute_stream));
     std::cout << "Done.\n";
 
-    // --- 6. Timed Trials ---
     std::vector<double> total_times, transfer_times, compute1_times, compute2_times;
+    unsigned long long h_timestamps[NUM_TIMESTAMPS];
+
     for (int i = 0; i < trials; ++i) {
-        // Reset source data for PCIe case if needed (not strictly necessary but good practice)
-        if (!use_nvlink) {
-           CHECK_CUDA(cudaMemcpy(h_A_pinned_offload, d_A + (size_t)N_resident * H, A_offload_size, cudaMemcpyDeviceToHost));
-        }
-        
-        CHECK_CUDA(cudaEventRecord(start, compute_stream)); // Overall start time
+        CHECK_CUDA(cudaGraphLaunch(graph_exec, compute_stream));
+        CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+        CHECK_CUDA(cudaMemcpy(h_timestamps, d_timestamps, sizeof(h_timestamps), cudaMemcpyDeviceToHost));
 
-        // --- Launch Concurrent Operations ---
-        
-        // Operation 1: Asynchronous memory copy in copy_stream
-        void* memcpy_src = use_nvlink ? (void*)d_A_peer_offload : (void*)h_A_pinned_offload;
-        CHECK_CUDA(cudaEventRecord(transferStart, copy_stream));
-        CHECK_CUDA(cudaMemcpyAsync(d_A + (size_t)N_resident * H, memcpy_src, A_offload_size, copyKind, copy_stream));
-        CHECK_CUDA(cudaEventRecord(transferStop, copy_stream));
-        CHECK_CUDA(cudaEventRecord(copy_finished_event, copy_stream)); // Mark end of copy
-
-        // Operation 2: First matmul on resident data in compute_stream
-        CHECK_CUBLAS(cublasSetStream(cublas_handle, compute_stream));
-        CHECK_CUDA(cudaEventRecord(compute1Start, compute_stream));
-        CHECK_CUBLAS(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, S, N_resident, H, &alpha, d_B, S, d_A, H, &beta, d_C, S));
-        CHECK_CUDA(cudaEventRecord(compute1Stop, compute_stream));
-
-        // --- Create Dependency and Launch Final Operation ---
-
-        // Make the compute_stream wait until the copy is finished
-        CHECK_CUDA(cudaStreamWaitEvent(compute_stream, copy_finished_event, 0));
-
-        // Operation 3: Second matmul on newly-transferred data in compute_stream
-        CHECK_CUDA(cudaEventRecord(compute2Start, compute_stream));
-        CHECK_CUBLAS(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                 S, N_offload, H, &alpha,
-                                 d_B, S,                                     // B is the same
-                                 d_A + (size_t)N_resident * H, H, &beta,   // A starts at an offset
-                                 d_C + (size_t)N_resident * S, S));              // C also starts at an offset
-        CHECK_CUDA(cudaEventRecord(compute2Stop, compute_stream));
-        
-        CHECK_CUDA(cudaEventRecord(stop, compute_stream)); // Overall stop time
-
-        // --- Synchronize and Collect Timings ---
-        CHECK_CUDA(cudaEventSynchronize(stop));
-
-        float ms_total, ms_transfer, ms_compute1, ms_compute2;
-        CHECK_CUDA(cudaEventElapsedTime(&ms_total, start, stop));
-        CHECK_CUDA(cudaEventElapsedTime(&ms_transfer, transferStart, transferStop));
-        CHECK_CUDA(cudaEventElapsedTime(&ms_compute1, compute1Start, compute1Stop));
-        CHECK_CUDA(cudaEventElapsedTime(&ms_compute2, compute2Start, compute2Stop));
-        total_times.push_back(ms_total);
-        transfer_times.push_back(ms_transfer);
-        compute1_times.push_back(ms_compute1);
-        compute2_times.push_back(ms_compute2);
+        transfer_times.push_back((double)(h_timestamps[2] - h_timestamps[1]));
+        compute1_times.push_back((double)(h_timestamps[4] - h_timestamps[3]));
+        compute2_times.push_back((double)(h_timestamps[6] - h_timestamps[5]));
+        total_times.push_back((double)(h_timestamps[7] - h_timestamps[0]));
     }
     
-    // --- 7. Report Results ---
-    auto avg = [](const std::vector<double>& v) { return std::accumulate(v.begin(), v.end(), 0.0) / v.size(); };
-    std::string bw_label = use_nvlink ? "NVLink Transfer (D2D):" : "PCIe Transfer (H2D): ";
+    // --- 6. Report Averaged Results ---
+    auto avg_ns_to_ms = [](const std::vector<double>& v) {
+        return (std::accumulate(v.begin(), v.end(), 0.0) / v.size()) / 1.0e6;
+    };
+    double avg_transfer_ms = avg_ns_to_ms(transfer_times);
+    double avg_compute1_ms = avg_ns_to_ms(compute1_times);
+    double avg_compute2_ms = avg_ns_to_ms(compute2_times);
+    double avg_total_kernel_ms = avg_ns_to_ms(total_times);
+    double total_compute_time = avg_compute1_ms + avg_compute2_ms;
 
-    std::cout << "\n--- Timings (avg over " << trials << " trials) ---\n";
+    std::string bw_label = use_nvlink ? "NVLink Transfer (D2D):" : "PCIe Transfer (H2D): ";
+    std::cout << "\n--- Timings (avg over " << trials << " graph trials) ---\n";
     std::cout << std::fixed << std::setprecision(3);
-    std::cout << bw_label << std::setw(8) << avg(transfer_times) << " ms\n";
-    std::cout << "Compute (Resident Data):  " << std::setw(8) << avg(compute1_times) << " ms\n";
-    std::cout << "Compute (Offloaded Data): " << std::setw(8) << avg(compute2_times) << " ms\n";
+    std::cout << bw_label << std::setw(8) << avg_transfer_ms << " ms\n";
+    std::cout << "Compute (Resident Data):  " << std::setw(8) << avg_compute1_ms << " ms\n";
+    std::cout << "Compute (Offloaded Data): " << std::setw(8) << avg_compute2_ms << " ms\n";
     std::cout << "--------------------------------------\n";
-    std::string bw_rate_label = "Comm. Bandwidth (GB/s):   ";
-    std::cout << bw_rate_label << std::setw(8) << (A_offload_size / (1e6 * avg(transfer_times))) << "\n";
-    double total_compute_time = avg(compute1_times) + avg(compute2_times);
-    std::cout << "GPU Throughput (GB/s):    " << std::setw(8) << ((A_size) / (1e6 * total_compute_time)) << "\n";
+    std::cout << "Comm. Bandwidth (GB/s):   " << std::setw(8) << (A_offload_size / (1e6 * avg_transfer_ms)) << "\n";
+    std::cout << "GPU Throughput (GB/s):    " << std::setw(8) << (A_size / (1e6 * total_compute_time)) << "\n";
     std::cout << "--------------------------------------\n";
-    std::cout << "Total Kernel Time:        " << std::setw(8) << avg(total_times) << " ms\n";
+    std::cout << "Total Kernel Time:        " << std::setw(8) << avg_total_kernel_ms << " ms\n";
     std::cout << "Total Compute Time:       " << total_compute_time << " ms\n";
     
     verify_result_gpu(d_A, d_B, d_C, N, H, S);
-    
-    // --- 8. Cleanup ---
-    if (use_nvlink) {
-        CHECK_CUDA(cudaFree(d_A_peer_offload));
-        CHECK_CUDA(cudaDeviceDisablePeerAccess(peerDeviceId));
-    } else {
-        CHECK_CUDA(cudaFreeHost(h_A_pinned_offload));
-    }
+
+    // --- 7. Cleanup ---
+    CHECK_CUDA(cudaGraphExecDestroy(graph_exec));
+    CHECK_CUDA(cudaGraphDestroy(graph));
+    if (use_nvlink) { CHECK_CUDA(cudaFree(d_A_peer_offload)); CHECK_CUDA(cudaDeviceDisablePeerAccess(peerDeviceId)); } 
+    else { CHECK_CUDA(cudaFreeHost(h_A_pinned_offload)); }
     CHECK_CUBLAS(cublasDestroy(cublas_handle));
-    CHECK_CUDA(cudaEventDestroy(start)); CHECK_CUDA(cudaEventDestroy(stop));
-    CHECK_CUDA(cudaEventDestroy(transferStart)); CHECK_CUDA(cudaEventDestroy(transferStop));
-    CHECK_CUDA(cudaEventDestroy(compute1Start)); CHECK_CUDA(cudaEventDestroy(compute1Stop));
-    CHECK_CUDA(cudaEventDestroy(compute2Start)); CHECK_CUDA(cudaEventDestroy(compute2Stop));
+    CHECK_CUDA(cudaEventDestroy(ghost_link_event));
     CHECK_CUDA(cudaEventDestroy(copy_finished_event));
     CHECK_CUDA(cudaStreamDestroy(copy_stream));
     CHECK_CUDA(cudaStreamDestroy(compute_stream));
+    CHECK_CUDA(cudaFree(d_timestamps));
     CHECK_CUDA(cudaFree(d_A)); CHECK_CUDA(cudaFree(d_B)); CHECK_CUDA(cudaFree(d_C));
 }
 
@@ -651,13 +642,24 @@ void runUvmTest(int N, int H, int S, float offload_ratio, int trials, int device
         runSingleKernelTest(N, H, S, trials, true, device_id);
         return;
     }
+
+    // Ensure row counts are aligned to a reasonable number for simplicity (e.g., 32)
+    const int ALIGNMENT = 32;
+    if (N % ALIGNMENT != 0) {
+        int old_N = N;
+        N = (N / ALIGNMENT) * ALIGNMENT;
+        std::cout << "Adjusting N from " << old_N << " to " << N << " to be a multiple of " << ALIGNMENT << "\n";
+    }
+
+    int N_offload = static_cast<int>(round(N * offload_ratio));
+    N_offload = (N_offload / ALIGNMENT) * ALIGNMENT;
+    if (offload_ratio > 0.999f) N_offload = N;
+    int N_resident = N - N_offload;
     
     // --- 1. Initial Setup and UVM Allocation ---
     size_t A_size = (size_t)N * H * sizeof(float);
     size_t B_size = (size_t)H * S * sizeof(float);
     size_t C_size = (size_t)N * S * sizeof(float);
-    int N_offload = static_cast<int>(N * offload_ratio);
-    int N_resident = N - N_offload;
     size_t A_offload_size = (size_t)N_offload * H * sizeof(float);
     std::cout << "Resident Rows: " << N_resident << ", Offloaded Rows: " << N_offload << std::endl;
     
@@ -795,135 +797,6 @@ void runUvmTest(int N, int H, int S, float offload_ratio, int trials, int device
     CHECK_CUDA(cudaFree(A)); CHECK_CUDA(cudaFree(B)); CHECK_CUDA(cudaFree(C));
     CHECK_CUDA(cudaStreamDestroy(streamCompute)); CHECK_CUDA(cudaStreamDestroy(streamTransfer));
 }
-
-
-// This is now the primary function for the --extend flag, handling all cases (0, 1, and partial).
-// void runBandwidthExtensionTest(int N, int H, int S, float offload_ratio, int trials, int device_id, int interleave_ratio) {
-//     std::cout << "\n--- Running Case 3: Simultaneous Zero-Copy Test (Interleaved Scratchpad Kernel) ---\n";
-    
-//     // Ensure row counts are aligned to TILE_DIM for simplicity
-//     if (N % TILE_DIM != 0) {
-//         int old_N = N;
-//         N = (N / TILE_DIM) * TILE_DIM;
-//         std::cout << "Adjusting N from " << old_N << " to " << N << " to be a multiple of TILE_DIM (" << TILE_DIM << ")\n";
-//     }
-
-//     int N_offload = static_cast<int>(round(N * offload_ratio));
-//     N_offload = (N_offload / TILE_DIM) * TILE_DIM;
-//     if (offload_ratio > 0.999f) N_offload = N;
-//     int N_resident = N - N_offload;
-
-//     size_t A_resident_size = (size_t)N_resident * H * sizeof(float);
-//     size_t A_offload_size = (size_t)N_offload * H * sizeof(float);
-//     size_t A_full_size = (size_t)N * H * sizeof(float);
-//     size_t B_size = (size_t)H * S * sizeof(float);
-//     size_t C_size = (size_t)N * S * sizeof(float);
-
-//     float *d_A_resident = nullptr, *d_B = nullptr, *d_C = nullptr;
-//     float *h_A_offload = nullptr;
-//     float *d_A_offload_mapped = nullptr;
-
-//     cudaStream_t stream;
-//     CHECK_CUDA(cudaStreamCreate(&stream));
-    
-//     CHECK_CUDA(cudaMalloc(&d_B, B_size));
-//     CHECK_CUDA(cudaMalloc(&d_C, C_size));
-
-//     if (N_resident > 0) CHECK_CUDA(cudaMalloc(&d_A_resident, A_resident_size));
-//     if (N_offload > 0) {
-//         CHECK_CUDA(cudaHostAlloc(&h_A_offload, A_offload_size, cudaHostAllocMapped));
-//         CHECK_CUDA(cudaHostGetDevicePointer(&d_A_offload_mapped, h_A_offload, 0));
-//     }
-    
-//     std::cout << "Initializing resident data on GPU and offloaded data on CPU..." << std::flush;
-//     init_matrices_on_gpu(nullptr, d_B, 0, H, S);
-    
-//     if (N_resident > 0) {
-//         float* d_A_res_temp;
-//         CHECK_CUDA(cudaMalloc(&d_A_res_temp, A_resident_size));
-//         init_matrices_on_gpu(d_A_res_temp, nullptr, N_resident, H, 0);
-//         CHECK_CUDA(cudaMemcpy(d_A_resident, d_A_res_temp, A_resident_size, cudaMemcpyDeviceToDevice));
-//         CHECK_CUDA(cudaFree(d_A_res_temp));
-//     }
-//     if (N_offload > 0) {
-//         for (size_t i = 0; i < (size_t)N_offload * H; ++i) h_A_offload[i] = (float)rand() / RAND_MAX;
-//     }
-    
-//     std::cout << "Done.\n";
-//     std::cout << "Resident Rows: " << N_resident << ", Offloaded Rows: " << N_offload << "\n";
-    
-//     cudaGraph_t graph;
-//     cudaGraphExec_t graph_exec;
-//     CHECK_CUDA(cudaGraphCreate(&graph, 0));
-
-//     cudaEvent_t start, stop;
-//     CHECK_CUDA(cudaEventCreate(&start));
-//     CHECK_CUDA(cudaEventCreate(&stop));
-    
-//     cudaGraphNode_t start_node, kernel_node, stop_node;
-//     CHECK_CUDA(cudaGraphAddEventRecordNode(&start_node, graph, nullptr, 0, start));
-
-//     cudaKernelNodeParams kernel_params = {0};
-//     kernel_params.func = (void*)interleavedScratchpadMatMulKernel;
-//     kernel_params.gridDim = calculate_grid_dims(S, N);
-//     kernel_params.blockDim = dim3(TILE_DIM, TILE_DIM);
-
-//     void *kernel_args[] = {&d_C, &d_A_resident, &d_A_offload_mapped, &d_B, &N, &H, &S, &N_resident, &interleave_ratio};
-//     kernel_params.kernelParams = kernel_args;
-
-//     CHECK_CUDA(cudaGraphAddKernelNode(&kernel_node, graph, &start_node, 1, &kernel_params));
-//     CHECK_CUDA(cudaGraphAddEventRecordNode(&stop_node, graph, &kernel_node, 1, stop));
-//     CHECK_CUDA(cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0));
-
-//     const int WARMUP_COUNT = 5;
-//     std::cout << "Performing " << WARMUP_COUNT << " warm-up runs... " << std::flush;
-//     for (int i = 0; i < WARMUP_COUNT; ++i) CHECK_CUDA(cudaGraphLaunch(graph_exec, stream));
-//     CHECK_CUDA(cudaStreamSynchronize(stream));
-//     std::cout << "Done.\n";
-
-//     std::vector<double> total_times;
-//     for (int i = 0; i < trials; ++i) {
-//         CHECK_CUDA(cudaGraphLaunch(graph_exec, stream));
-//         CHECK_CUDA(cudaStreamSynchronize(stream));
-        
-//         float ms_total;
-//         CHECK_CUDA(cudaEventElapsedTime(&ms_total, start, stop));
-//         total_times.push_back(ms_total);
-//     }
-
-//     auto avg = [](const std::vector<double>& v) { return std::accumulate(v.begin(), v.end(), 0.0f) / v.size(); };
-    
-//     double avg_time_ms = avg(total_times);
-//     double effective_bandwidth = (A_full_size + B_size) / (avg_time_ms * 1e6);
-    
-//     std::cout << "\n--- Timings (avg over " << trials << " trials) ---\n";
-//     std::cout << std::fixed << std::setprecision(3);
-//     std::cout << "Effective Blended BW (GB/s): " << std::setw(8) << effective_bandwidth << "\n";
-//     std::cout << "Total Kernel Time:           " << std::setw(8) << avg_time_ms << " ms\n";
-    
-//     // **RESTORED:** Foolproof verification by reconstructing a simple, contiguous matrix A.
-//     float* d_A_full_temp_verify;
-//     CHECK_CUDA(cudaMalloc(&d_A_full_temp_verify, (size_t)N * H * sizeof(float)));
-//     if (N_resident > 0) {
-//         CHECK_CUDA(cudaMemcpy(d_A_full_temp_verify, d_A_resident, A_resident_size, cudaMemcpyDeviceToDevice));
-//     }
-//     if (N_offload > 0) {
-//         CHECK_CUDA(cudaMemcpy(d_A_full_temp_verify + (size_t)N_resident * H, h_A_offload, A_offload_size, cudaMemcpyHostToDevice));
-//     }
-
-//     verify_result_gpu(d_A_full_temp_verify, d_B, d_C, N, H, S);
-    
-//     CHECK_CUDA(cudaGraphExecDestroy(graph_exec));
-//     CHECK_CUDA(cudaGraphDestroy(graph));
-//     CHECK_CUDA(cudaEventDestroy(start)); 
-//     CHECK_CUDA(cudaEventDestroy(stop));
-//     if (d_A_resident) CHECK_CUDA(cudaFree(d_A_resident));
-//     if (h_A_offload) CHECK_CUDA(cudaFreeHost(h_A_offload));
-//     CHECK_CUDA(cudaFree(d_A_full_temp_verify));
-//     CHECK_CUDA(cudaFree(d_B));
-//     CHECK_CUDA(cudaFree(d_C));
-//     CHECK_CUDA(cudaStreamDestroy(stream));
-// }
 
 /**
  * @brief Adaptation of the simultaneous memory access test using two concurrent cuBLAS kernels

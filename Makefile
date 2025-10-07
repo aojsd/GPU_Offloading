@@ -32,17 +32,22 @@ NVCCFLAGS = -O3 -arch=native
 LDFLAGS = -L$(CUDA_PATH)/lib64 -lcurand -lcublas
 LDFLAGS += -Xlinker -rpath -Xlinker $(CUDA_PATH)/lib64
 
-# Target executable name
-TARGET = memory_offload
+# Target executable names
+OFFLOAD = memory_offload
+MLP = mlp_offload
 
-# Source file
-SRCS = src/cuda/memory_offload.cu
+# Source files
+OFFLOAD_SRCS = src/cuda/memory_offload.cu
+MLP_SRCS = src/cuda/mlp.cu
 
 # Default target
-all: $(TARGET)
+all: $(OFFLOAD) $(MLP)
 
-# Rule to build the target
-$(TARGET): $(SRCS) | $(BIN_DIR)
+# Rules to build targets
+$(OFFLOAD): $(OFFLOAD_SRCS) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $(BIN_DIR)/$@ $(LDFLAGS)
+
+$(MLP): $(MLP_SRCS) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $(BIN_DIR)/$@ $(LDFLAGS)
 
 test: src/cuda/test.cu | $(BIN_DIR)
@@ -54,6 +59,6 @@ $(BIN_DIR):
 
 # Rule to clean up
 clean:
-	rm -f $(BIN_DIR)/$(TARGET) $(BIN_DIR)/test
+	rm -f $(BIN_DIR)/$(OFFLOAD) $(BIN_DIR)/test
 
 .PHONY: all clean

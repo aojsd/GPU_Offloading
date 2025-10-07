@@ -1,4 +1,5 @@
 OffloadRatio_r,TargetCommRatio_x,Compute1_Resident_ms,Compute2_Offloaded_ms,Transfer1_Main_ms,Transfer2_Prefetch_ms,Observed_Transfer_BW_GBs,Observed_GPU_Throughput_GBs,Avg_Per_Layer_Time_ms,Avg_Forward_Pass_Time_ms
+0.000,0,0.5149,0,0,0,0,1173.05,0.5149,5.1488
 0.005,200.0000000000,0.5082,0.0166,0.2603,0.0181,11.3749,1137.3075,0.5300,5.3106
 0.010,100.0000000000,0.5057,0.0189,0.5110,0.0122,12.1375,1136.1099,0.5306,5.3162
 0.015,66.6666666666,0.4964,0.0231,0.5054,0.0128,18.5146,1147.1180,0.5255,5.2652

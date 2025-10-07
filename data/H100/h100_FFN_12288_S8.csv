@@ -1,4 +1,5 @@
 OffloadRatio,Data_Transfer_ms,Compute_Resident_ms,Compute_Offloaded_ms,Comm_Bandwidth_GBs,GPU_Throughput_GBs,Total_Kernel_Time_ms,Total_Compute_Time_ms
+0.000,0,0.519,0,0,1163.463,0.519,0.519
 0.005,0.489,0.513,0.017,3.216,1139.137,0.536,0.530
 0.010,0.484,0.508,0.017,9.742,1149.974,0.531,0.525
 0.015,0.477,0.501,0.021,16.490,1157.946,0.527,0.522

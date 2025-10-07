@@ -18,8 +18,9 @@ usage() {
   echo "Usage: $0 [-H <hidden dimension>] [-N <rows>] [-S <seq length/batch size>] [-d] <output_filename.csv>"
   echo "  (Arguments can be in any order)"
   echo
-  echo "  -H, -N, -S: Optional arguments to pass to the '$EXECUTABLE' binary."
+  echo "  -H, -N, -S:   Optional arguments to pass to the '$EXECUTABLE' binary."
   echo "  -d:           Enable debug mode to print the full command and its output."
+  echo "  --nvlink      Enable NVLink transfers."
   echo "  <output_filename.csv>: Mandatory argument for the output data file."
   exit 1
 }

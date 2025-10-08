@@ -63,7 +63,6 @@ def main():
         # Find the row with the maximum 'OffloadRatio_r' to get the measured bandwidth
         max_offload_row = data.loc[data['OffloadRatio_r'].idxmax()]
         measured_bandwidth = max_offload_row['Observed_Transfer_BW_GBs']
-        print(f"[{label}] Measured Communication Bandwidth: {measured_bandwidth:.2f} GB/s")
 
         # Calculate throughput for all data points and normalize
         data['Throughput'] = 1 / data['Avg_Forward_Pass_Time_ms']
@@ -73,7 +72,9 @@ def main():
         # Calculate predicted throughput
         non_off_gpu = data['Observed_GPU_Throughput_GBs'].iloc[0]
         x = non_off_gpu / measured_bandwidth
-        lambda_pred_throughput = lambda R: min(1, 1 / ((x + 1) * R)) if R != 0 else 1
+        print(f"[{label}] Communication Bandwidth: {measured_bandwidth:.2f} GB/s,\t GPU Throughput: {non_off_gpu:.2f} GB/s,\t 1/x = {1/x:.2f}")
+
+        lambda_pred_throughput = lambda R: min(1, 1 / ((x+1) * R)) if R != 0 else 1
         data['Predicted_Throughput'] = data['OffloadRatio_r'].apply(lambda_pred_throughput)
 
         # --- Plotting on the current subplot (ax) ---

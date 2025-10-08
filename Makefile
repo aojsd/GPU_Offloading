@@ -35,19 +35,24 @@ LDFLAGS += -Xlinker -rpath -Xlinker $(CUDA_PATH)/lib64
 # Target executable names
 OFFLOAD = memory_offload
 MLP = mlp_offload
+GEMM_ROW_SPLIT = gemm_row_split
 
 # Source files
 OFFLOAD_SRCS = src/cuda/memory_offload.cu
 MLP_SRCS = src/cuda/mlp.cu
+GEMM_ROW_SPLIT_SRCS = src/cuda/gemm_row_split.cu
 
 # Default target
-all: $(OFFLOAD) $(MLP)
+all: $(OFFLOAD) $(MLP) $(GEMM_ROW_SPLIT)
 
 # Rules to build targets
 $(OFFLOAD): $(OFFLOAD_SRCS) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $(BIN_DIR)/$@ $(LDFLAGS)
 
 $(MLP): $(MLP_SRCS) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $(BIN_DIR)/$@ $(LDFLAGS)
+
+$(GEMM_ROW_SPLIT): $(GEMM_ROW_SPLIT_SRCS) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $(BIN_DIR)/$@ $(LDFLAGS)
 
 test: src/cuda/test.cu | $(BIN_DIR)
@@ -59,6 +64,6 @@ $(BIN_DIR):
 
 # Rule to clean up
 clean:
-	rm -f $(BIN_DIR)/$(OFFLOAD) $(BIN_DIR)/$(MLP) $(BIN_DIR)/test
+	rm -f $(BIN_DIR)/$(OFFLOAD) $(BIN_DIR)/$(MLP) $(BIN_DIR)/$(GEMM_ROW_SPLIT) $(BIN_DIR)/test
 
 .PHONY: all clean

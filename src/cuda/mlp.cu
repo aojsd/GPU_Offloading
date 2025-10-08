@@ -125,12 +125,19 @@ void runBaselineMlpTest(int H, int N, int num_layers, int trials) {
     double observed_gpu_throughput = avg_forward_pass_ms > 0 ? (total_weights_size_gb / (avg_forward_pass_ms / 1000.0)) : 0.0;
 
     std::cout << "\n--- Baseline Performance (No Offloading) ---\n";
+    std::cout << "\n--- Average Timings per Layer (over " << trials * num_layers << " samples) ---\n";
     std::cout << std::fixed << std::setprecision(4);
-    std::cout << "Avg. Per-Layer Time:    " << std::setw(8) << avg_per_layer_ms << " ms\n";
-    std::cout << "Avg. Forward Pass Time: " << std::setw(8) << avg_forward_pass_ms << " ms\n";
-    // ✅ Add throughput to output
-    std::cout << std::fixed << std::setprecision(2);
-    std::cout << "Observed GPU Throughput:" << std::setw(8) << observed_gpu_throughput << " GB/s\n";
+    std::cout << "Compute1 (Resident):      " << std::setw(8) << avg_per_layer_ms << " ms\n";
+    std::cout << "Compute2 (Offloaded):     " << std::setw(8) << 0 << " ms\n";
+    std::cout << "Transfer1 (Main):         " << std::setw(8) << 0 << " ms\n";
+    std::cout << "Transfer2 (Pre-fetch):    " << std::setw(8) << 0 << " ms\n";
+    
+    std::cout << "\n--- Overall Performance Metrics ---\n";
+    std::cout << std::fixed << std::setprecision(4);
+    std::cout << "Observed Transfer BW:     " << std::setw(8) << 0 << " GB/s\n";
+    std::cout << "Observed GPU Throughput:  " << std::setw(8) << observed_gpu_throughput << " GB/s\n";
+    std::cout << "Avg. Per-Layer Time:      " << std::setw(8) << avg_per_layer_ms << " ms (Wall Clock)\n";
+    std::cout << "Avg. Forward Pass Time:   " << std::setw(8) << avg_forward_pass_ms << " ms (Wall Clock)\n";
 
 
     // --- 5. Cleanup ---

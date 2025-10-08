@@ -397,11 +397,19 @@ void runSingleKernelTest(int N, int H, int S, int trials, bool use_uvm, int devi
     double effective_bandwidth = (A_size) / (avg_time_ms / 1000.0) / 1e9;
     double gflops = (2.0 * N * S * H) / (avg_time_ms / 1000.0) / 1e9;
 
+    std::string bw_label = "NVLink Transfer (D2D): ";
     std::cout << "\n--- Timings (avg over " << trials << " graph trials) ---\n";
     std::cout << std::fixed << std::setprecision(3);
+    std::cout << bw_label << std::setw(8) << 0 << " ms\n";
+    std::cout << "Compute (Resident Data):  " << std::setw(8) << avg_time_ms << " ms\n";
+    std::cout << "Compute (Offloaded Data): " << std::setw(8) << 0 << " ms\n";
+    std::cout << "--------------------------------------\n";
+    std::cout << "Comm. Bandwidth (GB/s):   " << std::setw(8) << 0 << "\n";
+    std::cout << "GPU Throughput (GB/s):    " << std::setw(8) << effective_bandwidth << "\n";
     std::cout << "GFLOPS:                   " << std::setw(8) << gflops << "\n";
-    std::cout << "Effective Bandwidth (GB/s): " << std::setw(8) << effective_bandwidth << "\n";
+    std::cout << "--------------------------------------\n";
     std::cout << "Total Kernel Time:        " << std::setw(8) << avg_time_ms << " ms\n";
+    std::cout << "Total Compute Time:       " << avg_time_ms << " ms\n";
 
     verify_result_gpu(d_A, d_B, d_C, N, H, S);
     

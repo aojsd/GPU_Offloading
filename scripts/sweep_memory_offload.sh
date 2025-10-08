@@ -7,9 +7,9 @@
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 EXP_ROOT="$SCRIPT_DIR/.."
 EXECUTABLE=$(realpath "$EXP_ROOT/bin/memory_offload")
-START_RATIO=0.005
+START_RATIO=0.00
 STEP=0.005
-END_RATIO=0.25
+END_RATIO=0.40
 
 # --- Script Logic ---
 

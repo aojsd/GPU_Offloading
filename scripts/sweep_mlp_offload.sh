@@ -9,9 +9,9 @@
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 EXP_ROOT="$SCRIPT_DIR/.."
 EXECUTABLE=$(realpath "$EXP_ROOT/bin/mlp_offload")
-START_RATIO=0.005
+START_RATIO=0.00
 STEP=0.005
-END_RATIO=0.25
+END_RATIO=0.40
 
 # --- Script Logic ---
 
@@ -98,7 +98,11 @@ echo "Output will be saved to '$OUTPUT_FILE'"
 # --- Main Loop ---
 for r in $(seq $START_RATIO $STEP $END_RATIO); do
   # Calculate x = 1/r for the mlp_offload binary
-  x=$(echo "scale=10; 1 / $r" | bc -l)
+  if (( $(echo "$r == 0" | bc -l) )); then
+    x=$r
+  else
+    x=$(echo "scale=10; 1 / $r" | bc -l)
+  fi
 
   echo "Running with offload ratio r=$r (x=$x)"
 

@@ -26,7 +26,7 @@ def main():
     # --- Plot Styling Parameters (Tunable) ---
     FONTSIZE_AXIS = 14
     FONTSIZE_TITLE = 16
-    FONTSIZE_LEGEND = 16
+    FONTSIZE_LEGEND = 14
     H_SPACE_BETWEEN_PLOTS = 0.1  # Horizontal space between subplots
     V_SPACE_TITLE_TO_GRAPH = 6.0 # Vertical padding for subplot titles
     V_SPACE_LEGEND_TO_GRAPH = -0.25 # Vertical position of the legend relative to subplots
@@ -74,19 +74,40 @@ def main():
         x = non_off_gpu / measured_bandwidth
         print(f"[{label}] Communication Bandwidth: {measured_bandwidth:.2f} GB/s,\t GPU Throughput: {non_off_gpu:.2f} GB/s,\t 1/x = {1/x:.2f}")
 
-        lambda_pred_throughput = lambda R: min(1, 1 / ((x+1) * R)) if R != 0 else 1
+        lambda_pred_throughput = lambda R: min(1, 1 / (x * R)) if R != 0 else 1
         data['Predicted_Throughput'] = data['OffloadRatio_r'].apply(lambda_pred_throughput)
+
+        # Predicted throughput corrected to empirical GPU throughput
+        # For each row:
+        #  - Calculate y = min(1, 1 / [(gpu_thrp_row / measured_bandwidth) * offload_ratio_row])
+        #  - Normalized throughput is then y * gpu_thrp_row / non_off_gpu
+        data['Corrected_Predicted_Throughput'] = data.apply(
+            lambda row: min(
+                1, 1 / ((row['Observed_GPU_Throughput_GBs'] / measured_bandwidth)* row['OffloadRatio_r'])
+            ) if row['OffloadRatio_r'] != 0 else 1,
+            axis=1
+        )
+        data['Corrected_Predicted_Throughput'] *= data['Observed_GPU_Throughput_GBs'] / non_off_gpu
 
         # --- Plotting on the current subplot (ax) ---
 
         # Add the baseline horizontal line
-        ax.axhline(y=1, color='r', linestyle='--', label='No Offloading', zorder=3)
+        ax.axhline(y=1, color='r', linestyle='--', label='No Offloading', zorder=2)
 
         # Plot the normalized throughput vs. offload ratio
-        ax.plot(data['OffloadRatio_r'] * 100, data['Normalized_Throughput'], marker='o', markersize=5, linestyle='-', label='Measured', color='tab:blue', zorder=1)
+        ax.plot(data['OffloadRatio_r'] * 100, data['Normalized_Throughput'],
+                marker='o', markersize=5, linestyle='-',
+                label='Measured', color='tab:blue', zorder=1)
 
         # Plot the predicted throughput vs. offload ratio
-        ax.plot(data['OffloadRatio_r'] * 100, data['Predicted_Throughput'], marker='.', markersize=2, linestyle='-', label='Performance Model', color='tab:orange', zorder=2)
+        ax.plot(data['OffloadRatio_r'] * 100, data['Predicted_Throughput'],
+                marker='.', markersize=2, linestyle='-', linewidth=1,
+                label='Constant GPU Throughput Model', color='tab:green', zorder=3)
+
+        # Plot the corrected predicted throughput vs. offload ratio
+        ax.plot(data['OffloadRatio_r'] * 100, data['Corrected_Predicted_Throughput'],
+                marker='.', markersize=2, linestyle='-', linewidth=1,
+                label='Corrected Model', color='tab:orange', zorder=4)
 
         # Add labels and title for the subplot
         ax.set_xlabel('Memory Offload Ratio (%)', fontsize=FONTSIZE_AXIS)

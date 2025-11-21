@@ -5,6 +5,10 @@ import argparse
 import time
 import torch.compiler
 
+# Set all PyTorch subsystems to only report ERRORS
+import logging
+torch._logging.set_logs(all=logging.ERROR)
+
 # Check for GPU availability
 if not torch.cuda.is_available():
     raise RuntimeError("This benchmark requires a CUDA GPU.")
@@ -47,8 +51,8 @@ class HybridOffloadAttention(torch.nn.Module):
         
         # Compile ONLY the compute kernels.
         # The orchestration (streams, copies) remains in Eager Python.
-        self.compute_A = torch.compile(self._compute_A_impl, mode="reduce-overhead")
-        self.compute_B_merge = torch.compile(self._compute_B_merge_impl, mode="reduce-overhead")
+        self.compute_A = torch.compile(self._compute_A_impl, mode="max-autotune")
+        self.compute_B_merge = torch.compile(self._compute_B_merge_impl, mode="max-autotune")
 
     def _compute_A_impl(self, q, k_A, v_A):
         return flex_attention(q, k_A, v_A, return_lse=True)
@@ -82,7 +86,7 @@ def benchmark(args):
     D_HEAD = args.head_dim
     Q_len = args.q_len
     
-    total_kv = args.total_kv_len
+    total_kv = args.seq_length
     offload_ratio = args.offload_ratio
     
     # Calculate Splits
@@ -170,7 +174,7 @@ def benchmark(args):
     # ==========================================
     print("  -> Benchmarking Baseline (Full GPU, Compiled)...")
     
-    baseline_model = torch.compile(BaselineAttention(), mode="reduce-overhead").to(device)
+    baseline_model = torch.compile(BaselineAttention(), mode="max-autotune").to(device)
     
     # Warmup
     with torch.no_grad():
@@ -273,13 +277,13 @@ def benchmark(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark Concurrent KV Offloading")
     # Dimensions
-    parser.add_argument("-b", "--batch-size", type=int, default=4, help="Batch size (default: 4)")
+    parser.add_argument("-b", "--batch-size", type=int, default=1, help="Batch size (default: 1)")
     parser.add_argument("-H", "--heads", type=int, default=48, help="Number of attention heads (default: 48)")
     parser.add_argument("-D", "--head-dim", type=int, default=256, help="Dimension per attention head (default: 256)")
     parser.add_argument("-q", "--q-len", type=int, default=1, help="Query sequence length (default: 1 for decoding)")
     
     # KV Cache Config
-    parser.add_argument("--total-kv-len", type=int, default=10000, help="Total KV sequence length (default: 10000)")
+    parser.add_argument("-S", "--seq-length", type=int, default=10000, help="Total KV sequence length (default: 10000)")
     parser.add_argument("-r", "--offload-ratio", type=float, default=0.1, 
                         help="Fraction of KV cache offloaded/split (0.0 to 1.0). Example: 0.5 = 50%% split.")
     args = parser.parse_args()

@@ -5,6 +5,10 @@ import copy
 import argparse
 import sys
 
+# Set all PyTorch subsystems to only report ERRORS
+import logging
+torch._logging.set_logs(all=logging.ERROR)
+
 # Check for GPU availability
 if not torch.cuda.is_available():
     raise RuntimeError("This benchmark requires a CUDA GPU.")
@@ -52,7 +56,7 @@ def benchmark(args):
     D_HEAD = args.head_dim
     Q_len = args.q_len
     
-    total_kv = args.total_kv_len
+    total_kv = args.seq_length
     offload_ratio = args.offload_ratio
 
     # Validate ratio
@@ -153,8 +157,8 @@ def benchmark(args):
     # ==========================================
     # 3. Benchmark Full Attention (Compiled/Graph)
     # ==========================================
-    print("  -> Compiling FULL Attention (mode='reduce-overhead')...")
-    full_op_compiled = torch.compile(full_op, mode="reduce-overhead")
+    print("  -> Compiling FULL Attention (mode='max-autotune')...")
+    full_op_compiled = torch.compile(full_op, mode="max-autotune")
     
     # Aggressive Warmup for Compile/Graph capture
     for _ in range(20):
@@ -171,8 +175,8 @@ def benchmark(args):
     # ==========================================
     # 4. Benchmark Split & Merge (Compiled/Graph)
     # ==========================================
-    print("  -> Compiling SPLIT Attention (mode='reduce-overhead')...")
-    split_op_compiled = torch.compile(split_op, mode="reduce-overhead")
+    print("  -> Compiling SPLIT Attention (mode='max-autotune')...")
+    split_op_compiled = torch.compile(split_op, mode="max-autotune")
     
     # Aggressive Warmup for Compile/Graph capture
     for _ in range(20):
@@ -223,13 +227,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark FlexAttention for Split-KV Decoding")
     
     # Dimensions
-    parser.add_argument("-b", "--batch-size", type=int, default=4, help="Batch size (default: 4)")
+    parser.add_argument("-b", "--batch-size", type=int, default=1, help="Batch size (default: 1)")
     parser.add_argument("-H", "--heads", type=int, default=48, help="Number of attention heads (default: 48)")
     parser.add_argument("-D", "--head-dim", type=int, default=256, help="Dimension per attention head (default: 256)")
     parser.add_argument("-q", "--q-len", type=int, default=1, help="Query sequence length (default: 1 for decoding)")
     
     # KV Cache Config
-    parser.add_argument("--total-kv-len", type=int, default=10000, help="Total KV sequence length (default: 10000)")
+    parser.add_argument("-S", "--seq-length", type=int, default=10000, help="Total KV sequence length (default: 10000)")
     parser.add_argument("-r", "--offload-ratio", type=float, default=0.5, 
                         help="Fraction of KV cache offloaded/split (0.0 to 1.0). Example: 0.5 = 50%% split.")
 

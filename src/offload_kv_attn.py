@@ -13,8 +13,14 @@ torch._logging.set_logs(all=logging.ERROR)
 if not torch.cuda.is_available():
     raise RuntimeError("This benchmark requires a CUDA GPU.")
 
+def compile_if_needed(func, compile_mode):
+    if compile_mode is None:
+        return func
+    else:
+        return torch.compile(func, mode=compile_mode)
+
 # ==========================================
-# 1. Helper: Stable Merge Logic
+# Helper: Merge Logic
 # ==========================================
 def merge_attention_states(out1, lse1, out2, lse2):
     # Upcast to FP32 for numerical stability
@@ -34,7 +40,7 @@ def merge_attention_states(out1, lse1, out2, lse2):
     return new_out.to(torch.float16), new_lse.squeeze(-1)
 
 # ==========================================
-# 2. Baseline: Standard Compiled Attention
+# Baseline Attention
 # ==========================================
 class BaselineAttention(torch.nn.Module):
     def forward(self, q, k, v):
@@ -42,17 +48,14 @@ class BaselineAttention(torch.nn.Module):
         return flex_attention(q, k, v, return_lse=True)
 
 # ==========================================
-# 3. Optimized: Hybrid Concurrent Attention
+# Offloaded Attention
 # ==========================================
 class HybridOffloadAttention(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, compile_mode=None):
         super().__init__()
         self.transfer_stream = torch.cuda.Stream()
-        
-        # Compile ONLY the compute kernels.
-        # The orchestration (streams, copies) remains in Eager Python.
-        self.compute_A = torch.compile(self._compute_A_impl, mode="max-autotune")
-        self.compute_B_merge = torch.compile(self._compute_B_merge_impl, mode="max-autotune")
+        self.compute_A = compile_if_needed(self._compute_A_impl, compile_mode)
+        self.compute_B_merge = compile_if_needed(self._compute_B_merge_impl, compile_mode)
 
     def _compute_A_impl(self, q, k_A, v_A):
         return flex_attention(q, k_A, v_A, return_lse=True)
@@ -60,24 +63,44 @@ class HybridOffloadAttention(torch.nn.Module):
     def _compute_B_merge_impl(self, q, k_B, v_B, out_A, lse_A):
         out_B, lse_B = flex_attention(q, k_B, v_B, return_lse=True)
         return merge_attention_states(out_A, lse_A, out_B, lse_B)
-
-    def forward(self, q, k_A, v_A, k_B_gpu, v_B_gpu, k_B_host, v_B_host):
-        # 1. Start Transfer on Side Stream (Eager Python)
+    
+    def start_transfers(self, k_B_gpu, v_B_gpu, k_B_host, v_B_host):
         with torch.cuda.stream(self.transfer_stream):
             k_B_gpu.copy_(k_B_host, non_blocking=True)
             v_B_gpu.copy_(v_B_host, non_blocking=True)
-        
-        # 2. Start Compute A (Compiled Graph Dispatch)
+
+    def forward(self, q, k_A, v_A, k_B_gpu, v_B_gpu, k_B_host, v_B_host):
+        # Start Transfers
+        self.start_transfers(k_B_gpu, v_B_gpu, k_B_host, v_B_host)
+
+        # Start Compute A (Compiled Graph Dispatch)
         out_A, lse_A = self.compute_A(q, k_A, v_A)
         
-        # 3. Synchronization (CPU tells GPU Stream 0 to wait for Stream 1)
+        # Synchronization (CPU tells GPU Stream 0 to wait for Stream 1)
         torch.cuda.current_stream().wait_stream(self.transfer_stream)
         
-        # 4. Compute B & Merge (Compiled Graph Dispatch)
+        # Compute B & Merge (Compiled Graph Dispatch)
         return self.compute_B_merge(q, k_B_gpu, v_B_gpu, out_A, lse_A)
 
 # ==========================================
-# 4. Benchmarking Infrastructure
+# Result Sanity Check
+# ==========================================
+class MergedAttention(torch.nn.Module):
+    def __init__(self, compile_mode=None):
+        super().__init__()
+        self.flex_attention = compile_if_needed(flex_attention, compile_mode)
+        self.compute_B_merge = compile_if_needed(self.compute_B_merge_, compile_mode)
+    
+    def compute_B_merge_(self, q, k_B, v_B, out_A, lse_A):
+        out_B, lse_B = flex_attention(q, k_B, v_B, return_lse=True)
+        return merge_attention_states(out_A, lse_A, out_B, lse_B)
+
+    def forward(self, q, k_A, v_A, k_B, v_B):
+        out_A, lse_A = self.flex_attention(q, k_A, v_A, return_lse=True)
+        return self.compute_B_merge(q, k_B, v_B, out_A, lse_A)
+    
+# ==========================================
+# Benchmarking
 # ==========================================
 def benchmark(args):
     # --- Configuration from Args ---
@@ -85,6 +108,12 @@ def benchmark(args):
     H = args.heads
     D_HEAD = args.head_dim
     Q_len = args.q_len
+    if args.compile_mode == 0:
+        compile_mode = None
+    elif args.compile_mode == 1:
+        compile_mode = "reduce-overhead"
+    else:
+        compile_mode = "max-autotune"
     
     total_kv = args.seq_length
     offload_ratio = args.offload_ratio
@@ -118,7 +147,11 @@ def benchmark(args):
     print(f"{'Total KV Size':<25} : {total_kv_bytes / 1024**3:.2f} GB")
     print(f"{'Transfer Size (Block B)':<25} : {transfer_bytes / 1024**3:.2f} GB")
     print("=" * 75)
-    print("\nStarting Warmup and Compilation...\n")
+
+    if compile_mode is not None:
+        print(f"\nStarting Warmup and Compilation ({compile_mode})...\n")
+    else:
+        print(f"\nStarting Warmup (No Compilation)...\n")
     
     # --- Allocations ---
     q = torch.randn(B_BATCH, H, Q_len, D_HEAD, device=device, dtype=dtype)
@@ -173,8 +206,7 @@ def benchmark(args):
     # Phase 1: Baseline (Full GPU Attention)
     # ==========================================
     print("  -> Benchmarking Baseline (Full GPU, Compiled)...")
-    
-    baseline_model = torch.compile(BaselineAttention(), mode="max-autotune").to(device)
+    baseline_model = compile_if_needed(BaselineAttention(), compile_mode).to(device)
     
     # Warmup
     with torch.no_grad():
@@ -208,7 +240,7 @@ def benchmark(args):
     # ==========================================
     print("  -> Benchmarking Hybrid (Concurrent Offload)...")
     
-    hybrid_model = HybridOffloadAttention().to(device)
+    hybrid_model = HybridOffloadAttention(compile_mode=compile_mode).to(device)
 
     # Warmup 
     with torch.no_grad():
@@ -265,13 +297,19 @@ def benchmark(args):
     print("-" * 85)
     
     # Validation
+    max_diff = 1e-3
+    if not args.default_baseline:
+        merged_attn = MergedAttention(compile_mode).to(device)
+        with torch.no_grad():
+            out_gt, _ = merged_attn(q, k_A, v_A, k_B, v_B)
+        max_diff = 0.0
     diff = (out_hybrid - out_gt).abs().max()
     
     print(f"\nValidation Delta (Max Diff): {diff.item():.6e}")
-    if diff.item() < 1e-3:
+    if diff.item() <= max_diff:
         print("SUCCESS: Hybrid attention matches Full attention within tolerance.")
     else:
-        print("WARNING: Significant numerical divergence detected.")
+        print("WARNING: Numerical divergence detected.")
     print("=" * 85)
 
 if __name__ == "__main__":
@@ -286,5 +324,11 @@ if __name__ == "__main__":
     parser.add_argument("-S", "--seq-length", type=int, default=10000, help="Total KV sequence length (default: 10000)")
     parser.add_argument("-r", "--offload-ratio", type=float, default=0.1, 
                         help="Fraction of KV cache offloaded/split (0.0 to 1.0). Example: 0.5 = 50%% split.")
+    
+    # Compilation and validation
+    parser.add_argument("--default-baseline", action="store_true", help="Use default GEMM for baseline.", default=False)
+    parser.add_argument("-C", "--compile-mode", type=int, default=0,
+                        choices=[0, 1, 2], help="Torch Compile Mode (0=none, 1=reduce-overhead, 2=max-autotune)")
+    
     args = parser.parse_args()
     benchmark(args)

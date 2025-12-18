@@ -2,20 +2,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention
-import logging
-import argparse
-from misc.suppress_output import suppress_output
-
 from offload_kv_attn import merge_attention_states
-
-# Set logging to none
-torch._logging.set_logs(all=logging.CRITICAL)
+from misc.suppress_output import suppress_output
+import argparse
 
 def compile_if_needed(module, compile_mode):
     if compile_mode is None:
         return module
     else:
-        return torch.compile(module, mode=compile_mode)
+        # Suppress compile output and logs
+        with suppress_output():
+            return torch.compile(module, mode=compile_mode)
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=100000):
@@ -183,8 +180,6 @@ class OffloadedTransformer(nn.Module):
         self.softmax = compile_if_needed(nn.Softmax(dim=-1), compile_mode)
 
         # Larger compilation
-        self.offloaded_attention = compile_if_needed(self.offloaded_attention_, compile_mode)
-        self.offloaded_mm = compile_if_needed(self.offloaded_mm_, compile_mode)
         self.forward_compute = compile_if_needed(self.forward_compute_, compile_mode)
 
         # I/O Stream events
@@ -196,7 +191,7 @@ class OffloadedTransformer(nn.Module):
         self.ffn2_events = [torch.cuda.Event(enable_timing=False) for _ in range(num_layers)]
         self.output_event = torch.cuda.Event(enable_timing=False)
 
-    def offloaded_attention_(self, q, k_A, v_A, k_B, v_B, 
+    def offloaded_attention(self, q, k_A, v_A, k_B, v_B, 
                             event_transfer_done: torch.cuda.Event):
         out_A, lse_A = flex_attention(q, k_A, v_A, return_lse=True)
         torch.cuda.current_stream().wait_event(event_transfer_done)
@@ -204,7 +199,7 @@ class OffloadedTransformer(nn.Module):
         out, _ = merge_attention_states(out_A, lse_A, out_B, lse_B)
         return out
     
-    def offloaded_mm_(self, x, weight_A, weight_B,
+    def offloaded_mm(self, x, weight_A, weight_B,
                     event_transfer_done: torch.cuda.Event):
         out_A = F.linear(x, weight_A)
         torch.cuda.current_stream().wait_event(event_transfer_done)
@@ -348,7 +343,7 @@ def run_benchmark(args):
         compile_mode = "max-autotune"
 
     print("="*85)
-    print(f"{'Full Offloaded Transformer Benchmark':^85}")
+    print(f"{'Offloaded Transformer Benchmark':^85}")
     print("="*85)
     print(f"{'Batch Size':<25} : {B}")
     print(f"{'Hidden Dim':<25} : {H_dim}")
@@ -392,8 +387,7 @@ def run_benchmark(args):
     # 1. Resident Transformer
     # -------------------------------------------------------
     print("  -> Benchmarking Resident Transformer...")
-    with suppress_output():
-        res_model = ResidentTransformer(H_dim, Heads, L, compile_mode=compile_mode).to(device).to(torch.float16)
+    res_model = ResidentTransformer(H_dim, Heads, L, compile_mode=compile_mode).to(device).to(torch.float16)
     
     # Warmup
     with torch.no_grad():
@@ -418,8 +412,7 @@ def run_benchmark(args):
     # 2. Offloaded Transformer
     # -------------------------------------------------------
     print("  -> Benchmarking Offloaded Transformer...")
-    with suppress_output():
-        off_model = OffloadedTransformer(H_dim, Heads, L, compile_mode=compile_mode).to(device).to(torch.float16)
+    off_model = OffloadedTransformer(H_dim, Heads, L, compile_mode=compile_mode).to(device).to(torch.float16)
     
     # Warmup
     with torch.no_grad():
@@ -452,14 +445,14 @@ def run_benchmark(args):
     print("=" * 85)
     print(f"{'Metric':<30} | {'Time (ms)':<12} | {'Eff. BW':<18} | {'Note':<15}")
     print("-" * 85)
-    print(f"{'1. Resident GPU':<30} | {time_res:<12.4f} | {bw_res:<7.2f} GB/s {'':<8} | {'Baseline':<15}")
-    print(f"{'2. Offloaded Pipeline':<30} | {time_off:<12.4f} | {bw_off:<7.2f} GB/s {'':<8} | {calc_diff(time_off):<15}")
+    print(f"{'Fully-Resident':<30} | {time_res:<12.4f} | {bw_res:<7.2f} GB/s {'':<8} | {'Baseline':<15}")
+    print(f"{'Offloaded Transformer':<30} | {time_off:<12.4f} | {bw_off:<7.2f} GB/s {'':<8} | {calc_diff(time_off):<15}")
     print("-" * 85)
     print("Note: Bandwidth = (Weights + KV_Read) / Time. Ignores small intermediate writes.")
     print("=" * 85)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark Offloaded Transformer Pipeline")
+    parser = argparse.ArgumentParser(description="Benchmark Offloaded Transformer")
     
     parser.add_argument("-H", "--hidden-dim", type=int, default=8192, help="Hidden Dimension")
     parser.add_argument("-L", "--num-layers", type=int, default=4, help="Number of Layers")

@@ -334,6 +334,9 @@ def run_benchmark(args):
     
     mm_ratio = args.w_offload
     kv_ratio = args.kv_offload
+    if args.ratio > 0:
+        mm_ratio = args.ratio
+        kv_ratio = args.ratio
     
     if args.compile_mode == 0:
         compile_mode = None
@@ -462,7 +465,8 @@ if __name__ == "__main__":
     
     parser.add_argument("--w_offload", type=float, default=0.05, help="Ratio of weights offloaded to CPU")
     parser.add_argument("--kv_offload", type=float, default=0.05, help="Ratio of KV cache offloaded to CPU")
-    
+    parser.add_argument("--ratio", type=float, default=-1.0, help="Offload ratio for both weights and KV (overrides individual settings if > 0)")
+
     parser.add_argument("-C", "--compile-mode", type=int, default=0,
                         choices=[0, 1, 2], help="Torch Compile Mode (0=none, 1=reduce-overhead, 2=max-autotune)")
     

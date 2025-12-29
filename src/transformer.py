@@ -1,7 +1,7 @@
 import argparse
 import torch
 from include.transformer_common import *
-from include.split_offloaded_transformer import SplitOffloadedTransformer
+from include.split_offloaded_transformer import *
 from include.resident_transfomer import ResidentTransformer
 
 # ====================================================================================

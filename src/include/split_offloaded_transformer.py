@@ -5,6 +5,68 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention
 
+# Manages all weights and KV cache of a split offloaded transformer
+class SplitOffloadedTransformerData(OffloadedTransformerData):
+    def __init__(self, batch_size, hidden_dim, seq_len, num_heads, num_layers, dev_gpu,
+                 mm_offload_ratio, kv_offload_ratio):
+        super(SplitOffloadedTransformerData, self).__init__(
+            batch_size, hidden_dim, seq_len, num_heads, num_layers, dev_gpu)
+        
+        # Offloaded rows calculation
+        self.qkv_offload_rows = int(3*hidden_dim * mm_offload_ratio)
+        self.kv_offload_rows = int(seq_len * kv_offload_ratio)
+        self.ffn1_offload_rows = int(4 * hidden_dim * mm_offload_ratio)
+        self.ffn2_offload_rows = int(hidden_dim * mm_offload_ratio)
+        self.output_offload_rows = int(hidden_dim * mm_offload_ratio)
+
+        # Split projection weights, KV cache, and FFNs into resident and offloaded portions
+        # QKV Projections
+        self.qkv_resident = [self.qkv_full[i][:3 * hidden_dim - self.qkv_offload_rows, :]
+                             for i in range(num_layers)]
+        self.qkv_offloaded = [torch.zeros(self.qkv_offload_rows, hidden_dim, device='cpu', dtype=torch.float16).pin_memory()
+                              for _ in range(num_layers)]
+        # KV Cache
+        self.k_resident = [self.k_full[i][:, :, :seq_len - self.kv_offload_rows, :]
+                           for i in range(num_layers)]
+        self.v_resident = [self.v_full[i][:, :, :seq_len - self.kv_offload_rows, :]
+                           for i in range(num_layers)]
+        self.k_offloaded = [torch.zeros(batch_size, num_heads, self.kv_offload_rows + 1, hidden_dim // num_heads, device='cpu', dtype=torch.float16).pin_memory()
+                            for _ in range(num_layers)]
+        self.v_offloaded = [torch.zeros(batch_size, num_heads, self.kv_offload_rows + 1, hidden_dim // num_heads, device='cpu', dtype=torch.float16).pin_memory()
+                            for _ in range(num_layers)]
+        # FFN Layers        
+        self.ffn1_resident = [self.ffn1_full[i][:4 * hidden_dim - self.ffn1_offload_rows, :]
+                             for i in range(num_layers)]
+        self.ffn2_resident = [self.ffn2_full[i][:hidden_dim - self.ffn2_offload_rows, :]
+                             for i in range(num_layers)]
+        self.ffn1_offloaded = [torch.zeros(self.ffn1_offload_rows, hidden_dim, device='cpu', dtype=torch.float16).pin_memory()
+                              for _ in range(num_layers)]
+        self.ffn2_offloaded = [torch.zeros(self.ffn2_offload_rows, 4 * hidden_dim, device='cpu', dtype=torch.float16).pin_memory()
+                              for _ in range(num_layers)]
+        # Output Linear
+        self.output_resident = self.output_full[:hidden_dim - self.output_offload_rows, :]
+        self.output_offloaded = torch.zeros(self.output_offload_rows, hidden_dim, device='cpu', dtype=torch.float16).pin_memory()
+
+        # Copy offloaded portions to CPU
+        for i in range(num_layers):
+            self.qkv_offloaded[i].copy_(self.qkv_full[i][3 * hidden_dim - self.qkv_offload_rows:, :])
+            # Only copy the history part of the KV cache.
+            # The last slot (seq_len) is reserved for the new token and shouldn't overwrite fresh computations.
+            self.k_offloaded[i][..., :-1, :].copy_(self.k_full[i][:, :, seq_len - self.kv_offload_rows : seq_len, :])
+            self.v_offloaded[i][..., :-1, :].copy_(self.v_full[i][:, :, seq_len - self.kv_offload_rows : seq_len, :])
+            
+            self.ffn1_offloaded[i].copy_(self.ffn1_full[i][4 * hidden_dim - self.ffn1_offload_rows:, :])
+            self.ffn2_offloaded[i].copy_(self.ffn2_full[i][hidden_dim - self.ffn2_offload_rows:, :])
+            self.output_offloaded.copy_(self.output_full[hidden_dim - self.output_offload_rows:, :])
+
+        # Scratchpad space for offloaded portions on GPU (1 per operation per layer)
+        self.qkv_scratch = torch.zeros(self.qkv_offload_rows, hidden_dim, device=dev_gpu, dtype=torch.float16)
+        self.k_scratch = torch.zeros(batch_size, num_heads, self.kv_offload_rows + 1, hidden_dim // num_heads, device=dev_gpu, dtype=torch.float16)
+        self.v_scratch = torch.zeros(batch_size, num_heads, self.kv_offload_rows + 1, hidden_dim // num_heads, device=dev_gpu, dtype=torch.float16)
+        self.ffn1_scratch = torch.zeros(self.ffn1_offload_rows, hidden_dim, device=dev_gpu, dtype=torch.float16)
+        self.ffn2_scratch = torch.zeros(self.ffn2_offload_rows, 4 * hidden_dim, device=dev_gpu, dtype=torch.float16)
+        self.output_scratch = torch.zeros(self.output_offload_rows, hidden_dim, device=dev_gpu, dtype=torch.float16)
+
 
 # Transformer where each compute step has a portion of data offloaded originally
 class SplitOffloadedTransformer(nn.Module):

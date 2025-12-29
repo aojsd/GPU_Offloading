@@ -24,6 +24,13 @@ class PositionalEncoding(nn.Module):
 # Dummy parent class for all transformer data objects
 class OffloadedTransformerData():
     def __init__(self, batch_size, hidden_dim, seq_len, num_heads, num_layers, dev_gpu):
+        self.batch_size = batch_size
+        self.hidden_dim = hidden_dim
+        self.seq_len = seq_len
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        self.dev_gpu = dev_gpu
+
         # Initialize QKV projection weights
         self.qkv_full = [torch.randn(3 * hidden_dim, hidden_dim, device=dev_gpu, dtype=torch.float16)
                          for _ in range(num_layers)]

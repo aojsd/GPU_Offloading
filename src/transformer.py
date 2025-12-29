@@ -138,8 +138,8 @@ def run_benchmark(args):
     print("-" * 85)
     print(f"{'Fully-Resident':<30} | {time_res:<12.4f} | {bw_res:<7.2f} GB/s {'':<8} | {'Baseline':<15}")
     print(f"{'Offloaded Transformer':<30} | {time_off:<12.4f} | {bw_off:<7.2f} GB/s {'':<8} | {calc_diff(time_off):<15}")
-    print("-" * 85)
-    print("Note: Bandwidth = (Weights + KV_Read) / Time. Ignores small intermediate writes.")
+    print("=" * 85)
+    print(f"{'True Offload Ratio: ' + f'{data.offload_ratio():.2%}'}")
     print("=" * 85)
 
 if __name__ == "__main__":

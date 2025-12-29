@@ -67,6 +67,35 @@ class SplitOffloadedTransformerData(OffloadedTransformerData):
         self.ffn2_scratch = torch.zeros(self.ffn2_offload_rows, 4 * hidden_dim, device=dev_gpu, dtype=torch.float16)
         self.output_scratch = torch.zeros(self.output_offload_rows, hidden_dim, device=dev_gpu, dtype=torch.float16)
 
+    # Calculate the total percentage of data offloaded
+    # 1 - (resident_data + scratchpad_data) / total_data
+    def offload_ratio(self):
+        total_elements = self.num_layers * (
+            self.qkv_full[0].numel() +
+            # Only count the history part of the KV cache
+            self.k_full[0][:, :, :self.seq_len, :].numel() +
+            self.v_full[0][:, :, :self.seq_len, :].numel() +
+            self.ffn1_full[0].numel() +
+            self.ffn2_full[0].numel()
+        ) + self.output_full.numel()
+
+        resident_elements = self.num_layers * (
+            self.qkv_resident[0].numel() +
+            self.k_resident[0].numel() +
+            self.v_resident[0].numel() +
+            self.ffn1_resident[0].numel() +
+            self.ffn2_resident[0].numel()
+        ) + self.output_resident.numel()
+
+        scratchpad_elements = self.qkv_scratch.numel() + \
+            self.k_scratch.numel() + \
+            self.v_scratch.numel() + \
+            self.ffn1_scratch.numel() + \
+            self.ffn2_scratch.numel() + \
+            self.output_scratch.numel()
+        
+        return 1 - (resident_elements + scratchpad_elements) / total_elements
+
 
 # Transformer where each compute step has a portion of data offloaded originally
 class SplitOffloadedTransformer(nn.Module):

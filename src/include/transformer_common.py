@@ -51,3 +51,13 @@ class OffloadedTransformerData():
         
         # Initialize output linear weights
         self.output_full = torch.randn(hidden_dim, hidden_dim, device=dev_gpu, dtype=torch.float16)
+
+        # Calculate total number of parameters
+        self.total_elements = self.num_layers * (
+            self.qkv_full[0].numel() +
+            # Only count the history part of the KV cache
+            self.k_full[0][:, :, :self.seq_len, :].numel() +
+            self.v_full[0][:, :, :self.seq_len, :].numel() +
+            self.ffn1_full[0].numel() +
+            self.ffn2_full[0].numel()
+        ) + self.output_full.numel()

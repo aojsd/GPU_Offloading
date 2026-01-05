@@ -17,8 +17,8 @@ B_OFFLOADED = 128   # Offloaded tokens per layer (swapped into scratchpad)
 
 # Physical Tensor Layout:
 # [ Layer0_Res | Layer1_Res | ... | Shared_Scratchpad ]
-PHYSICAL_LEN = (L_LAYERS * A_RESIDENT) + B_OFFLOADED
-SCRATCHPAD_START = PHYSICAL_LEN - B_OFFLOADED
+PHYSICAL_LEN = (L_LAYERS * A_RESIDENT) + B_OFFLOADED * 2
+SCRATCHPAD_START = PHYSICAL_LEN - B_OFFLOADED * 2
 
 print(f"--- Configuration ---")
 print(f"Physical Tensor Size: {PHYSICAL_LEN}")
@@ -31,6 +31,8 @@ print(f"Note: Scratchpad is overwritten for every layer.\n")
 def get_layer_mask_mod(layer_idx):
     res_start = layer_idx * A_RESIDENT
     res_end   = (layer_idx + 1) * A_RESIDENT
+    scratchpad_start = SCRATCHPAD_START + B_OFFLOADED * (layer_idx % 2)
+    scratchpad_end   = scratchpad_start + B_OFFLOADED
     
     # We capture the constants for this specific layer
     def mask_mod(b, h, q_idx, kv_idx):
@@ -40,7 +42,7 @@ def get_layer_mask_mod(layer_idx):
         # 2. Is this token in the SHARED SCRATCHPAD section?
         # (We always allow attention to the scratchpad, assuming the correct 
         #  data has been loaded there before calling this)
-        is_scratchpad = kv_idx >= SCRATCHPAD_START
+        is_scratchpad = (kv_idx >= scratchpad_start) & (kv_idx < scratchpad_end)
         
         return is_resident | is_scratchpad
     return mask_mod
@@ -50,8 +52,8 @@ def get_layer_mask_mod(layer_idx):
 # -----------------------------------------------------------------------------
 # Global Tensors (The "System Memory")
 # We allocate these ONCE. The Resident parts will stay resident.
-k_giant = torch.zeros(BATCH, HEADS, PHYSICAL_LEN, DIM, device=device, dtype=dtype)
-v_giant = torch.zeros(BATCH, HEADS, PHYSICAL_LEN, DIM, device=device, dtype=dtype)
+k_heap = torch.zeros(BATCH, HEADS, PHYSICAL_LEN, DIM, device=device, dtype=dtype)
+v_heap = torch.zeros(BATCH, HEADS, PHYSICAL_LEN, DIM, device=device, dtype=dtype)
 
 query = torch.randn(BATCH, HEADS, 1, DIM, device=device, dtype=dtype)
 
@@ -71,8 +73,8 @@ for i in range(L_LAYERS):
     # Write physically to the permanent slot
     start = i * A_RESIDENT
     end   = start + A_RESIDENT
-    k_giant[:, :, start:end, :] = k_res
-    v_giant[:, :, start:end, :] = v_res
+    k_heap[:, :, start:end, :] = k_res
+    v_heap[:, :, start:end, :] = v_res
 
     # Generate unique "Offloaded" data (currently on "CPU")
     k_off = torch.randn(BATCH, HEADS, B_OFFLOADED, DIM, device=device, dtype=dtype)
@@ -88,9 +90,10 @@ for layer_idx in range(L_LAYERS):
     # 1. LOAD: Copy this layer's offloaded data into the Shared Scratchpad
     #    (Simulating the Memory Offload Transfer)
     k_off_src, v_off_src = layer_offload_data[layer_idx]
-    
-    k_giant[:, :, SCRATCHPAD_START:, :] = k_off_src
-    v_giant[:, :, SCRATCHPAD_START:, :] = v_off_src
+    s_start = SCRATCHPAD_START + B_OFFLOADED * (layer_idx % 2)
+    s_end   = s_start + B_OFFLOADED
+    k_heap[:, :, s_start:s_end, :].copy_(k_off_src)
+    v_heap[:, :, s_start:s_end, :].copy_(v_off_src)
 
     # 2. MASK: Create mask specific to this layer's resident slot + scratchpad
     mask_mod = get_layer_mask_mod(layer_idx)
@@ -99,7 +102,7 @@ for layer_idx in range(L_LAYERS):
     )
 
     # 3. EXECUTE: Flex Attention on the Giant Tensor
-    out_offloaded = torch.compile(flex_attention)(query, k_giant, v_giant, block_mask=block_mask)
+    out_offloaded = torch.compile(flex_attention)(query, k_heap, v_heap, block_mask=block_mask)
 
     # --- Validation ---
     # Retrieve the pure logic data to build a standard baseline

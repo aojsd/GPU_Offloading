@@ -2,6 +2,7 @@ import argparse
 import torch
 from include.transformer_common import *
 from include.split_offloaded_transformer import *
+from include.kv_offload_transformer import *
 from include.resident_transfomer import ResidentTransformer
 
 # ====================================================================================
@@ -33,8 +34,11 @@ def run_benchmark(args):
     else:
         compile_mode = "max-autotune"
 
+    transformer_type = args.transformer_type
+    t_string = "Split Offload" if transformer_type == 0 else "KV Offload"
+
     print("="*85)
-    print(f"{'Offloaded Transformer Benchmark':^85}")
+    print(f"{'Offloaded Transformer Benchmark (' + t_string + ')':^85}")
     print("="*85)
     print(f"{'Batch Size':<25} : {B}")
     print(f"{'Hidden Dim':<25} : {H_dim}")
@@ -70,8 +74,12 @@ def run_benchmark(args):
 
     # Initialize Data Container (Weights + Cache)
     print("Initializing model weights and cache...")
-    data = SplitOffloadedTransformerData(B, H_dim, Seq_Len, Heads, L, device, 
+    if transformer_type == 0:
+        data = SplitOffloadedTransformerData(B, H_dim, Seq_Len, Heads, L, device, 
                                     mm_offload_ratio=mm_ratio, 
+                                    kv_offload_ratio=kv_ratio)
+    elif transformer_type == 1:
+        data = CacheOffloadedTransformerData(B, H_dim, Seq_Len, Heads, L, device, 
                                     kv_offload_ratio=kv_ratio)
     
     # -------------------------------------------------------
@@ -103,7 +111,11 @@ def run_benchmark(args):
     # 2. Offloaded Transformer
     # -------------------------------------------------------
     print("  -> Benchmarking Offloaded Transformer...")
-    off_model = SplitOffloadedTransformer(H_dim, Heads, L, compile_mode=compile_mode).to(device).to(torch.float16)
+    if transformer_type == 0:
+        off_model = SplitOffloadedTransformer(H_dim, Heads, L, compile_mode=compile_mode).to(device).to(torch.float16)
+    elif transformer_type == 1:
+        off_model = CacheOffloadedTransformer(H_dim, Heads, L, data, compile_mode=compile_mode).to(device).to(torch.float16)
+
     
     # Warmup
     with torch.no_grad():
@@ -144,7 +156,9 @@ def run_benchmark(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark Offloaded Transformer")
-    
+    parser.add_argument("-T", "--transformer-type", type=int, default=1,
+                        choices=[0, 1], help="Transformer Type (0=Split Offload, 1=KV Offload)")
+
     parser.add_argument("-H", "--hidden-dim", type=int, default=8192, help="Hidden Dimension")
     parser.add_argument("-L", "--num-layers", type=int, default=4, help="Number of Layers")
     parser.add_argument("-b", "--batch-size", type=int, default=1, help="Batch Size")

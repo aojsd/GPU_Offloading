@@ -39,7 +39,7 @@ def suppress_all_output():
 # Edit this array to test different heuristics.
 # Example High Throughput (v1 preferred): [100] * 128
 # Example Low Latency (v2 preferred):     [10000, 10000]
-SEQUENCE_LENGTHS = [100000, 12000, 4000, 2048, 1024, 500, 100, 50] * 4
+SEQUENCE_LENGTHS = [100000, 12000, 4000, 2048, 1024, 500, 100, 50] * 16
 
 # Benchmarking
 NUM_TRIALS = 100
@@ -152,26 +152,6 @@ tmp_output = torch.empty((NUM_SEQS, NUM_HEADS, max_num_partitions, HEAD_SIZE), d
 # ==========================================
 # FLEX ATTENTION SETUP
 # ==========================================
-
-# 1. Create Metadata Tables
-owner_table = torch.full((num_physical_blocks,), -1, dtype=torch.int32, device=DEVICE)
-logical_block_indices = torch.full((num_physical_blocks,), -1, dtype=torch.int32, device=DEVICE)
-
-for seq_id in range(NUM_SEQS):
-    num_blocks = (SEQUENCE_LENGTHS[seq_id] + BLOCK_SIZE - 1) // BLOCK_SIZE
-    valid_blocks = block_tables[seq_id, :num_blocks].long()
-    
-    # Map Physical Block -> Owner Sequence
-    owner_table[valid_blocks] = seq_id
-    
-    # Map Physical Block -> Logical Index (0, 1, 2...) in that sequence
-    # This allows us to calculate the global token index later
-    logical_block_indices[valid_blocks] = torch.arange(num_blocks, device=DEVICE, dtype=torch.int32)
-
-# 2. Reshape Inputs for Flex
-# Flex Query: (1, Heads, Num_Seqs, Head_Dim)
-flex_query = query.unsqueeze(0).transpose(1, 2).contiguous()
-
 # -------------------------------------------------------------------------
 # Un-permute KV cache for FlexAttention Correctness
 # vLLM Shape: (blocks, heads, head_size/x, block_size, x)
@@ -207,10 +187,7 @@ def unpermute_vllm_cache(cache_tensor):
     # 3. Add Batch dim
     return t.unsqueeze(0).contiguous()
 
-flex_key = unpermute_vllm_cache(key_cache)
-flex_val = unpermute_vllm_cache(value_cache)
-
-# 3. Define the Mask Mod (Fixed to respect context_len)
+# 3. Define the mask mod
 def paged_mask_mod(b, h, q_idx, kv_idx):
     # Map the dense Query Index (0..N) to Sequence ID
     seq_id = q_idx 
@@ -232,21 +209,10 @@ def paged_mask_mod(b, h, q_idx, kv_idx):
     
     return is_owned & is_in_bounds
 
-# 4. Create Block Mask
-print("Generating BlockMask (this handles the layout mapping)...")
-block_mask = create_block_mask(
-    paged_mask_mod,
-    B=1,
-    H=NUM_HEADS,
-    Q_LEN=NUM_SEQS,
-    KV_LEN=num_physical_blocks * BLOCK_SIZE,
-    device=DEVICE
-)
-
-# Compilation
+# Ensure compilation works before allocating any memory
 flex_status = True
 try:
-    # Define pure function
+    # Define pure function (not compiled)
     def run_flex_pure(q, k, v, mask):
         return flex_attention(q, k, v, block_mask=mask)
 
@@ -256,7 +222,39 @@ try:
     with suppress_all_output():
         run_flex_compiled = torch.compile(run_flex_pure, mode="max-autotune-no-cudagraphs")
     
-    # Force Compilation now by running once
+    # 1. Create Metadata Tables
+    owner_table = torch.full((num_physical_blocks,), -1, dtype=torch.int32, device=DEVICE)
+    logical_block_indices = torch.full((num_physical_blocks,), -1, dtype=torch.int32, device=DEVICE)
+
+    for seq_id in range(NUM_SEQS):
+        num_blocks = (SEQUENCE_LENGTHS[seq_id] + BLOCK_SIZE - 1) // BLOCK_SIZE
+        valid_blocks = block_tables[seq_id, :num_blocks].long()
+        
+        # Map Physical Block -> Owner Sequence
+        owner_table[valid_blocks] = seq_id
+        
+        # Map Physical Block -> Logical Index (0, 1, 2...) in that sequence
+        # This allows us to calculate the global token index later
+        logical_block_indices[valid_blocks] = torch.arange(num_blocks, device=DEVICE, dtype=torch.int32)
+
+    # 2. Reshape Inputs for Flex
+    # Flex Query: (1, Heads, Num_Seqs, Head_Dim)
+    flex_query = query.unsqueeze(0).transpose(1, 2).contiguous()
+    flex_key = unpermute_vllm_cache(key_cache)
+    flex_val = unpermute_vllm_cache(value_cache)
+
+    # 3. Create Block Mask
+    print("Generating BlockMask (this handles the layout mapping)...")
+    block_mask = create_block_mask(
+        paged_mask_mod,
+        B=1,
+        H=NUM_HEADS,
+        Q_LEN=NUM_SEQS,
+        KV_LEN=num_physical_blocks * BLOCK_SIZE,
+        device=DEVICE
+    )
+
+    # 4. Force Compilation now by running once
     run_flex_compiled(flex_query, flex_key, flex_val, block_mask)
     torch.cuda.synchronize()
     print("FlexAttention Compilation: SUCCESS")
@@ -272,7 +270,6 @@ except Exception as e:
 # ==========================================
 # BENCHMARKING FUNCTIONS
 # ==========================================
-
 def run_v1():
     ops.paged_attention_v1(
         output_v1, query, key_cache, value_cache, NUM_KV_HEADS, scale,
@@ -322,7 +319,6 @@ def benchmark(name, func):
 # ==========================================
 # CORRECTNESS CHECKS
 # ==========================================
-
 print("\n--- Correctness Checks ---")
 
 # Helper to run a kernel and catch immediate CUDA launch errors

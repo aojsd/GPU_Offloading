@@ -11,7 +11,7 @@ from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 # Edit this array to test different heuristics.
 # Example High Throughput (v1 preferred): [100] * 128
 # Example Low Latency (v2 preferred):     [10000, 10000]
-SEQUENCE_LENGTHS = [12000, 4000, 2048, 1024, 500, 100, 50] * 5
+SEQUENCE_LENGTHS = [20000, 12000, 4000, 2048, 1024, 500, 100, 50]
 
 # Benchmarking
 NUM_TRIALS = 100

@@ -3,6 +3,34 @@ from vllm import _custom_ops as ops
 import argparse
 import sys
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from contextlib import contextmanager
+
+@contextmanager
+def suppress_all_output():
+    """
+    Redirects file descriptors 1 (stdout) and 2 (stderr) to /dev/null.
+    This suppresses output from C++ extensions, Triton, and the Python interpreter.
+    """
+    # Open a pair of null files
+    null_fds = [os.open(os.devnull, os.O_RDWR) for x in range(2)]
+    
+    # Save the actual stdout (1) and stderr (2) file descriptors.
+    save_fds = [os.dup(1), os.dup(2)]
+
+    try:
+        # Assign the null pointers to stdout and stderr.
+        os.dup2(null_fds[0], 1)
+        os.dup2(null_fds[1], 2)
+        yield
+    finally:
+        # Re-assign the real stdout/stderr back to (1) and (2)
+        os.dup2(save_fds[0], 1)
+        os.dup2(save_fds[1], 2)
+        
+        # Close the null files and the saved copies
+        for fd in null_fds + save_fds:
+            os.close(fd)
+
 
 # ==========================================
 # USER CONFIGURATION
@@ -11,7 +39,7 @@ from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 # Edit this array to test different heuristics.
 # Example High Throughput (v1 preferred): [100] * 128
 # Example Low Latency (v2 preferred):     [10000, 10000]
-SEQUENCE_LENGTHS = [20000, 12000, 4000, 2048, 1024, 500, 100, 50]
+SEQUENCE_LENGTHS = [100000, 12000, 4000, 2048, 1024, 500, 100, 50] * 4
 
 # Benchmarking
 NUM_TRIALS = 100
@@ -215,15 +243,30 @@ block_mask = create_block_mask(
     device=DEVICE
 )
 
-# 5. Compile Flex Attention
-# CHANGED: Use 'max-autotune-no-cudagraphs' to prevent crash on large inputs
-@torch.compile(mode="max-autotune-no-cudagraphs")
-def run_flex_compiled(q, k, v, mask):
-    return flex_attention(q, k, v, block_mask=mask)
+# Compilation
+flex_status = True
+try:
+    # Define pure function
+    def run_flex_pure(q, k, v, mask):
+        return flex_attention(q, k, v, block_mask=mask)
 
-print("Compiling FlexAttention...")
-run_flex_compiled(flex_query, flex_key, flex_val, block_mask)
-print("Compilation finished.")
+    # Compile
+    # Note: Compilation is lazy. It happens on the first call.
+    print("Compiling FlexAttention ...")
+    with suppress_all_output():
+        run_flex_compiled = torch.compile(run_flex_pure, mode="max-autotune-no-cudagraphs")
+    
+    # Force Compilation now by running once
+    run_flex_compiled(flex_query, flex_key, flex_val, block_mask)
+    torch.cuda.synchronize()
+    print("FlexAttention Compilation: SUCCESS")
+
+except Exception as e:
+    print(f">>> FlexAttention Compilation Failed!")
+    flex_status = False
+    # Define a dummy fallback so functions don't crash before checking status
+    def dummy_fail(*args, **kwargs): raise RuntimeError("Flex failed to compile")
+    run_flex_compiled = dummy_fail
 
 
 # ==========================================
@@ -290,7 +333,6 @@ def safe_run_kernel(name, func):
         return True
     except Exception as e:
         print(f">>> WARNING: {name} crashed or failed to launch.")
-        print(f"    Error: {e}")
         return False
 
 # 1. Run v1 Safely
@@ -302,8 +344,9 @@ run_v2()
 torch.cuda.synchronize()
 
 # 3. Run Flex
-out_flex = run_flex()
-torch.cuda.synchronize()
+if flex_status:
+    out_flex = run_flex()
+    torch.cuda.synchronize()
 
 # --- Check v1 vs v2 ---
 v1_valid = False
@@ -326,23 +369,25 @@ if v1_status:
                 print(">>> v1 check passed.")
                 v1_valid = True
     except Exception as e:
-        print(f">>> WARNING: Error comparing v1 vs v2 (Context likely corrupted): {e}")
+        print(f">>> WARNING: Error comparing v1 vs v2 (Context likely corrupted)")
         v1_valid = False
 else:
     print(">>> v1 check SKIPPED (Crashed on launch).")
 
 # --- Check v2 vs Flex ---
 # Flex output: (1, H, Q, D) -> Permute to (Q, H, D)
-out_flex_reshaped = out_flex.squeeze(0).transpose(0, 1) 
+if flex_status:
+    out_flex_reshaped = out_flex.squeeze(0).transpose(0, 1) 
 
-flex_passed = torch.allclose(output_v2, out_flex_reshaped, rtol=1e-2, atol=1e-2)
-diff_v2_flex = torch.abs(output_v2 - out_flex_reshaped).max().item()
-print(f"Max Diff (v2 vs Flex): {diff_v2_flex:.6f}")
-
-if not flex_passed:
-    print(">>> WARNING: FlexAttention output differs significantly from v2.")
+    flex_passed = torch.allclose(output_v2, out_flex_reshaped, rtol=1e-2, atol=1e-2)
+    diff_v2_flex = torch.abs(output_v2 - out_flex_reshaped).max().item()
+    print(f"Max Diff (v2 vs Flex): {diff_v2_flex:.6f}")
+    if not flex_passed:
+        print(">>> WARNING: v2 output differs significantly from FlexAttention.")
+    else:
+        print(">>> Flex check passed.")
 else:
-    print(">>> FlexAttention sanity check passed.")
+    print(">>> WARNING: Flex correctness check SKIPPED (Compilation failed).")
 
 
 # ==========================================
@@ -363,7 +408,14 @@ else:
         bw1 = 0.0
 
 bw2 = benchmark("v2 (FlashDecoding)", run_v2)
-bw3 = benchmark("FlexAttention", run_flex)
+
+# Only benchmark flex attention if compilation succeeded
+if flex_status:
+    bw3 = benchmark("FlexAttention", run_flex)
+else:
+    print(f"{'FlexAttention':<20} | SKIPPED (Failed Compilation)")
+    bw3 = 0.0
+
 
 print("\n--- Summary ---")
 best_bw = max(bw1, bw2, bw3)
@@ -371,6 +423,6 @@ if best_bw > 0:
     print(f"Peak Bandwidth: {best_bw:.2f} GB/s")
     if bw1 > 0: print(f"v1 vs Peak: {bw1/best_bw:.2f}x")
     print(f"v2 vs Peak: {bw2/best_bw:.2f}x")
-    print(f"Flex vs Peak: {bw3/best_bw:.2f}x")
+    if bw3 > 0: print(f"Flex vs Peak: {bw3/best_bw:.2f}x")
 else:
     print("All kernels failed.")

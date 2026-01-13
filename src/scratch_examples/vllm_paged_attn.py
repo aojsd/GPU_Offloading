@@ -2,6 +2,7 @@ import torch
 from vllm import _custom_ops as ops
 import argparse
 import sys
+import os
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from contextlib import contextmanager
 

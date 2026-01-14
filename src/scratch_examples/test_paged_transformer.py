@@ -11,10 +11,10 @@ from include.paged_transformer import PagedTransformer, PagedTransformerData, Tr
 # ==========================================
 # CONFIGURATION
 # ==========================================
-BATCH_SIZE = 16
-SEQ_LEN = 4096  # Long sequence to stress BW
+BATCH_SIZE = 1
+SEQ_LEN = 500000  # Long sequence to stress BW
 DIM = 8192
-HEADS = 32
+HEADS = 64
 LAYERS = 4      # Keep small for quick testing, BW scales linearly
 BLOCK_SIZE = 16
 DTYPE = torch.float16
@@ -60,7 +60,7 @@ x_input = torch.randn((BATCH_SIZE, 1, DIM), dtype=DTYPE, device=DEVICE)
 # COMPILATION
 # ==========================================
 print("Compiling model (torch.compile)...")
-compiled_model = torch.compile(model, mode="max-autotune-no-cudagraphs")
+compiled_model = torch.compile(model)
 
 # Trigger compilation with a single run
 with torch.no_grad():

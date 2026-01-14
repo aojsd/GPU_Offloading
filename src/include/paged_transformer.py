@@ -35,11 +35,11 @@ class PagedTransformerData:
         self.x = 16 // element_size
         
         # 1. Allocate Heaps
-        self.key_heap = torch.zeros(
+        self.key_heap = torch.randn(
             (max_num_blocks, num_heads, head_dim // self.x, block_size, self.x),
             dtype=dtype, device=device
         )
-        self.val_heap = torch.zeros(
+        self.val_heap = torch.randn(
             (max_num_blocks, num_heads, head_dim, block_size),
             dtype=dtype, device=device
         )
@@ -108,7 +108,7 @@ class PagedTransformer(nn.Module):
         self.register_buffer("v_scale", torch.tensor(1.0, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor, data: PagedTransformerData):
-        # FIX: Calculate max_seq_len as a Python int to avoid graph breaks
+        # Calculate max_seq_len as a Python int to avoid graph breaks
         # We know seq_len from init, plus 1 for the new token.
         max_seq_len_scalar = data.seq_len + 1
         
@@ -185,7 +185,7 @@ class PagedTransformerBlock(nn.Module):
         )
         
         # 3. READ PHASE
-        # FIX: Reshape Query to 3D [Batch, Heads, HeadDim]
+        # Reshape Query to 3D [Batch, Heads, Head Dim]
         # vLLM expects [num_seqs, num_heads, head_size]
         q_for_attn = q.transpose(1, 2).squeeze(2).contiguous()
         

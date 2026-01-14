@@ -5,6 +5,13 @@ from torch.nn.attention.flex_attention import flex_attention
 from offload_kv_attn import merge_attention_states
 from include.misc import compile_if_needed
 
+class TransformerArgs:
+    def __init__(self, dim, n_heads, n_layers, norm_eps=1e-5):
+        self.dim = dim
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.norm_eps = norm_eps
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=100000):
         super(PositionalEncoding, self).__init__()

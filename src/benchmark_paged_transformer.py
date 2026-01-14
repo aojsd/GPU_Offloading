@@ -3,26 +3,35 @@ import time
 import argparse
 import sys
 import os
+from include.transformer_common import TransformerArgs
 from include.paged_transformer import PagedTransformer, PagedTransformerData
-from include.paged_offload_transformer import PagedOffloadTransformer, PagedOffloadTransformerData, TransformerArgs
+from include.paged_offload_transformer import PagedOffloadTransformer, PagedOffloadTransformerData
+
+# ==========================================
+# HARDCODED SEQUENCE LENGTHS (Dynamic Batch)
+# ==========================================
+# A mix of lengths to stress the arbitrary batch logic
+SEQUENCE_LENGTHS = [8192, 4096, 2048, 1024, 512, 256, 128] * 2
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark Paged and Paged-Offload Transformers")
+    parser = argparse.ArgumentParser(description="Benchmark Paged Transformer (Arbitrary Batches)")
     
     # Configuration
-    parser.add_argument("-b", "--batch_size", type=int, default=16, help="Batch size")
-    parser.add_argument("-s", "--seq_len", type=int, default=8192, help="Sequence length (history)")
-    parser.add_argument("-H", "--dim", type=int, default=2048, help="Hidden dimension")
-    parser.add_argument("--heads", type=int, default=64, help="Number of attention heads")
-    parser.add_argument("--layers", type=int, default=8, help="Number of layers")
+    parser.add_argument("--dim", type=int, default=8192, help="Hidden dimension")
+    parser.add_argument("--heads", type=int, default=32, help="Number of attention heads")
+    parser.add_argument("--layers", type=int, default=4, help="Number of layers")
     parser.add_argument("--block_size", type=int, default=16, help="PagedAttention block size")
     
     # Offloading
     parser.add_argument("-r", "--offload_ratio", type=float, default=0.0, 
                         help="Ratio of KV cache to offload to CPU (0.0 = Fully Resident)")
     
+    # Randomization
+    parser.add_argument("--randomize_blocks", action="store_true", 
+                        help="Randomize physical block layout to test fragmentation")
+    
     # Compilation & Benchmarking
-    parser.add_argument("-C", "--compile_mode", type=str, default="default", 
+    parser.add_argument("--compile_mode", type=str, default="default", 
                         choices=["default", "reduce-overhead", "max-autotune"],
                         help="torch.compile mode")
     parser.add_argument("--warmup", type=int, default=10, help="Number of warmup steps")
@@ -30,20 +39,26 @@ def main():
     
     args = parser.parse_args()
     
+    # Allocation Mode
+    allocation_mode = "random" if args.randomize_blocks else "contiguous"
+
     # Derived Constants
     DTYPE = torch.float16
     DEVICE = "cuda"
+    BATCH_SIZE = len(SEQUENCE_LENGTHS)
     
     print(f"\n==========================================")
     print(f"       Transformer Benchmark Config       ")
     print(f"==========================================")
     print(f"Mode:          {'Offloaded' if args.offload_ratio > 0 else 'Fully Resident'}")
-    print(f"Batch Size:    {args.batch_size}")
-    print(f"Seq Len:       {args.seq_len}")
+    print(f"Batch Size:    {BATCH_SIZE}")
+    print(f"Seq Lengths:   {SEQUENCE_LENGTHS}")
+    print(f"Total Tokens:  {sum(SEQUENCE_LENGTHS)}")
     print(f"Model Dim:     {args.dim}")
     print(f"Layers:        {args.layers}")
     print(f"Heads:         {args.heads}")
     print(f"Offload Ratio: {args.offload_ratio * 100:.1f}%")
+    print(f"Alloc Mode:    {allocation_mode}")
     print(f"Compile Mode:  {args.compile_mode}")
     print(f"==========================================\n")
 
@@ -54,48 +69,49 @@ def main():
     
     if args.offload_ratio > 0:
         # --- Offloaded Setup ---
+        # Note: Data argument removed from model init as per user request
         model = PagedOffloadTransformer(model_args).to(DEVICE).to(DTYPE)
         
         print(f"Allocating Offloaded Data...")
         data = PagedOffloadTransformerData(
-            batch_size=args.batch_size,
-            seq_len=args.seq_len,
+            sequence_lengths=SEQUENCE_LENGTHS,
             num_layers=args.layers,
             num_heads=args.heads,
             head_dim=args.dim // args.heads,
             kv_offload_ratio=args.offload_ratio,
             block_size=args.block_size,
             dtype=DTYPE,
-            device=DEVICE
+            device=DEVICE,
+            allocation_mode=allocation_mode
         )
-        print(f"  > Resident Blocks: {data.num_resident_blocks} per sequence")
-        print(f"  > Offload Blocks:  {data.num_offload_blocks} per sequence")
+        print(f"  > Total Resident Blocks (Pool): {data.total_resident_blocks_L0 + data.total_resident_blocks_L1N}")
+        print(f"  > Total Offload Blocks (Batch): {data.total_offload_blocks_batch}")
         
     else:
         # --- Resident Setup ---
         model = PagedTransformer(model_args).to(DEVICE).to(DTYPE)
         
         # Estimate blocks needed
-        blocks_per_seq = (args.seq_len + 1 + args.block_size - 1) // args.block_size
-        total_blocks = args.layers * args.batch_size * blocks_per_seq + 1024
+        blocks_per_seq = [(l + 1 + args.block_size - 1) // args.block_size for l in SEQUENCE_LENGTHS]
+        total_blocks = args.layers * sum(blocks_per_seq) + 1024
         
         print(f"Allocating Resident Data (Heap size: {total_blocks} blocks)...")
         data = PagedTransformerData(
-            batch_size=args.batch_size,
-            seq_len=args.seq_len,
+            sequence_lengths=SEQUENCE_LENGTHS,
             max_num_blocks=total_blocks,
             num_layers=args.layers,
             num_heads=args.heads,
             head_dim=args.dim // args.heads,
             block_size=args.block_size,
             dtype=DTYPE,
-            device=DEVICE
+            device=DEVICE,
+            allocation_mode=allocation_mode
         )
 
     model.eval()
     
-    # Input Tensor (Single Decode Step)
-    x_input = torch.randn((args.batch_size, 1, args.dim), dtype=DTYPE, device=DEVICE)
+    # Input Tensor (Single Decode Step for the Batch)
+    x_input = torch.randn((BATCH_SIZE, 1, args.dim), dtype=DTYPE, device=DEVICE)
 
     # ------------------------------------------------------------------
     # 2. Compilation
@@ -151,31 +167,34 @@ def main():
     element_size = torch.tensor([], dtype=DTYPE).element_size() # 2 bytes
     
     # A. Weights Load (Read for every step)
-    # 16 matrices of size D^2 per layer
     weights_bytes = args.layers * (16 * args.dim * args.dim) * element_size
     
     # B. KV Cache Write (New Token)
     # We write 1 token to all layers
-    kv_write_bytes = args.layers * args.batch_size * 1 * args.dim * 2 * element_size
+    kv_write_bytes = args.layers * BATCH_SIZE * 1 * args.dim * 2 * element_size
     
     # C. KV Cache Read (History)
     # We read the full history (Resident + Offloaded) for all layers
-    total_tokens = args.batch_size * args.seq_len
-    kv_read_bytes = args.layers * total_tokens * args.dim * 2 * element_size
+    total_tokens_history = sum(SEQUENCE_LENGTHS)
+    kv_read_bytes = args.layers * total_tokens_history * args.dim * 2 * element_size
     
     # D. PCIe Traffic (Offloaded Data Movement)
-    # Only applies to Layers 1..N
     pcie_bytes = 0
     if args.offload_ratio > 0:
         # Data class stores exact number of offloaded blocks per seq
-        offloaded_tokens_per_seq = data.num_offload_blocks * args.block_size
-        bytes_per_layer = args.batch_size * offloaded_tokens_per_seq * args.dim * 2 * element_size
+        # We need to sum up offloaded blocks for the batch
+        total_offload_blocks = data.total_offload_blocks_batch
+        
+        # Bytes = Batch_Offloaded_Blocks * Block_Size * Heads * HeadDim * 2 * Bytes
+        bytes_per_layer = total_offload_blocks * args.block_size * args.dim * 2 * element_size
         pcie_bytes = bytes_per_layer * (args.layers - 1)
 
     # Metrics
     total_mem_bytes = weights_bytes + kv_write_bytes + kv_read_bytes
     effective_bw = (total_mem_bytes / 1e9) / (avg_ms / 1000.0)
-    pcie_bw = (pcie_bytes / 1e9) / (avg_ms / 1000.0)
+    
+    # Token Throughput (Batch Size tokens generated per step)
+    tokens_per_sec = BATCH_SIZE / (avg_ms / 1000.0)
 
     # ------------------------------------------------------------------
     # 5. Report
@@ -192,8 +211,7 @@ def main():
         print(f"  PCIe Transfer:     {pcie_bytes / 1024**3:.4f} GB")
     print(f"--------------------------------------------------")
     print(f"Effective Memory BW: {effective_bw:.2f} GB/s")
-    if pcie_bytes > 0:
-        print(f"Effective PCIe BW:   {pcie_bw:.2f} GB/s")
+    print(f"Effective Tokens/s:  {tokens_per_sec:.2f} tok/s")
 
 if __name__ == "__main__":
     main()

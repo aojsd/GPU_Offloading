@@ -3,6 +3,7 @@ import time
 import argparse
 import sys
 import os
+from include.misc import GPUProfiler
 from include.transformer_common import TransformerArgs
 from include.paged_transformer import PagedTransformer, PagedTransformerData
 from include.paged_offload_transformer import PagedOffloadTransformer, PagedOffloadTransformerData
@@ -30,9 +31,10 @@ def main():
                         help="Randomize physical block layout to test fragmentation")
     
     # Compilation & Benchmarking
-    parser.add_argument("-C", "--compile_mode", type=str, default="default", help="torch.compile mode")
+    parser.add_argument("-C", "--compile_mode", type=str, default=None, help="torch.compile mode")
     parser.add_argument("--warmup", type=int, default=10, help="Number of warmup steps")
-    parser.add_argument("--trials", type=int, default=50, help="Number of benchmark trials")
+    parser.add_argument("--trials", type=int, default=100, help="Number of benchmark trials")
+    parser.add_argument("--profile", type=str, default=None, help="Output file for GPU profiling")
     
     args = parser.parse_args()
     
@@ -139,20 +141,24 @@ def main():
             compiled_model(x_input, data)
 
     # Warmup
+    torch.cuda.nvtx.range_push("Warmup Trials")
     for _ in range(args.warmup):
         run_step()
     torch.cuda.synchronize()
+    torch.cuda.nvtx.range_pop()
 
     # Timing
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(args.trials)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(args.trials)]
 
-    for i in range(args.trials):
-        start_events[i].record()
-        run_step()
-        end_events[i].record()
-
-    torch.cuda.synchronize()
+    torch.cuda.nvtx.range_push("Benchmark Trials")
+    with GPUProfiler(gpu_index=0):
+        for i in range(args.trials):
+            start_events[i].record()
+            run_step()
+            end_events[i].record()
+        torch.cuda.synchronize()
+    torch.cuda.nvtx.range_pop()
     
     # Stats
     times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]

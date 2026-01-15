@@ -10,16 +10,15 @@ from include.paged_offload_transformer import PagedOffloadTransformer, PagedOffl
 # ==========================================
 # HARDCODED SEQUENCE LENGTHS (Dynamic Batch)
 # ==========================================
-# A mix of lengths to stress the arbitrary batch logic
-SEQUENCE_LENGTHS = [8192, 4096, 2048, 1024, 512, 256, 128] * 2
+SEQUENCE_LENGTHS = [8192, 16384, 1024, 32768, 100000]
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Paged Transformer (Arbitrary Batches)")
     
     # Configuration
-    parser.add_argument("--dim", type=int, default=8192, help="Hidden dimension")
+    parser.add_argument("--dim", type=int, default=4096, help="Hidden dimension")
     parser.add_argument("--heads", type=int, default=32, help="Number of attention heads")
-    parser.add_argument("--layers", type=int, default=4, help="Number of layers")
+    parser.add_argument("--layers", type=int, default=25, help="Number of layers")
     parser.add_argument("--block_size", type=int, default=16, help="PagedAttention block size")
     
     # Offloading
@@ -31,9 +30,7 @@ def main():
                         help="Randomize physical block layout to test fragmentation")
     
     # Compilation & Benchmarking
-    parser.add_argument("--compile_mode", type=str, default="default", 
-                        choices=["default", "reduce-overhead", "max-autotune"],
-                        help="torch.compile mode")
+    parser.add_argument("-C", "--compile_mode", type=str, default="default", help="torch.compile mode")
     parser.add_argument("--warmup", type=int, default=10, help="Number of warmup steps")
     parser.add_argument("--trials", type=int, default=50, help="Number of benchmark trials")
     

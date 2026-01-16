@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from vllm import _custom_ops as ops
-from typing import List
+from typing import List, Optional
 from .transformer_common import compile_if_needed
 from .paged_transformer import PagedTransformer, PagedTransformerBlock
 
@@ -11,7 +11,7 @@ from .paged_transformer import PagedTransformer, PagedTransformerBlock
 
 class PagedOffloadTransformerData:
     """
-    Manages a Paged KV Cache with CPU Offloading.
+    Manages a Paged KV Cache with CPU Offloading for Dynamic Batches.
     """
     def __init__(
         self, 
@@ -76,14 +76,19 @@ class PagedOffloadTransformerData:
         # Ensure buffers exist even if size is 0
         off_size = self.total_offload_blocks_batch
         for _ in range(num_layers - 1):
-            k_buf = torch.randn(
-                (off_size, num_heads, head_dim // self.x, block_size, self.x),
-                dtype=dtype, device='cpu'
-            ).pin_memory()
-            v_buf = torch.randn(
-                (off_size, num_heads, head_dim, block_size),
-                dtype=dtype, device='cpu'
-            ).pin_memory()
+            if off_size > 0:
+                k_buf = torch.randn(
+                    (off_size, num_heads, head_dim // self.x, block_size, self.x),
+                    dtype=dtype, device='cpu'
+                ).pin_memory()
+                v_buf = torch.randn(
+                    (off_size, num_heads, head_dim, block_size),
+                    dtype=dtype, device='cpu'
+                ).pin_memory()
+            else:
+                k_buf = torch.empty(0, dtype=dtype, device='cpu').pin_memory()
+                v_buf = torch.empty(0, dtype=dtype, device='cpu').pin_memory()
+                
             self.k_offload_cpu.append(k_buf)
             self.v_offload_cpu.append(v_buf)
 
@@ -169,8 +174,16 @@ class PagedOffloadTransformerData:
 class PagedOffloadTransformerBlock(PagedTransformerBlock):
     """
     Inherits from PagedTransformerBlock.
-    Overrides forward_compute to inject synchronization events.
+    Overrides forward_offload to inject synchronization events.
     """
+    def __init__(self, args):
+        super().__init__(args)
+        # We compile the granular chunks to ensure kernel fusion (e.g. Norm+Linear)
+        # without baking the Wait/Record events into the graph.
+        self._op_qkv_write = torch.compile(self._op_qkv_write)
+        self._op_mlp = torch.compile(self._op_mlp)
+        self._op_attn = torch.compile(self._op_attn)
+
     def forward_offload(
         self, x, key_heap, val_heap, block_table, slot_mapping,
         context_lens, exp_sums, max_logits, tmp_output,
@@ -202,6 +215,11 @@ class PagedOffloadTransformerBlock(PagedTransformerBlock):
 # ==========================================
 
 class PagedOffloadTransformer(PagedTransformer):
+    """
+    Inherits from PagedTransformer.
+    Overrides __init__ to use PagedOffloadTransformerBlocks.
+    Overrides forward to dispatch to the correct loop (Resident vs Offload).
+    """
     def __init__(self, model_args, data=None, compile_mode=None):
         super().__init__(model_args)
         
@@ -217,45 +235,47 @@ class PagedOffloadTransformer(PagedTransformer):
         # ------------------------------------------------------------------
         # Two-Path Compilation Strategy
         # ------------------------------------------------------------------
-        
         # Path A: Resident (Standard)
         # We compile the wrapper that calls super().forward()
-        # This traces the standard loop without any I/O events.
         self.forward_resident_impl = compile_if_needed(self._forward_resident_wrapper, compile_mode)
         
         # Path B: Offloaded
-        # We compile the custom loop that includes event handling.
-        self.forward_offload_impl = compile_if_needed(self._forward_offload_loop, compile_mode)
-
-    def forward_IO(self, data: PagedOffloadTransformerData):
-        if data.total_offload_blocks_batch == 0:
-            return
-
-        with torch.cuda.stream(self.IO_stream):
-            def load_data(layer_idx):
-                sp_idx = layer_idx % 2
-                sp_start, sp_end = data.scratchpad_ranges[sp_idx]
-                
-                k_src = data.k_offload_cpu[layer_idx - 1]
-                v_src = data.v_offload_cpu[layer_idx - 1]
-                
-                data.key_heap[sp_start:sp_end].copy_(k_src, non_blocking=True)
-                data.val_heap[sp_start:sp_end].copy_(v_src, non_blocking=True)
-                
-                self.IO_stream.record_event(self.attn_data_ready_events[layer_idx - 1])
-            
-            # First two transfers can happen immediately
-            load_data(1)
-            load_data(2)
-            for layer_idx in range(3, self.n_layers):
-                self.IO_stream.wait_event(self.attn_finish_events[layer_idx - 3])
-                load_data(layer_idx)
+        # We compile the custom loop that includes I/O and event handling.
+        self.forward = compile_if_needed(self.forward_, compile_mode)
 
     def _forward_resident_wrapper(self, x, data):
         """Wrapper to allow compiling super().forward"""
         return super().forward(x, data)
 
-    def _forward_offload_loop(self, x, data, max_seq_len_scalar):
+    def load_data(self, data: PagedOffloadTransformerData, layer_idx):
+        sp_idx = layer_idx % 2
+        sp_start, sp_end = data.scratchpad_ranges[sp_idx]
+        
+        k_src = data.k_offload_cpu[layer_idx - 1]
+        v_src = data.v_offload_cpu[layer_idx - 1]
+        
+        with torch.cuda.stream(self.IO_stream):
+            data.key_heap[sp_start:sp_end].copy_(k_src, non_blocking=True)
+            data.val_heap[sp_start:sp_end].copy_(v_src, non_blocking=True)
+        self.IO_stream.record_event(self.attn_data_ready_events[layer_idx - 1])
+
+    def forward_IO(self, data: PagedOffloadTransformerData):
+        """
+        The I/O Dispatch Loop.
+        Logic:
+         - Layers 1 and 2 start immediately (filling the pipeline).
+         - Subsequent layers wait for the scratchpad to be free (finish_event[i-3]).
+        """
+        # Pipeline Priming
+        self.load_data(data, 1)
+        self.load_data(data, 2)
+        
+        # Pipeline Steady State
+        for layer_idx in range(3, self.n_layers):
+            self.IO_stream.wait_event(self.attn_finish_events[layer_idx - 3])
+            self.load_data(data, layer_idx)
+
+    def forward_offload(self, x, data, max_seq_len_scalar):
         """
         Specialized loop for Offloading.
         Uses forward() for Layer 0, forward_offload() for Layers 1..N.
@@ -285,15 +305,14 @@ class PagedOffloadTransformer(PagedTransformer):
         
         return self.norm(x)
 
-    def forward(self, x: torch.Tensor, data: PagedOffloadTransformerData):
+    def forward_(self, x: torch.Tensor, data: PagedOffloadTransformerData):
+        # No Offload Case
+        if data.total_offload_blocks_batch == 0:
+            return self.forward_resident_impl(x, data)
+
         # 1. Start I/O
         self.forward_IO(data)
         
         # 2. Dispatch
-        if data.total_offload_blocks_batch == 0:
-            # Use the clean, event-free loop
-            return self.forward_resident_impl(x, data)
-        else:
-            # Use the specialized offload loop
-            max_seq_len_scalar = data.max_seq_len + 1
-            return self.forward_offload_impl(x, data, max_seq_len_scalar)
+        max_seq_len_scalar = data.max_seq_len + 1
+        return self.forward_offload(x, data, max_seq_len_scalar)

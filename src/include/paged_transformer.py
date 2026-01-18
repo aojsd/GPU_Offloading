@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 from vllm import _custom_ops as ops
-from typing import List
+from typing import List, Optional
+from flash_attn import flash_attn_varlen_func
 
 class TransformerArgs:
     def __init__(self, dim, n_heads, n_layers, norm_eps=1e-5):
@@ -12,12 +14,19 @@ class TransformerArgs:
 
 class PagedTransformerData:
     """
-    Manages the Key/Value cache for arbitrary batch sizes and sequence lengths.
+    Manages the Key/Value cache for Mixed Batches (Prefill + Decode).
+    
+    Batch Layout:
+    [ Prefill_Seq_0_Tokens | ... | Prefill_Seq_M_Tokens | Decode_Seq_0_Token | ... | Decode_Seq_N_Token ]
+    
+    The corresponding Block Tables and Metadata follow this order:
+    Indices [0 ... M-1] -> Prefill Sequences
+    Indices [M ... M+N-1] -> Decode Sequences
     """
     def __init__(
         self, 
-        sequence_lengths: List[int],
-        max_num_blocks: int, 
+        decode_lengths: List[int],          # History lengths for decode sequences (generating 1 token)
+        prefill_lengths: List[int],         # Total lengths for prefill sequences (generating L tokens)
         num_layers: int, 
         num_heads: int, 
         head_dim: int, 
@@ -33,86 +42,156 @@ class PagedTransformerData:
         self.dtype = dtype
         self.device = device
         
-        self.batch_size = len(sequence_lengths)
-        self.sequence_lengths = sequence_lengths
-        self.max_seq_len = max(sequence_lengths)
+        # 1. Parse Inputs
+        self.decode_lengths = decode_lengths if decode_lengths is not None else []
+        self.prefill_lengths = prefill_lengths if prefill_lengths is not None else []
+        
+        self.num_prefills = len(self.prefill_lengths)
+        self.num_decodes = len(self.decode_lengths)
+        self.batch_size = self.num_prefills + self.num_decodes
+        
+        # Calculate Flattened Sizes
+        self.num_prefill_tokens = sum(self.prefill_lengths)
+        self.num_decode_tokens = self.num_decodes # 1 token per decode seq
+        self.total_tokens = self.num_prefill_tokens + self.num_decode_tokens
+        
+        # Sequence Max (for scratchpad sizing)
+        max_prefill = max(self.prefill_lengths) if self.prefill_lengths else 0
+        max_decode = max(self.decode_lengths) if self.decode_lengths else 0
+        self.max_seq_len = max(max_prefill, max_decode)
         
         element_size = torch.tensor([], dtype=dtype).element_size()
         self.x = 16 // element_size
         
-        # 1. Allocate Heaps
-        self.key_heap = torch.zeros(
-            (max_num_blocks, num_heads, head_dim // self.x, block_size, self.x),
-            dtype=dtype, device=device
-        )
-        self.val_heap = torch.zeros(
-            (max_num_blocks, num_heads, head_dim, block_size),
-            dtype=dtype, device=device
-        )
+        # ------------------------------------------------------------------
+        # 2. Block Table Allocation (Exact Size)
+        # ------------------------------------------------------------------
+        # Determine blocks needed per sequence
+        needed_blocks = []
+        # Part A: Prefills (Need blocks for `len` tokens)
+        for l in self.prefill_lengths:
+            needed_blocks.append((l + block_size - 1) // block_size)
+        # Part B: Decodes (Need blocks for `history + 1` tokens)
+        for l in self.decode_lengths:
+            needed_blocks.append((l + 1 + block_size - 1) // block_size)
+            
+        max_logical_blocks = max(needed_blocks) if needed_blocks else 0
         
-        # 2. Block Tables
-        needed_logical_blocks = [(l + 1 + block_size - 1) // block_size for l in sequence_lengths]
-        max_logical_blocks = max(needed_logical_blocks)
-        total_blocks_needed = num_layers * sum(needed_logical_blocks)
+        # Calculate EXACT total blocks needed across all layers
+        self.total_blocks = num_layers * sum(needed_blocks)
         
-        if total_blocks_needed > max_num_blocks:
-            raise RuntimeError(f"OOM: Heap size {max_num_blocks} too small. Needed {total_blocks_needed}.")
-        
-        self.context_lens = torch.tensor(
-            [l + 1 for l in sequence_lengths], dtype=torch.int32, device=device
-        )
-        
+        # Allocate Table: [Num_Layers, Batch_Size, Max_Blocks]
         self.block_tables = torch.zeros(
             (num_layers, self.batch_size, max_logical_blocks), 
             dtype=torch.int32, device=device
         )
         
+        # ------------------------------------------------------------------
+        # 3. Allocate Heaps (Exact Size)
+        # ------------------------------------------------------------------
+        self.key_heap = torch.zeros(
+            (self.total_blocks, num_heads, head_dim // self.x, block_size, self.x),
+            dtype=dtype, device=device
+        )
+        self.val_heap = torch.zeros(
+            (self.total_blocks, num_heads, head_dim, block_size),
+            dtype=dtype, device=device
+        )
+        
+        # Assign physical blocks (Linear Strategy)
         if allocation_mode == "contiguous":
             current_id = 0
             for b in range(self.batch_size):
-                num_blocks = needed_logical_blocks[b]
+                n_blocks = needed_blocks[b]
                 for l in range(num_layers):
-                    ids = torch.arange(current_id, current_id + num_blocks, device=device, dtype=torch.int32)
-                    self.block_tables[l, b, :num_blocks] = ids
-                    current_id += num_blocks
+                    ids = torch.arange(current_id, current_id + n_blocks, device=device, dtype=torch.int32)
+                    self.block_tables[l, b, :n_blocks] = ids
+                    current_id += n_blocks
         elif allocation_mode == "random":
-            available_ids = torch.randperm(max_num_blocks, device=device, dtype=torch.int32)
+            available_ids = torch.randperm(self.total_blocks, device=device, dtype=torch.int32)
             current_idx = 0
             for b in range(self.batch_size):
-                num_blocks = needed_logical_blocks[b]
+                n_blocks = needed_blocks[b]
                 for l in range(num_layers):
-                    ids = available_ids[current_idx : current_idx + num_blocks]
-                    self.block_tables[l, b, :num_blocks] = ids
-                    current_idx += num_blocks
+                    ids = available_ids[current_idx : current_idx + n_blocks]
+                    self.block_tables[l, b, :n_blocks] = ids
+                    current_idx += n_blocks
 
-        # 3. Slot Mapping
-        target_indices = torch.tensor(sequence_lengths, device=device, dtype=torch.long)
-        logical_block_indices = target_indices // block_size
-        block_offsets = target_indices % block_size
+        # ------------------------------------------------------------------
+        # 4. Slot Mapping Construction (Unified)
+        # ------------------------------------------------------------------
+        flat_batch_indices = []
+        flat_logical_indices = []
         
-        gather_indices = logical_block_indices.view(1, self.batch_size, 1).expand(num_layers, -1, -1)
-        physical_blocks = torch.gather(self.block_tables.long(), 2, gather_indices).squeeze(2)
-        
-        self.slot_mapping = (physical_blocks * block_size) + block_offsets.view(1, self.batch_size)
-        self.slot_mapping = self.slot_mapping.long()
+        # Part A: Prefills
+        for b_idx in range(self.num_prefills):
+            l = self.prefill_lengths[b_idx]
+            flat_logical_indices.append(torch.arange(l, device=device, dtype=torch.long))
+            flat_batch_indices.append(torch.full((l,), b_idx, device=device, dtype=torch.long))
+            
+        # Part B: Decodes
+        for i in range(self.num_decodes):
+            b_idx = self.num_prefills + i
+            hist_len = self.decode_lengths[i]
+            flat_logical_indices.append(torch.tensor([hist_len], device=device, dtype=torch.long))
+            flat_batch_indices.append(torch.tensor([b_idx], device=device, dtype=torch.long))
+            
+        if self.total_tokens > 0:
+            flat_logical_indices = torch.cat(flat_logical_indices)
+            flat_batch_indices = torch.cat(flat_batch_indices)
+            
+            logical_blk = flat_logical_indices // block_size
+            blk_offset = flat_logical_indices % block_size
+            
+            self.slot_mapping = torch.zeros((num_layers, self.total_tokens), dtype=torch.long, device=device)
+            
+            for l in range(num_layers):
+                phys_ids = self.block_tables[l][flat_batch_indices, logical_blk]
+                self.slot_mapping[l] = (phys_ids.long() * block_size) + blk_offset
+        else:
+            self.slot_mapping = torch.empty((num_layers, 0), dtype=torch.long, device=device)
 
-        # 4. Scratchpads
+        # ------------------------------------------------------------------
+        # 5. Attention Metadata
+        # ------------------------------------------------------------------
+        # A. Prefill Metadata
+        if self.num_prefills > 0:
+            cu_seqlens = [0]
+            cwd = 0
+            for l in self.prefill_lengths:
+                cwd += l
+                cu_seqlens.append(cwd)
+            self.prefill_cu_seqlens = torch.tensor(cu_seqlens, device=device, dtype=torch.int32)
+            self.prefill_max_seqlen = max(self.prefill_lengths)
+        else:
+            self.prefill_cu_seqlens = None
+            self.prefill_max_seqlen = 0
+
+        # B. Decode Metadata
+        if self.num_decodes > 0:
+            dec_lens = [l + 1 for l in self.decode_lengths]
+            self.decode_context_lens = torch.tensor(dec_lens, dtype=torch.int32, device=device)
+        else:
+            self.decode_context_lens = None
+
+        # v2 Scratchpads
         self._partition_size = 512
-        max_total_len = self.max_seq_len + 1
-        max_num_partitions = (max_total_len + self._partition_size - 1) // self._partition_size
+        max_num_partitions = (self.max_seq_len + self._partition_size - 1) // self._partition_size
         
-        self.exp_sums = torch.empty(
-            (self.batch_size, num_heads, max_num_partitions),
-            dtype=torch.float32, device=device
-        )
-        self.max_logits = torch.empty_like(self.exp_sums)
-        self.tmp_output = torch.empty(
-            (self.batch_size, num_heads, max_num_partitions, head_dim),
-            dtype=dtype, device=device
-        )
+        if self.num_decodes > 0:
+            self.exp_sums = torch.empty((self.num_decodes, num_heads, max_num_partitions), dtype=torch.float32, device=device)
+            self.max_logits = torch.empty_like(self.exp_sums)
+            self.tmp_output = torch.empty((self.num_decodes, num_heads, max_num_partitions, head_dim), dtype=dtype, device=device)
+        else:
+            self.exp_sums = None
+            self.max_logits = None
+            self.tmp_output = None
 
-    def get_layer_data(self, layer_idx: int):
-        return (self.block_tables[layer_idx], self.slot_mapping[layer_idx])
+    def get_layer_slot_mapping(self, layer_idx: int):
+        return self.slot_mapping[layer_idx]
+    
+    def get_decode_block_table(self, layer_idx: int):
+        return self.block_tables[layer_idx, self.num_prefills : ]
 
 
 class PagedTransformer(nn.Module):
@@ -133,18 +212,48 @@ class PagedTransformer(nn.Module):
         self.register_buffer("v_scale", torch.tensor(1.0, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor, data: PagedTransformerData):
-        max_seq_len_scalar = data.max_seq_len + 1
-        
+        """
+        x: Flattened input [Total_Tokens, Dim]. 
+           Contains prefill tokens first, then decode tokens.
+        """
+        # We need max_seq_len for the PagedAttention kernel (decode only)
+        # For the kernel scalar, we use the max context len of the decode batch
+        decode_max_seq_len = 0
+        if data.num_decodes > 0:
+            decode_max_seq_len = max(data.decode_lengths) + 1
+
         for i, layer in enumerate(self.layers):
-            block_table, slot_mapping = data.get_layer_data(i)
+            slot_mapping = data.get_layer_slot_mapping(i)
+            
+            # For PagedAttention (Decode), we need the sliced block table
+            decode_block_table = None
+            if data.num_decodes > 0:
+                decode_block_table = data.get_decode_block_table(i)
             
             x = layer(
-                x, data.key_heap, data.val_heap, block_table, slot_mapping,
-                data.context_lens, data.exp_sums, data.max_logits, data.tmp_output,
-                self.scale, self.k_scale, self.v_scale, max_seq_len_scalar
+                x, 
+                data.key_heap, 
+                data.val_heap, 
+                slot_mapping,
+                # Decode Specifics
+                decode_block_table,
+                data.decode_context_lens,
+                data.exp_sums,
+                data.max_logits,
+                data.tmp_output,
+                decode_max_seq_len,
+                # Prefill Specifics
+                data.num_prefill_tokens,
+                data.prefill_cu_seqlens,
+                data.prefill_max_seqlen,
+                # Constants
+                self.scale,
+                self.k_scale,
+                self.v_scale
             )
             
         return self.norm(x)
+
 
 class PagedTransformerBlock(nn.Module):
     def __init__(self, args):
@@ -163,29 +272,77 @@ class PagedTransformerBlock(nn.Module):
         self.w2 = nn.Linear(4 * args.dim, args.dim, bias=False)
         self.w3 = nn.Linear(args.dim, 4 * args.dim, bias=False)
 
-    # --- Decomposed Operations (Hooks for Subclasses) ---
-
     def _op_qkv_write(self, x, key_heap, val_heap, slot_mapping, k_scale, v_scale):
-        """Part 1: Projections & Write to Cache"""
+        """Unified QKV Projection and Cache Write for ALL tokens."""
         residual = x
         x = self.norm1(x)
         
-        q = self.wq(x).view(x.shape[0], 1, self.n_heads, self.head_dim)
-        k = self.wk(x).view(x.shape[0], 1, self.n_heads, self.head_dim)
-        v = self.wv(x).view(x.shape[0], 1, self.n_heads, self.head_dim)
+        # Project all tokens
+        q = self.wq(x).view(x.shape[0], self.n_heads, self.head_dim)
+        k = self.wk(x).view(x.shape[0], self.n_heads, self.head_dim)
+        v = self.wv(x).view(x.shape[0], self.n_heads, self.head_dim)
         
+        # Write all tokens to Paged Cache (Prefill + Decode) using the unified slot map
         ops.reshape_and_cache(
-            k.view(-1, self.n_heads, self.head_dim),
-            v.view(-1, self.n_heads, self.head_dim),
+            k, v,
             key_heap, val_heap, slot_mapping,
             "auto", k_scale, v_scale
         )
-        return residual, q
+        return residual, q, k, v
 
-    def _op_attn(self, q, key_heap, val_heap, block_table, context_lens, 
-                 exp_sums, max_logits, tmp_output, scale, k_scale, v_scale, max_seq_len):
-        """Part 2: Paged Attention"""
-        q_attn = q.transpose(1, 2).squeeze(2).contiguous()
+    def _op_attn_prefill(self, q, k, v, cu_seqlens, max_seqlen, scale):
+        """Flash Attention for Prefill (Self-Attention on new tokens)"""
+        # q, k, v are [Total_Prefill_Tokens, Heads, Dim]
+        # We use PyTorch SDPA with FlashAttention backend
+        # Note: PyTorch SDPA expects batch first for nested tensors usually, or flattened.
+        # For 'flash_attention' specifically, we can use the efficient implementation via 
+        # F.scaled_dot_product_attention if we format it right, or specialized kernels.
+        # However, standard SDPA often expects [B, H, S, D]. Since we have a ragged batch,
+        # treating it as 1 giant sequence with a block-diagonal mask is one way, 
+        # but modern FlashAttn V2 supports `varlen`.
+        
+        # Since we are using standard PyTorch, let's use the explicit `flash_attn_varlen_func`
+        # if available, or assume the user has the environment for it.
+        # If strictly standard torch: we might have to pad. 
+        # For simplicity/robustness here without external libs: 
+        # We will trust `flash_attn_varlen_func` if available, else we rely on vLLM ops or similar.
+        # Given vLLM is imported, let's assuming standard PyTorch SDPA for now.
+        
+        # Fallback: Since integrating varlen flash attn is complex without the lib:
+        # We will assume `torch.nn.functional.scaled_dot_product_attention` is smart enough 
+        # OR we rely on vLLM's `xformers` integration if available.
+        # BUT, to keep this clean: Let's assume we use FlashAttn if available via vllm logic,
+        # or just standard SDPA on 1 giant batch with causal mask. 
+        
+        # IMPLEMENTATION: Using torch SDPA with varlen is tricky.
+        # Strategy: Use `flash_attn` library logic if possible. 
+        # For this snippet, I will implement a placeholder call that users would swap 
+        # for `flash_attn_varlen_func(q, k, v, cu_seqlens, ...)`
+        # Since I cannot import flash_attn here, I will leave the logic clear:
+        
+        return flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            dropout_p=0.0,
+            softmax_scale=scale,
+            causal=True
+        )
+
+    def _op_attn_decode(self, q, key_heap, val_heap, block_table, context_lens, 
+                        exp_sums, max_logits, tmp_output, scale, k_scale, v_scale, max_seq_len):
+        """Paged Attention for Decode"""
+        # q is [Batch, Heads, Dim] -> PagedAttn expects [Batch, Heads, 1, Dim] logic effectively
+        # vLLM `paged_attention_v2` expects `q` as [Batch, Heads, Head_Dim]
+        # or [Batch, 1, Heads, Head_Dim]?
+        # Checking vLLM source: q: [num_seqs, num_heads, head_size]
+        
+        # But wait, our `q` comes from view(..., heads, head_dim).
+        # We need to ensure it's contiguous for the kernel.
+        
+        q_attn = q  # Already [Batch, Heads, Dim]
         attn_out = torch.empty_like(q_attn)
         
         ops.paged_attention_v2(
@@ -198,10 +355,11 @@ class PagedTransformerBlock(nn.Module):
         )
         return attn_out
 
-    def _op_mlp(self, attn_out, residual, x_shape_0):
-        """Part 3: MLP"""
-        attn_out = attn_out.unsqueeze(2).transpose(1, 2).reshape(x_shape_0, 1, -1)
-        x = self.wo(attn_out) + residual
+    def _op_mlp(self, attn_out, residual, total_tokens):
+        """Unified MLP"""
+        # attn_out: [Total_Tokens, Heads, Dim] -> Flatten to [Total_Tokens, Hidden]
+        x = attn_out.reshape(total_tokens, -1)
+        x = self.wo(x) + residual
         
         residual = x
         x = self.norm2(x)
@@ -210,18 +368,46 @@ class PagedTransformerBlock(nn.Module):
         x = x + residual
         return x
 
-    # --- Main Forward (Classic) ---
     def forward(
-        self, x, key_heap, val_heap, block_table, slot_mapping,
-        context_lens, exp_sums, max_logits, tmp_output,
-        scale, k_scale, v_scale, max_seq_len
+        self, x, key_heap, val_heap, slot_mapping,
+        # Decode Args
+        decode_block_table, decode_context_lens, 
+        exp_sums, max_logits, tmp_output, decode_max_seq_len,
+        # Prefill Args
+        num_prefill_tokens, prefill_cu_seqlens, prefill_max_seqlen,
+        # Constants
+        scale, k_scale, v_scale
     ):
-        residual, q = self._op_qkv_write(x, key_heap, val_heap, slot_mapping, k_scale, v_scale)
+        # 1. Unified QKV & Write
+        residual, q, k, v = self._op_qkv_write(x, key_heap, val_heap, slot_mapping, k_scale, v_scale)
         
-        attn_out = self._op_attn(
-            q, key_heap, val_heap, block_table, context_lens,
-            exp_sums, max_logits, tmp_output, scale, k_scale, v_scale, max_seq_len
-        )
+        # 2. Split Attention
+        attn_outputs = []
         
-        x = self._op_mlp(attn_out, residual, x.shape[0])
+        # A. Prefill
+        if num_prefill_tokens > 0:
+            q_p = q[:num_prefill_tokens]
+            k_p = k[:num_prefill_tokens]
+            v_p = v[:num_prefill_tokens]
+            
+            # Run Flash Attention (Self-Attn)
+            attn_p = self._op_attn_prefill(q_p, k_p, v_p, prefill_cu_seqlens, prefill_max_seqlen, scale)
+            attn_outputs.append(attn_p)
+            
+        # B. Decode
+        if decode_context_lens is not None: # We have decodes
+            q_d = q[num_prefill_tokens:]
+            
+            # Run Paged Attention (History-Attn)
+            attn_d = self._op_attn_decode(
+                q_d, key_heap, val_heap, decode_block_table, decode_context_lens,
+                exp_sums, max_logits, tmp_output, scale, k_scale, v_scale, decode_max_seq_len
+            )
+            attn_outputs.append(attn_d)
+            
+        # 3. Merge
+        attn_combined = torch.cat(attn_outputs, dim=0)
+        
+        # 4. Unified MLP
+        x = self._op_mlp(attn_combined, residual, x.shape[0])
         return x

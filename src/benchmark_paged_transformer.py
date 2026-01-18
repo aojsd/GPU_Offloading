@@ -9,12 +9,14 @@ from include.paged_transformer import PagedTransformer, PagedTransformerData
 from include.paged_offload_transformer import PagedOffloadTransformer, PagedOffloadTransformerData
 
 # ==========================================
-# HARDCODED SEQUENCE LENGTHS (Dynamic Batch)
+# HARDCODED SEQUENCE LENGTHS (Mixed Batch)
 # ==========================================
-SEQUENCE_LENGTHS = [8192, 16384, 1024, 32768, 100000]
+# A mix of lengths to stress the arbitrary batch logic
+DECODE_LENGTHS = [8192, 16384, 1024, 32768, 100000]
+PREFILL_LENGTHS = [128, 256, 1024]
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark Paged Transformer (Arbitrary Batches)")
+    parser = argparse.ArgumentParser(description="Benchmark Paged Transformer (Mixed Batch)")
     
     # Configuration
     parser.add_argument("--dim", type=int, default=4096, help="Hidden dimension")
@@ -31,10 +33,11 @@ def main():
                         help="Randomize physical block layout to test fragmentation")
     
     # Compilation & Benchmarking
-    parser.add_argument("-C", "--compile_mode", type=str, default=None, help="torch.compile mode")
+    parser.add_argument("--compile_mode", type=str, default="default", 
+                        choices=["default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile mode")
     parser.add_argument("--warmup", type=int, default=10, help="Number of warmup steps")
-    parser.add_argument("--trials", type=int, default=100, help="Number of benchmark trials")
-    parser.add_argument("--profile", type=str, default=None, help="Output file for GPU profiling")
+    parser.add_argument("--trials", type=int, default=50, help="Number of benchmark trials")
     
     args = parser.parse_args()
     
@@ -44,15 +47,18 @@ def main():
     # Derived Constants
     DTYPE = torch.float16
     DEVICE = "cuda"
-    BATCH_SIZE = len(SEQUENCE_LENGTHS)
     
+    # Validate Offloading
+    if args.offload_ratio > 0 and len(PREFILL_LENGTHS) > 0:
+        print("\n>>> ERROR: Offloading is not supported with prefill sequences.")
+        sys.exit(1)
+
     print(f"\n==========================================")
     print(f"       Transformer Benchmark Config       ")
     print(f"==========================================")
     print(f"Mode:          {'Offloaded' if args.offload_ratio > 0 else 'Fully Resident'}")
-    print(f"Batch Size:    {BATCH_SIZE}")
-    print(f"Seq Lengths:   {SEQUENCE_LENGTHS}")
-    print(f"Total Tokens:  {sum(SEQUENCE_LENGTHS)}")
+    print(f"Decode Seqs:   {len(DECODE_LENGTHS)} {DECODE_LENGTHS}")
+    print(f"Prefill Seqs:  {len(PREFILL_LENGTHS)} {PREFILL_LENGTHS}")
     print(f"Model Dim:     {args.dim}")
     print(f"Layers:        {args.layers}")
     print(f"Heads:         {args.heads}")
@@ -68,12 +74,12 @@ def main():
     
     if args.offload_ratio > 0:
         # --- Offloaded Setup ---
-        # Note: Data argument removed from model init as per user request
-        model = PagedOffloadTransformer(model_args).to(DEVICE).to(DTYPE)
+        model = PagedOffloadTransformer(model_args, compile_mode=args.compile_mode).to(DEVICE).to(DTYPE)
         
         print(f"Allocating Offloaded Data...")
         data = PagedOffloadTransformerData(
-            sequence_lengths=SEQUENCE_LENGTHS,
+            decode_lengths=DECODE_LENGTHS,
+            prefill_lengths=[], # Must be empty for offloading
             num_layers=args.layers,
             num_heads=args.heads,
             head_dim=args.dim // args.heads,
@@ -90,14 +96,10 @@ def main():
         # --- Resident Setup ---
         model = PagedTransformer(model_args).to(DEVICE).to(DTYPE)
         
-        # Estimate blocks needed
-        blocks_per_seq = [(l + 1 + args.block_size - 1) // args.block_size for l in SEQUENCE_LENGTHS]
-        total_blocks = args.layers * sum(blocks_per_seq) + 1024
-        
-        print(f"Allocating Resident Data (Heap size: {total_blocks} blocks)...")
+        print(f"Allocating Resident Data (Exact Size)...")
         data = PagedTransformerData(
-            sequence_lengths=SEQUENCE_LENGTHS,
-            max_num_blocks=total_blocks,
+            decode_lengths=DECODE_LENGTHS,
+            prefill_lengths=PREFILL_LENGTHS,
             num_layers=args.layers,
             num_heads=args.heads,
             head_dim=args.dim // args.heads,
@@ -109,20 +111,20 @@ def main():
 
     model.eval()
     
-    # Input Tensor (Single Decode Step for the Batch)
-    x_input = torch.randn((BATCH_SIZE, 1, args.dim), dtype=DTYPE, device=DEVICE)
+    # Input Tensor (Combined Prefill + Decode tokens)
+    # [Total_Tokens, Dim]
+    total_tokens = data.total_tokens
+    x_input = torch.randn((total_tokens, args.dim), dtype=DTYPE, device=DEVICE)
 
     # ------------------------------------------------------------------
     # 2. Compilation
     # ------------------------------------------------------------------
     print(f"Compiling model (mode='{args.compile_mode}')...")
     
-    # Note: PagedOffloadTransformer compiles internal layers in __init__
-    # PagedTransformer needs explicit compile here.
     if args.offload_ratio == 0:
         compiled_model = torch.compile(model, mode=args.compile_mode)
     else:
-        # Offload transformer manages its own compilation of sub-components
+        # Offload transformer manages its own compilation
         compiled_model = model 
         
     # Trigger compilation with a warmup run
@@ -141,24 +143,20 @@ def main():
             compiled_model(x_input, data)
 
     # Warmup
-    torch.cuda.nvtx.range_push("Warmup Trials")
     for _ in range(args.warmup):
         run_step()
     torch.cuda.synchronize()
-    torch.cuda.nvtx.range_pop()
 
     # Timing
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(args.trials)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(args.trials)]
 
-    torch.cuda.nvtx.range_push("Benchmark Trials")
-    with GPUProfiler(gpu_index=0):
-        for i in range(args.trials):
-            start_events[i].record()
-            run_step()
-            end_events[i].record()
-        torch.cuda.synchronize()
-    torch.cuda.nvtx.range_pop()
+    for i in range(args.trials):
+        start_events[i].record()
+        run_step()
+        end_events[i].record()
+
+    torch.cuda.synchronize()
     
     # Stats
     times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
@@ -172,23 +170,26 @@ def main():
     # A. Weights Load (Read for every step)
     weights_bytes = args.layers * (16 * args.dim * args.dim) * element_size
     
-    # B. KV Cache Write (New Token)
-    # We write 1 token to all layers
-    kv_write_bytes = args.layers * BATCH_SIZE * 1 * args.dim * 2 * element_size
+    # B. KV Cache Write (New Tokens)
+    # We write 1 token for each decode seq + L tokens for each prefill seq
+    total_new_tokens = data.total_tokens
+    kv_write_bytes = args.layers * total_new_tokens * args.dim * 2 * element_size
     
-    # C. KV Cache Read (History)
-    # We read the full history (Resident + Offloaded) for all layers
-    total_tokens_history = sum(SEQUENCE_LENGTHS)
-    kv_read_bytes = args.layers * total_tokens_history * args.dim * 2 * element_size
+    # C. KV Cache Read
+    # Decode: Reads History
+    # Prefill: Reads Self (Causal). Approx sum(L^2/2) interactions, but we treat bandwidth
+    # as reading the KV cache once per attention op per head. 
+    # For strict "Memory Bandwidth" calculation in these benchmarks, we usually count
+    # reading the *entire* history for decode, and reading the *entire* active KV for prefill.
     
-    # D. PCIe Traffic (Offloaded Data Movement)
+    # Simplified: Total history tokens * Layers * Dim * 2
+    total_history_tokens = sum(DECODE_LENGTHS) + sum(PREFILL_LENGTHS)
+    kv_read_bytes = args.layers * total_history_tokens * args.dim * 2 * element_size
+    
+    # D. PCIe Traffic
     pcie_bytes = 0
     if args.offload_ratio > 0:
-        # Data class stores exact number of offloaded blocks per seq
-        # We need to sum up offloaded blocks for the batch
         total_offload_blocks = data.total_offload_blocks_batch
-        
-        # Bytes = Batch_Offloaded_Blocks * Block_Size * Heads * HeadDim * 2 * Bytes
         bytes_per_layer = total_offload_blocks * args.block_size * args.dim * 2 * element_size
         pcie_bytes = bytes_per_layer * (args.layers - 1)
 
@@ -196,8 +197,8 @@ def main():
     total_mem_bytes = weights_bytes + kv_write_bytes + kv_read_bytes
     effective_bw = (total_mem_bytes / 1e9) / (avg_ms / 1000.0)
     
-    # Token Throughput (Batch Size tokens generated per step)
-    tokens_per_sec = BATCH_SIZE / (avg_ms / 1000.0)
+    # Token Throughput
+    tokens_per_sec = total_new_tokens / (avg_ms / 1000.0)
 
     # ------------------------------------------------------------------
     # 5. Report

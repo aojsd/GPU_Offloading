@@ -3,7 +3,6 @@ import time
 import argparse
 import sys
 import os
-from include.misc import GPUProfiler
 from include.transformer_common import TransformerArgs
 from include.paged_transformer import PagedTransformer, PagedTransformerData
 from include.paged_offload_transformer import PagedOffloadTransformer, PagedOffloadTransformerData
@@ -11,9 +10,8 @@ from include.paged_offload_transformer import PagedOffloadTransformer, PagedOffl
 # ==========================================
 # HARDCODED SEQUENCE LENGTHS (Mixed Batch)
 # ==========================================
-# A mix of lengths to stress the arbitrary batch logic
-DECODE_LENGTHS = [8192, 16384, 1024, 32768, 100000]
-PREFILL_LENGTHS = [128, 256, 1024]
+DECODE_LENGTHS = [8192, 16384, 1024, 32768]
+PREFILL_LENGTHS = [512, 256, 128]
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Paged Transformer (Mixed Batch)")
@@ -48,11 +46,6 @@ def main():
     DTYPE = torch.float16
     DEVICE = "cuda"
     
-    # Validate Offloading
-    if args.offload_ratio > 0 and len(PREFILL_LENGTHS) > 0:
-        print("\n>>> ERROR: Offloading is not supported with prefill sequences.")
-        sys.exit(1)
-
     print(f"\n==========================================")
     print(f"       Transformer Benchmark Config       ")
     print(f"==========================================")
@@ -79,7 +72,7 @@ def main():
         print(f"Allocating Offloaded Data...")
         data = PagedOffloadTransformerData(
             decode_lengths=DECODE_LENGTHS,
-            prefill_lengths=[], # Must be empty for offloading
+            prefill_lengths=PREFILL_LENGTHS, 
             num_layers=args.layers,
             num_heads=args.heads,
             head_dim=args.dim // args.heads,
@@ -171,33 +164,26 @@ def main():
     weights_bytes = args.layers * (16 * args.dim * args.dim) * element_size
     
     # B. KV Cache Write (New Tokens)
-    # We write 1 token for each decode seq + L tokens for each prefill seq
     total_new_tokens = data.total_tokens
     kv_write_bytes = args.layers * total_new_tokens * args.dim * 2 * element_size
     
     # C. KV Cache Read
-    # Decode: Reads History
-    # Prefill: Reads Self (Causal). Approx sum(L^2/2) interactions, but we treat bandwidth
-    # as reading the KV cache once per attention op per head. 
-    # For strict "Memory Bandwidth" calculation in these benchmarks, we usually count
-    # reading the *entire* history for decode, and reading the *entire* active KV for prefill.
-    
-    # Simplified: Total history tokens * Layers * Dim * 2
     total_history_tokens = sum(DECODE_LENGTHS) + sum(PREFILL_LENGTHS)
     kv_read_bytes = args.layers * total_history_tokens * args.dim * 2 * element_size
     
     # D. PCIe Traffic
     pcie_bytes = 0
     if args.offload_ratio > 0:
-        total_offload_blocks = data.total_offload_blocks_batch
+        # Note: In this benchmark, we only H2D copy the DECODE portion.
+        # Ideally we should also count D2H prefill eviction bytes if we implemented it.
+        # We stick to the bytes MOVED in the step.
+        total_offload_blocks = data.total_decode_offload_blocks # Only decode is moved H2D
         bytes_per_layer = total_offload_blocks * args.block_size * args.dim * 2 * element_size
         pcie_bytes = bytes_per_layer * (args.layers - 1)
 
     # Metrics
     total_mem_bytes = weights_bytes + kv_write_bytes + kv_read_bytes
     effective_bw = (total_mem_bytes / 1e9) / (avg_ms / 1000.0)
-    
-    # Token Throughput
     tokens_per_sec = total_new_tokens / (avg_ms / 1000.0)
 
     # ------------------------------------------------------------------

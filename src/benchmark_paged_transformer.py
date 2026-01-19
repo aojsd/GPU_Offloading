@@ -3,20 +3,81 @@ import time
 import argparse
 import sys
 import os
+import json
 from include.transformer_common import TransformerArgs
 from include.paged_transformer import PagedTransformer, PagedTransformerData
 from include.paged_offload_transformer import PagedOffloadTransformer, PagedOffloadTransformerData
 
-# ==========================================
-# HARDCODED SEQUENCE LENGTHS (Mixed Batch)
-# ==========================================
-DECODE_LENGTHS = [8192, 16384, 1024, 32768]
-PREFILL_LENGTHS = [512, 256, 128]
+def parse_batch_distribution(arg_list):
+    """
+    Parses a list of strings into a flat list of integers.
+    Supports:
+      - Simple integers: "1024" -> [1024]
+      - Distributions:   "4:2048" -> [2048, 2048, 2048, 2048]
+    """
+    if not arg_list:
+        return []
+    
+    result = []
+    for item in arg_list:
+        if ':' in item:
+            try:
+                count_str, len_str = item.split(':')
+                count = int(count_str)
+                length = int(len_str)
+                result.extend([length] * count)
+            except ValueError:
+                print(f"Error parsing batch argument '{item}'. Expected format 'count:length'")
+                sys.exit(1)
+        else:
+            try:
+                result.append(int(item))
+            except ValueError:
+                print(f"Error parsing batch argument '{item}'. Expected integer.")
+                sys.exit(1)
+    return result
+
+def load_batch_from_file(filepath):
+    """
+    Loads decode and prefill lengths from a JSON file.
+    Expected format:
+    {
+      "decode_lengths": [1024, "4:2048", ...],
+      "prefill_lengths": [128, ...]
+    }
+    """
+    try:
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+            
+            # Get raw lists (default to empty)
+            dec_raw = data.get("decode_lengths", [])
+            pre_raw = data.get("prefill_lengths", [])
+            
+            # Ensure inputs are strings for the parser (handles mixed int/string JSON arrays)
+            dec_str = [str(x) for x in dec_raw]
+            pre_str = [str(x) for x in pre_raw]
+            
+            return parse_batch_distribution(dec_str), parse_batch_distribution(pre_str)
+    except Exception as e:
+        print(f"Error loading batch file '{filepath}': {e}")
+        sys.exit(1)
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Paged Transformer (Mixed Batch)")
     
-    # Configuration
+    # --- Input Options ---
+    # Option 1 & 2: CLI Args with Distribution Syntax
+    parser.add_argument("--decode", nargs='+', type=str, default=["1024", "8192", "32768", "100000"],
+                        help="Decode sequences. Format: 'len' or 'count:len'. Example: --decode 16:2048 4:8192")
+    parser.add_argument("--prefill", nargs='+', type=str, default=["1024"],
+                        help="Prefill sequences. Format: 'len' or 'count:len'. Example: --prefill 4:512")
+    
+    # Option 3: File-based Config
+    parser.add_argument("--batch_file", type=str, default=None,
+                        help="Path to JSON file containing 'decode_lengths' and 'prefill_lengths'")
+
+    # Model Configuration
     parser.add_argument("--dim", type=int, default=4096, help="Hidden dimension")
     parser.add_argument("--heads", type=int, default=32, help="Number of attention heads")
     parser.add_argument("--layers", type=int, default=25, help="Number of layers")
@@ -26,23 +87,51 @@ def main():
     parser.add_argument("-r", "--offload_ratio", type=float, default=0.0, 
                         help="Ratio of KV cache to offload to CPU (0.0 = Fully Resident)")
     
-    # Randomization
+    # Optimization
     parser.add_argument("--randomize_blocks", action="store_true", 
                         help="Randomize physical block layout to test fragmentation")
-    
-    # Compilation & Benchmarking
-    parser.add_argument("--compile_mode", type=str, default="default", 
+    parser.add_argument("-C", "--compile_mode", type=str, default="default", 
                         choices=["default", "reduce-overhead", "max-autotune"],
                         help="torch.compile mode")
+    
+    # Runtime
     parser.add_argument("--warmup", type=int, default=10, help="Number of warmup steps")
     parser.add_argument("--trials", type=int, default=50, help="Number of benchmark trials")
     
     args = parser.parse_args()
     
-    # Allocation Mode
-    allocation_mode = "random" if args.randomize_blocks else "contiguous"
+    # ------------------------------------------------------------------
+    # 1. Resolve Batch Inputs
+    # ------------------------------------------------------------------
+    decode_lengths = []
+    prefill_lengths = []
+
+    # Priority: CLI Args > Batch File > Default
+    
+    # Load from file first if provided
+    if args.batch_file:
+        print(f"Loading batch config from {args.batch_file}...")
+        file_decode, file_prefill = load_batch_from_file(args.batch_file)
+        decode_lengths.extend(file_decode)
+        prefill_lengths.extend(file_prefill)
+
+    # Append/Override with CLI args
+    if args.decode is not None:
+        if args.batch_file: print("Overriding/Appending Decode lengths from CLI...")
+        decode_lengths = parse_batch_distribution(args.decode)
+        
+    if args.prefill is not None:
+        if args.batch_file: print("Overriding/Appending Prefill lengths from CLI...")
+        prefill_lengths = parse_batch_distribution(args.prefill)
+
+    # Default fallback if absolutely nothing provided
+    if not decode_lengths and not prefill_lengths:
+        print("No batch specified. Using default benchmark workload.")
+        decode_lengths = [8192, 4096, 2048]
+        prefill_lengths = [512, 256]
 
     # Derived Constants
+    allocation_mode = "random" if args.randomize_blocks else "contiguous"
     DTYPE = torch.float16
     DEVICE = "cuda"
     
@@ -50,67 +139,75 @@ def main():
     print(f"       Transformer Benchmark Config       ")
     print(f"==========================================")
     print(f"Mode:          {'Offloaded' if args.offload_ratio > 0 else 'Fully Resident'}")
-    print(f"Decode Seqs:   {len(DECODE_LENGTHS)} {DECODE_LENGTHS}")
-    print(f"Prefill Seqs:  {len(PREFILL_LENGTHS)} {PREFILL_LENGTHS}")
-    print(f"Model Dim:     {args.dim}")
-    print(f"Layers:        {args.layers}")
-    print(f"Heads:         {args.heads}")
-    print(f"Offload Ratio: {args.offload_ratio * 100:.1f}%")
+    print(f"Decode Batch:  {len(decode_lengths)} seqs (Total tokens: {sum(decode_lengths)})")
+    if 0 < len(decode_lengths) < 20: print(f"  > Lengths: {decode_lengths}")
+    print(f"Prefill Batch: {len(prefill_lengths)} seqs (Total tokens: {sum(prefill_lengths)})")
+    if 0 < len(prefill_lengths) < 20: print(f"  > Lengths: {prefill_lengths}")
+    print(f"Model:         {args.layers}L, {args.heads}H, {args.dim}D")
+    print(f"Offload:       {args.offload_ratio * 100:.1f}%")
     print(f"Alloc Mode:    {allocation_mode}")
-    print(f"Compile Mode:  {args.compile_mode}")
     print(f"==========================================\n")
 
     # ------------------------------------------------------------------
-    # 1. Initialize Model & Data
+    # 2. Initialize Model & Data
     # ------------------------------------------------------------------
     model_args = TransformerArgs(dim=args.dim, n_heads=args.heads, n_layers=args.layers)
     
-    if args.offload_ratio > 0:
-        # --- Offloaded Setup ---
-        model = PagedOffloadTransformer(model_args, compile_mode=args.compile_mode).to(DEVICE).to(DTYPE)
-        
-        print(f"Allocating Offloaded Data...")
-        data = PagedOffloadTransformerData(
-            decode_lengths=DECODE_LENGTHS,
-            prefill_lengths=PREFILL_LENGTHS, 
-            num_layers=args.layers,
-            num_heads=args.heads,
-            head_dim=args.dim // args.heads,
-            kv_offload_ratio=args.offload_ratio,
-            block_size=args.block_size,
-            dtype=DTYPE,
-            device=DEVICE,
-            allocation_mode=allocation_mode
-        )
-        print(f"  > Total Resident Blocks (Pool): {data.total_resident_blocks_L0 + data.total_resident_blocks_L1N}")
-        print(f"  > Total Offload Blocks (Batch): {data.total_offload_blocks_batch}")
-        
-    else:
-        # --- Resident Setup ---
-        model = PagedTransformer(model_args).to(DEVICE).to(DTYPE)
-        
-        print(f"Allocating Resident Data (Exact Size)...")
-        data = PagedTransformerData(
-            decode_lengths=DECODE_LENGTHS,
-            prefill_lengths=PREFILL_LENGTHS,
-            num_layers=args.layers,
-            num_heads=args.heads,
-            head_dim=args.dim // args.heads,
-            block_size=args.block_size,
-            dtype=DTYPE,
-            device=DEVICE,
-            allocation_mode=allocation_mode
-        )
+    try:
+        if args.offload_ratio > 0:
+            # --- Offloaded Setup ---
+            model = PagedOffloadTransformer(model_args, compile_mode=args.compile_mode).to(DEVICE).to(DTYPE)
+            
+            print(f"Allocating Offloaded Data...")
+            data = PagedOffloadTransformerData(
+                decode_lengths=decode_lengths,
+                prefill_lengths=prefill_lengths,
+                num_layers=args.layers,
+                num_heads=args.heads,
+                head_dim=args.dim // args.heads,
+                kv_offload_ratio=args.offload_ratio,
+                block_size=args.block_size,
+                dtype=DTYPE,
+                device=DEVICE,
+                allocation_mode=allocation_mode
+            )
+            print(f"  > Decode Read (H2D) Blocks: {data.total_decode_offload_blocks}")
+            print(f"  > Prefill Write (D2H) Blocks: {data.total_prefill_offload_blocks}")
+            
+        else:
+            # --- Resident Setup ---
+            model = PagedTransformer(model_args).to(DEVICE).to(DTYPE)
+            
+            print(f"Allocating Resident Data...")
+            data = PagedTransformerData(
+                decode_lengths=decode_lengths,
+                prefill_lengths=prefill_lengths,
+                num_layers=args.layers,
+                num_heads=args.heads,
+                head_dim=args.dim // args.heads,
+                block_size=args.block_size,
+                dtype=DTYPE,
+                device=DEVICE,
+                allocation_mode=allocation_mode
+            )
+    except RuntimeError as e:
+        print(f"\n[Error] Allocation Failed: {e}")
+        print("Try reducing batch size or sequence lengths.")
+        sys.exit(1)
 
     model.eval()
     
     # Input Tensor (Combined Prefill + Decode tokens)
     # [Total_Tokens, Dim]
     total_tokens = data.total_tokens
+    if total_tokens == 0:
+        print("Error: No tokens to process (empty batch).")
+        sys.exit(1)
+        
     x_input = torch.randn((total_tokens, args.dim), dtype=DTYPE, device=DEVICE)
 
     # ------------------------------------------------------------------
-    # 2. Compilation
+    # 3. Compilation
     # ------------------------------------------------------------------
     print(f"Compiling model (mode='{args.compile_mode}')...")
     
@@ -127,7 +224,7 @@ def main():
     print("Compilation finished.")
 
     # ------------------------------------------------------------------
-    # 3. Benchmarking
+    # 4. Benchmarking
     # ------------------------------------------------------------------
     print("\n--- Running Benchmark ---")
     
@@ -156,7 +253,7 @@ def main():
     avg_ms = sum(times) / len(times)
 
     # ------------------------------------------------------------------
-    # 4. Bandwidth Calculations
+    # 5. Bandwidth Calculations
     # ------------------------------------------------------------------
     element_size = torch.tensor([], dtype=DTYPE).element_size() # 2 bytes
     
@@ -168,17 +265,16 @@ def main():
     kv_write_bytes = args.layers * total_new_tokens * args.dim * 2 * element_size
     
     # C. KV Cache Read
-    total_history_tokens = sum(DECODE_LENGTHS) + sum(PREFILL_LENGTHS)
+    total_history_tokens = sum(decode_lengths) + sum(prefill_lengths)
     kv_read_bytes = args.layers * total_history_tokens * args.dim * 2 * element_size
     
     # D. PCIe Traffic
     pcie_bytes = 0
     if args.offload_ratio > 0:
-        # Note: In this benchmark, we only H2D copy the DECODE portion.
-        # Ideally we should also count D2H prefill eviction bytes if we implemented it.
-        # We stick to the bytes MOVED in the step.
-        total_offload_blocks = data.total_decode_offload_blocks # Only decode is moved H2D
-        bytes_per_layer = total_offload_blocks * args.block_size * args.dim * 2 * element_size
+        # We move decode history H2D and prefill result D2H
+        # Note: Depending on the pipeline impl, D2H might happen post-compute or overlapped
+        moved_blocks = data.total_decode_offload_blocks + data.total_prefill_offload_blocks
+        bytes_per_layer = moved_blocks * args.block_size * args.dim * 2 * element_size
         pcie_bytes = bytes_per_layer * (args.layers - 1)
 
     # Metrics
@@ -187,7 +283,7 @@ def main():
     tokens_per_sec = total_new_tokens / (avg_ms / 1000.0)
 
     # ------------------------------------------------------------------
-    # 5. Report
+    # 6. Report
     # ------------------------------------------------------------------
     print(f"\n--- Results ---")
     print(f"Average Step Time:   {avg_ms:.4f} ms")

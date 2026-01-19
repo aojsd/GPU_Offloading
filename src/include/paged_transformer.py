@@ -294,32 +294,6 @@ class PagedTransformerBlock(nn.Module):
         """Flash Attention for Prefill (Self-Attention on new tokens)"""
         # q, k, v are [Total_Prefill_Tokens, Heads, Dim]
         # We use PyTorch SDPA with FlashAttention backend
-        # Note: PyTorch SDPA expects batch first for nested tensors usually, or flattened.
-        # For 'flash_attention' specifically, we can use the efficient implementation via 
-        # F.scaled_dot_product_attention if we format it right, or specialized kernels.
-        # However, standard SDPA often expects [B, H, S, D]. Since we have a ragged batch,
-        # treating it as 1 giant sequence with a block-diagonal mask is one way, 
-        # but modern FlashAttn V2 supports `varlen`.
-        
-        # Since we are using standard PyTorch, let's use the explicit `flash_attn_varlen_func`
-        # if available, or assume the user has the environment for it.
-        # If strictly standard torch: we might have to pad. 
-        # For simplicity/robustness here without external libs: 
-        # We will trust `flash_attn_varlen_func` if available, else we rely on vLLM ops or similar.
-        # Given vLLM is imported, let's assuming standard PyTorch SDPA for now.
-        
-        # Fallback: Since integrating varlen flash attn is complex without the lib:
-        # We will assume `torch.nn.functional.scaled_dot_product_attention` is smart enough 
-        # OR we rely on vLLM's `xformers` integration if available.
-        # BUT, to keep this clean: Let's assume we use FlashAttn if available via vllm logic,
-        # or just standard SDPA on 1 giant batch with causal mask. 
-        
-        # IMPLEMENTATION: Using torch SDPA with varlen is tricky.
-        # Strategy: Use `flash_attn` library logic if possible. 
-        # For this snippet, I will implement a placeholder call that users would swap 
-        # for `flash_attn_varlen_func(q, k, v, cu_seqlens, ...)`
-        # Since I cannot import flash_attn here, I will leave the logic clear:
-        
         return flash_attn_varlen_func(
             q, k, v,
             cu_seqlens_q=cu_seqlens,

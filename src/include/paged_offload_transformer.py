@@ -15,11 +15,6 @@ class PagedOffloadTransformerData:
     
     Scratchpad Layout (Per Layer):
     [ Decode_Read_Buffer (History) | Prefill_Write_Buffer (Eviction) ]
-    
-    Memory Flow:
-    - Decode: CPU -> Scratchpad[Decode] -> PagedAttention
-    - Prefill: ReshapeAndCache -> Scratchpad[Prefill] -> CPU (Future D2H)
-               ReshapeAndCache -> Resident Heap
     """
     def __init__(
         self, 
@@ -62,20 +57,16 @@ class PagedOffloadTransformerData:
         # ------------------------------------------------------------------
         # 1. Calculate Sizes & Offload Splits
         # ------------------------------------------------------------------
-        
         # A. Prefill (Total Length)
         prefill_blocks_per_seq = [(l + block_size - 1) // block_size for l in self.prefill_lengths]
-        
         # B. Decode (History + 1)
-        decode_total_tokens = [l + 1 for l in self.decode_lengths]
-        decode_blocks_per_seq = [(t + block_size - 1) // block_size for t in decode_total_tokens]
+        decode_blocks_per_seq = [(l + 1 + block_size - 1) // block_size for l in self.decode_lengths]
         
         all_blocks_per_seq = prefill_blocks_per_seq + decode_blocks_per_seq
         
         self.offload_counts = []
         self.resident_counts = []
         
-        # Separate sums to partition the scratchpad
         self.total_prefill_offload_blocks = 0
         self.total_decode_offload_blocks = 0
         
@@ -98,6 +89,7 @@ class PagedOffloadTransformerData:
         # 2. Heap Allocation (GPU)
         # ------------------------------------------------------------------
         total_resident_pool_size = self.total_resident_blocks_L0 + self.total_resident_blocks_L1N
+        # Heap must hold resident blocks + 2 sets of scratchpads
         heap_blocks_needed = total_resident_pool_size + 2 * self.total_offload_blocks_batch + 128
         
         self.key_heap = torch.zeros(
@@ -112,38 +104,30 @@ class PagedOffloadTransformerData:
         # ------------------------------------------------------------------
         # 3. CPU Buffers (Pinned)
         # ------------------------------------------------------------------
-        
-        # A. Decode History (Read Sources)
-        self.k_offload_cpu = []
+        self.k_offload_cpu = [] # For Decode H2D
         self.v_offload_cpu = []
+        self.k_prefill_cpu = [] # For Prefill D2H
+        self.v_prefill_cpu = []
         
-        # B. Prefill Eviction (Write Destinations)
-        self.k_prefill_offload_cpu = []
-        self.v_prefill_offload_cpu = []
-        
-        decode_off_size = self.total_decode_offload_blocks
-        prefill_off_size = self.total_prefill_offload_blocks
+        dec_off_size = self.total_decode_offload_blocks
+        pre_off_size = self.total_prefill_offload_blocks
         
         for _ in range(num_layers - 1):
-            # Decode Buffers
-            if decode_off_size > 0:
-                dk = torch.randn((decode_off_size, num_heads, head_dim // self.x, block_size, self.x), dtype=dtype, device='cpu').pin_memory()
-                dv = torch.randn((decode_off_size, num_heads, head_dim, block_size), dtype=dtype, device='cpu').pin_memory()
+            # Decode buffers (Read from CPU)
+            if dec_off_size > 0:
+                self.k_offload_cpu.append(torch.randn((dec_off_size, num_heads, head_dim // self.x, block_size, self.x), dtype=dtype, device='cpu').pin_memory())
+                self.v_offload_cpu.append(torch.randn((dec_off_size, num_heads, head_dim, block_size), dtype=dtype, device='cpu').pin_memory())
             else:
-                dk = torch.empty(0, dtype=dtype, device='cpu').pin_memory()
-                dv = torch.empty(0, dtype=dtype, device='cpu').pin_memory()
-            self.k_offload_cpu.append(dk)
-            self.v_offload_cpu.append(dv)
+                self.k_offload_cpu.append(torch.empty(0, dtype=dtype, device='cpu').pin_memory())
+                self.v_offload_cpu.append(torch.empty(0, dtype=dtype, device='cpu').pin_memory())
             
-            # Prefill Buffers
-            if prefill_off_size > 0:
-                pk = torch.empty((prefill_off_size, num_heads, head_dim // self.x, block_size, self.x), dtype=dtype, device='cpu').pin_memory()
-                pv = torch.empty((prefill_off_size, num_heads, head_dim, block_size), dtype=dtype, device='cpu').pin_memory()
+            # Prefill buffers (Write to CPU)
+            if pre_off_size > 0:
+                self.k_prefill_cpu.append(torch.empty((pre_off_size, num_heads, head_dim // self.x, block_size, self.x), dtype=dtype, device='cpu').pin_memory())
+                self.v_prefill_cpu.append(torch.empty((pre_off_size, num_heads, head_dim, block_size), dtype=dtype, device='cpu').pin_memory())
             else:
-                pk = torch.empty(0, dtype=dtype, device='cpu').pin_memory()
-                pv = torch.empty(0, dtype=dtype, device='cpu').pin_memory()
-            self.k_prefill_offload_cpu.append(pk)
-            self.v_prefill_offload_cpu.append(pv)
+                self.k_prefill_cpu.append(torch.empty(0, dtype=dtype, device='cpu').pin_memory())
+                self.v_prefill_cpu.append(torch.empty(0, dtype=dtype, device='cpu').pin_memory())
 
         # ------------------------------------------------------------------
         # 4. Block Tables (Mapping)
@@ -158,9 +142,7 @@ class PagedOffloadTransformerData:
             dtype=torch.int32, device=device
         )
         
-        # --- Scratchpad Partitioning ---
-        # 1. Decode Region (Size: total_decode_offload_blocks)
-        # 2. Prefill Region (Size: total_prefill_offload_blocks)
+        # Identify Scratchpad Regions [Decode | Prefill]
         off_size = self.total_offload_blocks_batch
         
         sp0_start = heap_blocks_needed - 2 * off_size
@@ -170,14 +152,13 @@ class PagedOffloadTransformerData:
         
         self.scratchpad_ranges = [(sp0_start, sp0_end), (sp1_start, sp1_end)]
         
-        # Offsets into the Scratchpad
-        decode_offset_start = 0
-        prefill_offset_start = self.total_decode_offload_blocks
+        # Offsets relative to scratchpad start
+        decode_base_offset = 0
+        prefill_base_offset = self.total_decode_offload_blocks
         
-        # Calculate start offset for each sequence
         sp_seq_offsets = []
-        curr_dec = decode_offset_start
-        curr_pre = prefill_offset_start
+        curr_dec = decode_base_offset
+        curr_pre = prefill_base_offset
         
         for i in range(self.batch_size):
             count = self.offload_counts[i]
@@ -187,8 +168,8 @@ class PagedOffloadTransformerData:
             else:
                 sp_seq_offsets.append(curr_dec)
                 curr_dec += count
-        
-        # --- Resident Allocation ---
+                
+        # Resident Allocation
         if allocation_mode == "random":
             resident_pool_ids = torch.randperm(total_resident_pool_size, device=device, dtype=torch.int32)
         else:
@@ -202,47 +183,44 @@ class PagedOffloadTransformerData:
             n_res   = self.resident_counts[b]
             sp_offset = sp_seq_offsets[b]
             
-            # Layer 0 (Resident)
+            # Layer 0
             ids_l0 = resident_pool_ids[pool_ptr : pool_ptr + n_total]
             pool_ptr += n_total
             self.block_tables[0, b, :n_total] = ids_l0
             
-            # Layers 1..N (Offloaded)
+            # Layers 1..N
             for l_idx in range(1, num_layers):
                 sp_set_idx = l_idx % 2
                 sp_base = self.scratchpad_ranges[sp_set_idx][0]
                 
-                # 1. Offload Part (Scratchpad)
+                # Offload Part (Scratchpad)
                 seq_sp_start = sp_base + sp_offset
                 sp_ids = torch.arange(seq_sp_start, seq_sp_start + n_off, device=device, dtype=torch.int32)
                 
-                # 2. Resident Part (Heap)
+                # Resident Part (Heap)
                 res_ids = resident_pool_ids[pool_ptr : pool_ptr + n_res]
                 pool_ptr += n_res
                 
-                # Combined
                 full_row = torch.cat([sp_ids, res_ids])
                 self.block_tables[l_idx, b, :n_total] = full_row
 
         # ------------------------------------------------------------------
         # 5. Slot Mapping
         # ------------------------------------------------------------------
-        # Slot Mapping is derived from block_tables. 
-        # Since block_tables maps the first N_off blocks to the Scratchpad,
-        # reshape_and_cache will naturally write:
-        #   - Blocks [0..N_off] -> Scratchpad Region (Prefill Write Buffer)
-        #   - Blocks [N_off..Total] -> Resident Heap
+        # block_tables logic ensures:
+        # [0..N_off] -> Scratchpad (Prefill writes here, Decode reads here)
+        # [N_off..End] -> Heap (Resident)
         
         flat_batch_indices = []
         flat_logical_indices = []
         
-        # A. Prefills
+        # A. Prefills (All tokens)
         for b_idx in range(self.num_prefills):
             l = self.prefill_lengths[b_idx]
             flat_logical_indices.append(torch.arange(l, device=device, dtype=torch.long))
             flat_batch_indices.append(torch.full((l,), b_idx, device=device, dtype=torch.long))
             
-        # B. Decodes
+        # B. Decodes (Only new token)
         for i in range(self.num_decodes):
             b_idx = self.num_prefills + i
             hist_len = self.decode_lengths[i]
@@ -303,9 +281,8 @@ class PagedOffloadTransformerData:
 class PagedOffloadTransformerBlock(PagedTransformerBlock):
     """
     Inherits from PagedTransformerBlock.
+    Overrides forward_offload to inject synchronization events.
     """
-    # Removed __init__ with piece-wise compilation as requested.
-
     def forward_offload(
         self, x, key_heap, val_heap, block_table, slot_mapping,
         # Decode
@@ -314,45 +291,48 @@ class PagedOffloadTransformerBlock(PagedTransformerBlock):
         # Prefill
         num_prefill_tokens, prefill_cu_seqlens, prefill_max_seqlen,
         # Sync
-        attn_data_ready_event, attn_finish_event,
+        h2d_ready_event, prefill_ready_event, compute_done_event,
         # Const
         scale, k_scale, v_scale
     ):
-        # 1. Write (Overlaps with I/O)
-        # Writes all tokens. Prefill offload parts go to Scratchpad[Prefill].
+        # 1. Write (Compute Bound - overlaps with H2D and D2H)
+        # Writes all tokens.
+        # Prefill offload parts -> Scratchpad[Prefill]
+        # Decode -> Heap
         residual, q, k, v = self._op_qkv_write(x, key_heap, val_heap, slot_mapping, k_scale, v_scale)
         
         # 2. Split Attention
         attn_outputs = []
         
-        # A. Prefill (OPTIMIZATION: Run BEFORE Waiting)
-        # Relies only on local data just written.
+        # A. Prefill (Compute Bound)
+        # Use LOCAL data just written. Run BEFORE waiting for H2D.
         if num_prefill_tokens > 0:
             q_p = q[:num_prefill_tokens]
             k_p = k[:num_prefill_tokens]
             v_p = v[:num_prefill_tokens]
             
-            # Using method from parent PagedTransformerBlock
             attn_p = self._op_attn_prefill(q_p, k_p, v_p, prefill_cu_seqlens, prefill_max_seqlen, scale)
             attn_outputs.append(attn_p)
             
-        # --- SYNC: Wait for I/O Data ---
-        # Wait for Decode History to arrive in Scratchpad[Decode]
-        torch.cuda.current_stream().wait_event(attn_data_ready_event)
+            # SIGNAL: Prefill Compute Done. D2H can start now.
+            torch.cuda.current_stream().record_event(prefill_ready_event)
+            
+        # --- SYNC: Wait for H2D (Decode History) ---
+        # Decode needs history from CPU.
+        torch.cuda.current_stream().wait_event(h2d_ready_event)
         
         # B. Decode
         if decode_context_lens is not None:
             q_d = q[num_prefill_tokens:]
             
-            # Using method from parent PagedTransformerBlock
             attn_d = self._op_attn_decode(
                 q_d, key_heap, val_heap, decode_block_table, decode_context_lens,
                 exp_sums, max_logits, tmp_output, scale, k_scale, v_scale, decode_max_seq_len
             )
             attn_outputs.append(attn_d)
 
-        # --- SYNC: Signal Buffer Free ---
-        torch.cuda.current_stream().record_event(attn_finish_event)
+        # SIGNAL: Compute Done. Scratchpad[Decode] is now free.
+        torch.cuda.current_stream().record_event(compute_done_event)
         
         # 3. Merge & MLP
         attn_combined = torch.cat(attn_outputs, dim=0)
@@ -365,118 +345,124 @@ class PagedOffloadTransformerBlock(PagedTransformerBlock):
 # ==========================================
 
 class PagedOffloadTransformer(PagedTransformer):
-    """
-    Inherits from PagedTransformer.
-    Overrides forward to dispatch to the correct loop (Resident vs Offload).
-    """
     def __init__(self, model_args, data=None, compile_mode=None):
         super().__init__(model_args)
         
-        # Replace Layers 1..N with PagedOffloadTransformerBlocks
         for i in range(1, self.n_layers):
             self.layers[i] = PagedOffloadTransformerBlock(model_args)
 
         # I/O Async Infrastructure
-        self.IO_stream = torch.cuda.Stream()
-        self.attn_data_ready_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.n_layers - 1)]
-        self.attn_finish_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.n_layers - 1)]
+        self.H2D_stream = torch.cuda.Stream()
+        self.D2H_stream = torch.cuda.Stream()
         
-        # ------------------------------------------------------------------
-        # Two-Path Compilation Strategy
-        # ------------------------------------------------------------------
-        # Path A: Resident (Standard)
+        # Event Arrays
+        self.h2d_ready_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.n_layers - 1)]
+        self.prefill_ready_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.n_layers - 1)]
+        self.compute_done_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.n_layers - 1)]
+        self.d2h_done_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.n_layers - 1)]
+        
+        # Compilation
         self.forward_resident_impl = compile_if_needed(self._forward_resident_wrapper, compile_mode)
-        
-        # Path B: Offloaded
         self.forward_offload = compile_if_needed(self.forward_offload_, compile_mode)
-        self.forward_IO = self.forward_IO_
 
     def _forward_resident_wrapper(self, x, data):
         return super().forward(x, data)
 
-    def load_data(self, data: PagedOffloadTransformerData, layer_idx):
+    def load_data_H2D(self, data: PagedOffloadTransformerData, layer_idx):
+        # [Decode] CPU -> GPU Scratchpad
         sp_idx = layer_idx % 2
         sp_start, sp_end = data.scratchpad_ranges[sp_idx]
         
-        # Source: Decode History
         k_src = data.k_offload_cpu[layer_idx - 1]
         v_src = data.v_offload_cpu[layer_idx - 1]
-        
-        # Size Logic:
-        # We MUST only write to the [Decode] partition of the scratchpad.
-        # Writing to the [Prefill] partition would overwrite the data being computed/written
-        # by the compute stream (race condition).
-        # Data class layout: [Decode | Prefill]
         decode_size = data.total_decode_offload_blocks
-        with torch.cuda.stream(self.IO_stream):
-            # Slice Source (k_src is sized for decode only)
-            # Slice Destination (Scratchpad Start -> Start + Decode_Size)
-            data.key_heap[sp_start : sp_start + decode_size].copy_(k_src, non_blocking=True)
-            data.val_heap[sp_start : sp_start + decode_size].copy_(v_src, non_blocking=True)
-            
-        # Record that data is ready for this layer
-        self.IO_stream.record_event(self.attn_data_ready_events[layer_idx - 1])
-
-    def forward_IO_(self, data: PagedOffloadTransformerData):
-        """
-        The I/O Dispatch Loop.
-        """
-        # Pipeline Priming
-        if self.n_layers > 1: self.load_data(data, 1)
-        if self.n_layers > 2: self.load_data(data, 2)
         
-        # Pipeline Steady State
+        # Wait for buffer to be free
+        # Needs: compute_done[i-2] (Previous usage of this scratchpad portion)
+        if layer_idx >= 3:
+            self.H2D_stream.wait_event(self.compute_done_events[layer_idx - 3])
+            
+        with torch.cuda.stream(self.H2D_stream):
+            if decode_size > 0:
+                data.key_heap[sp_start : sp_start + decode_size].copy_(k_src, non_blocking=True)
+                data.val_heap[sp_start : sp_start + decode_size].copy_(v_src, non_blocking=True)
+            self.H2D_stream.record_event(self.h2d_ready_events[layer_idx - 1])
+
+    def evict_data_D2H(self, data: PagedOffloadTransformerData, layer_idx):
+        # [Prefill] GPU Scratchpad -> CPU
+        sp_idx = layer_idx % 2
+        sp_start, sp_end = data.scratchpad_ranges[sp_idx]
+        
+        # Prefill region is AFTER decode region
+        prefill_start = sp_start + data.total_decode_offload_blocks
+        prefill_end = sp_end
+        copy_size = prefill_end - prefill_start
+        
+        k_dst = data.k_prefill_cpu[layer_idx - 1]
+        v_dst = data.v_prefill_cpu[layer_idx - 1]
+        
+        # Wait for Compute to finish writing Prefill data
+        self.D2H_stream.wait_event(self.prefill_ready_events[layer_idx - 1])
+        
+        with torch.cuda.stream(self.D2H_stream):
+            if copy_size > 0:
+                k_src = data.key_heap[prefill_start:prefill_end]
+                v_src = data.val_heap[prefill_start:prefill_end]
+                k_dst.copy_(k_src, non_blocking=True)
+                v_dst.copy_(v_src, non_blocking=True)
+            self.D2H_stream.record_event(self.d2h_done_events[layer_idx - 1])
+
+    def forward_onload_H2D(self, data: PagedOffloadTransformerData):
+        if self.n_layers > 1: self.load_data_H2D(data, 1)
+        if self.n_layers > 2: self.load_data_H2D(data, 2)
         for layer_idx in range(3, self.n_layers):
-            self.IO_stream.wait_event(self.attn_finish_events[layer_idx - 3])
-            self.load_data(data, layer_idx)
+            self.load_data_H2D(data, layer_idx)
+
+    def forward_offload_D2H(self, data: PagedOffloadTransformerData):
+        # Starts from layer 1
+        for layer_idx in range(1, self.n_layers):
+            self.evict_data_D2H(data, layer_idx)
 
     def forward_offload_(self, x, data, max_seq_len_scalar):
-        # --- Layer 0 (Resident) ---
+        # Layer 0 (Resident)
         block_table_0, slot_mapping_0 = data.get_layer_data(0)
-        
-        # Use base forward() - no events needed
         x = self.layers[0](
             x, data.key_heap, data.val_heap, slot_mapping_0,
-            # Decode Args
             data.get_decode_block_table(0), data.decode_context_lens, 
             data.exp_sums, data.max_logits, data.tmp_output, max_seq_len_scalar,
-            # Prefill Args
             data.num_prefill_tokens, data.prefill_cu_seqlens, data.prefill_max_seqlen,
-            # Constants
             self.scale, self.k_scale, self.v_scale
         )
 
-        # --- Layers 1..N (Offloaded) ---
+        # Layers 1..N (Offloaded)
         for i in range(1, self.n_layers):
             block_table, slot_mapping = data.get_layer_data(i)
-            
-            # Use forward_offload() with events
             x = self.layers[i].forward_offload(
                 x, data.key_heap, data.val_heap, block_table, slot_mapping,
-                # Decode Args
                 data.get_decode_block_table(i), data.decode_context_lens, 
                 data.exp_sums, data.max_logits, data.tmp_output, max_seq_len_scalar,
-                # Prefill Args
                 data.num_prefill_tokens, data.prefill_cu_seqlens, data.prefill_max_seqlen,
-                # Sync
-                self.attn_data_ready_events[i-1],
-                self.attn_finish_events[i-1],
-                # Constants
+                self.h2d_ready_events[i-1], 
+                self.prefill_ready_events[i-1], 
+                self.compute_done_events[i-1],
                 self.scale, self.k_scale, self.v_scale
             )
-        
         return self.norm(x)
 
     def forward(self, x: torch.Tensor, data: PagedOffloadTransformerData):
-        # No Offload Case
         if data.total_offload_blocks_batch == 0:
             return self.forward_resident_impl(x, data)
 
-        # 1. Start I/O
+        # 1. Launch H2D Pipeline (Decode)
         if data.total_decode_offload_blocks > 0:
-            self.forward_IO(data)
+            self.forward_onload_H2D(data)
+            
+        # 2. Launch D2H Pipeline (Prefill)
+        # Dependent on compute events, will block on GPU until ready
+        if data.total_prefill_offload_blocks > 0:
+            self.forward_offload_D2H(data)
         
-        # 2. Dispatch
+        # 3. Dispatch Compute
         max_seq_len_scalar = 0
         if data.num_decodes > 0:
             max_seq_len_scalar = max(data.decode_lengths) + 1

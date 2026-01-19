@@ -12,9 +12,6 @@ from .paged_transformer import PagedTransformer, PagedTransformerBlock
 class PagedOffloadTransformerData:
     """
     Manages a Paged KV Cache with CPU Offloading for Mixed Batches.
-    
-    Scratchpad Layout (Per Layer):
-    [ Decode_Read_Buffer (History) | Prefill_Write_Buffer (Eviction) ]
     """
     def __init__(
         self, 
@@ -57,18 +54,24 @@ class PagedOffloadTransformerData:
         # ------------------------------------------------------------------
         # 1. Calculate Sizes & Offload Splits
         # ------------------------------------------------------------------
+        
         # A. Prefill (Total Length)
         prefill_blocks_per_seq = [(l + block_size - 1) // block_size for l in self.prefill_lengths]
+        
         # B. Decode (History + 1)
-        decode_blocks_per_seq = [(l + 1 + block_size - 1) // block_size for l in self.decode_lengths]
+        decode_total_tokens = [l + 1 for l in self.decode_lengths]
+        decode_blocks_per_seq = [(t + block_size - 1) // block_size for t in decode_total_tokens]
         
         all_blocks_per_seq = prefill_blocks_per_seq + decode_blocks_per_seq
         
         self.offload_counts = []
         self.resident_counts = []
         
+        # Breakdown Stats (Per Layer)
         self.total_prefill_offload_blocks = 0
         self.total_decode_offload_blocks = 0
+        self.total_prefill_resident_blocks = 0
+        self.total_decode_resident_blocks = 0
         
         for i, tb in enumerate(all_blocks_per_seq):
             n_off = int(tb * kv_offload_ratio)
@@ -78,8 +81,10 @@ class PagedOffloadTransformerData:
             
             if i < self.num_prefills:
                 self.total_prefill_offload_blocks += n_off
+                self.total_prefill_resident_blocks += n_res
             else:
                 self.total_decode_offload_blocks += n_off
+                self.total_decode_resident_blocks += n_res
                 
         self.total_offload_blocks_batch = self.total_prefill_offload_blocks + self.total_decode_offload_blocks
         self.total_resident_blocks_L1N = sum(self.resident_counts) * (num_layers - 1)
@@ -89,7 +94,6 @@ class PagedOffloadTransformerData:
         # 2. Heap Allocation (GPU)
         # ------------------------------------------------------------------
         total_resident_pool_size = self.total_resident_blocks_L0 + self.total_resident_blocks_L1N
-        # Heap must hold resident blocks + 2 sets of scratchpads
         heap_blocks_needed = total_resident_pool_size + 2 * self.total_offload_blocks_batch + 128
         
         self.key_heap = torch.zeros(
@@ -142,7 +146,7 @@ class PagedOffloadTransformerData:
             dtype=torch.int32, device=device
         )
         
-        # Identify Scratchpad Regions [Decode | Prefill]
+        # Scratchpad partitioning
         off_size = self.total_offload_blocks_batch
         
         sp0_start = heap_blocks_needed - 2 * off_size
@@ -152,13 +156,12 @@ class PagedOffloadTransformerData:
         
         self.scratchpad_ranges = [(sp0_start, sp0_end), (sp1_start, sp1_end)]
         
-        # Offsets relative to scratchpad start
-        decode_base_offset = 0
-        prefill_base_offset = self.total_decode_offload_blocks
+        decode_offset_start = 0
+        prefill_offset_start = self.total_decode_offload_blocks
         
         sp_seq_offsets = []
-        curr_dec = decode_base_offset
-        curr_pre = prefill_base_offset
+        curr_dec = decode_offset_start
+        curr_pre = prefill_offset_start
         
         for i in range(self.batch_size):
             count = self.offload_counts[i]
@@ -207,20 +210,14 @@ class PagedOffloadTransformerData:
         # ------------------------------------------------------------------
         # 5. Slot Mapping
         # ------------------------------------------------------------------
-        # block_tables logic ensures:
-        # [0..N_off] -> Scratchpad (Prefill writes here, Decode reads here)
-        # [N_off..End] -> Heap (Resident)
-        
         flat_batch_indices = []
         flat_logical_indices = []
         
-        # A. Prefills (All tokens)
         for b_idx in range(self.num_prefills):
             l = self.prefill_lengths[b_idx]
             flat_logical_indices.append(torch.arange(l, device=device, dtype=torch.long))
             flat_batch_indices.append(torch.full((l,), b_idx, device=device, dtype=torch.long))
             
-        # B. Decodes (Only new token)
         for i in range(self.num_decodes):
             b_idx = self.num_prefills + i
             hist_len = self.decode_lengths[i]
@@ -272,7 +269,6 @@ class PagedOffloadTransformerData:
     
     def get_decode_block_table(self, layer_idx: int):
         return self.block_tables[layer_idx, self.num_prefills : ]
-
 
 # ==========================================
 # POLYMORPHIC BLOCK

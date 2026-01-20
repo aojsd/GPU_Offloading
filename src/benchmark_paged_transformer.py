@@ -65,7 +65,7 @@ def main():
                         help="Decode sequences. Pass '0' to disable.")
     
     parser.add_argument("--prefill", nargs='+', type=str, 
-                        default=["1024"],
+                        default=["0"],
                         help="Prefill sequences. Pass '0' to disable.")
     
     parser.add_argument("--batch_file", type=str, default=None,
@@ -74,7 +74,7 @@ def main():
     # Model Configuration
     parser.add_argument("--dim", type=int, default=4096)
     parser.add_argument("--heads", type=int, default=32)
-    parser.add_argument("--layers", type=int, default=25)
+    parser.add_argument("--layers", type=int, default=32)
     parser.add_argument("--block_size", type=int, default=16)
     
     # Offloading
@@ -82,7 +82,7 @@ def main():
     
     # Optimization
     parser.add_argument("--randomize_blocks", action="store_true")
-    parser.add_argument("--compile_mode", type=str, default="default")
+    parser.add_argument("-C", "--compile_mode", type=str, default="default")
     
     # Runtime
     parser.add_argument("--warmup", type=int, default=10)
@@ -198,6 +198,7 @@ def main():
         compiled_model = model 
         
     with torch.no_grad():
+        torch.compiler.cudagraph_mark_step_begin()
         compiled_model(x_input, data)
     torch.cuda.synchronize()
     print("Compilation finished.")
@@ -215,6 +216,7 @@ def main():
 
     # Warmup
     for _ in range(args.warmup):
+        torch.compiler.cudagraph_mark_step_begin()
         run_step()
     torch.cuda.synchronize()
 
@@ -223,6 +225,7 @@ def main():
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(args.trials)]
 
     for i in range(args.trials):
+        torch.compiler.cudagraph_mark_step_begin()
         start_events[i].record()
         run_step()
         end_events[i].record()

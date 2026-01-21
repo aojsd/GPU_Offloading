@@ -254,26 +254,37 @@ class PagedTransformerBlock(nn.Module):
         self.n_heads = args.n_heads
         self.head_dim = args.dim // args.n_heads
         
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+        # NOTE: Fusing QKV into a single linear layer ensures that 
+        # q, k, and v for the same head/token are adjacent in physical memory (Packed Layout).
+        # Otherwise, DRAM sector reads may be inefficient due to reading from 3 disjoint buffers.
+        self.w_qkv = nn.Linear(args.dim, 3 * args.n_heads * self.head_dim, bias=False)
+        
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
         
         self.norm1 = nn.RMSNorm(args.dim, eps=args.norm_eps)
         self.norm2 = nn.RMSNorm(args.dim, eps=args.norm_eps)
-        self.w1 = nn.Linear(args.dim, 4 * args.dim, bias=False)
+        
+        # NOTE: Similarly, fusing the Gate (w1) and Up (w3) projections 
+        # improves memory throughput during the MLP phase.
+        self.w_gate_up = nn.Linear(args.dim, 2 * 4 * args.dim, bias=False)
         self.w2 = nn.Linear(4 * args.dim, args.dim, bias=False)
-        self.w3 = nn.Linear(args.dim, 4 * args.dim, bias=False)
 
     def _op_qkv_write(self, x, key_heap, val_heap, slot_mapping, k_scale, v_scale):
         """Unified QKV Projection and Cache Write for ALL tokens."""
         residual = x
         x = self.norm1(x)
         
-        # Project all tokens
-        q = self.wq(x).view(x.shape[0], self.n_heads, self.head_dim)
-        k = self.wk(x).view(x.shape[0], self.n_heads, self.head_dim)
-        v = self.wv(x).view(x.shape[0], self.n_heads, self.head_dim)
+        # Project all tokens at once.
+        # Layout becomes [Batch, 3, Heads, HeadDim] which interleaves Q, K, V in memory.
+        qkv = self.w_qkv(x).view(x.shape[0], 3, self.n_heads, self.head_dim)
+        
+        # Create views for q, k, v. 
+        # Note: These are slices of the packed tensor. While they have a stride on the 
+        # second dimension, the last dimension (HeadDim) remains contiguous (stride 1),
+        # satisfying FlashAttention requirements while maximizing L2/DRAM locality.
+        q = qkv[:, 0]
+        k = qkv[:, 1]
+        v = qkv[:, 2]
         
         # Write all tokens to Paged Cache (Prefill + Decode) using the unified slot map
         ops.reshape_and_cache(
@@ -301,15 +312,14 @@ class PagedTransformerBlock(nn.Module):
     def _op_attn_decode(self, q, key_heap, val_heap, block_table, context_lens, 
                         exp_sums, max_logits, tmp_output, scale, k_scale, v_scale, max_seq_len):
         """Paged Attention for Decode"""
-        # q is [Batch, Heads, Dim] -> PagedAttn expects [Batch, Heads, 1, Dim] logic effectively
-        # vLLM `paged_attention_v2` expects `q` as [Batch, Heads, Head_Dim]
-        # or [Batch, 1, Heads, Head_Dim]?
-        # Checking vLLM source: q: [num_seqs, num_heads, head_size]
+        # q is [Batch, Heads, Dim]
         
-        # But wait, our `q` comes from view(..., heads, head_dim).
-        # We need to ensure it's contiguous for the kernel.
-        
-        q_attn = q  # Already [Batch, Heads, Dim]
+        # Ensure q is contiguous for the paged_attention kernel if the slice caused gaps.
+        # This is a low-cost operation (often a no-op if allocator aligned it well), 
+        # but technically required if the kernel assumes packed density.
+        # Given the strided view from _op_qkv_write, this might trigger a copy, 
+        # but it is necessary for correctness on some custom kernels.
+        q_attn = q.contiguous() 
         attn_out = torch.empty_like(q_attn)
         
         ops.paged_attention_v2(
@@ -330,7 +340,12 @@ class PagedTransformerBlock(nn.Module):
         
         residual = x
         x = self.norm2(x)
-        x = torch.nn.functional.silu(self.w1(x)) * self.w3(x)
+        
+        # Fused Gate/Up projection
+        gate_up = self.w_gate_up(x)
+        x_gate, x_up = gate_up.chunk(2, dim=-1)
+        
+        x = torch.nn.functional.silu(x_gate) * x_up
         x = self.w2(x)
         x = x + residual
         return x

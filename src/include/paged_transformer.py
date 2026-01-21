@@ -82,11 +82,11 @@ class PagedTransformerData:
         # ------------------------------------------------------------------
         # 3. Allocate Heaps (Exact Size)
         # ------------------------------------------------------------------
-        self.key_heap = torch.zeros(
+        self.key_heap = torch.empty(
             (self.total_blocks, num_heads, head_dim // self.x, block_size, self.x),
             dtype=dtype, device=device
         )
-        self.val_heap = torch.zeros(
+        self.val_heap = torch.empty(
             (self.total_blocks, num_heads, head_dim, block_size),
             dtype=dtype, device=device
         )

@@ -96,11 +96,11 @@ class PagedOffloadTransformerData:
         total_resident_pool_size = self.total_resident_blocks_L0 + self.total_resident_blocks_L1N
         heap_blocks_needed = total_resident_pool_size + 2 * self.total_offload_blocks_batch + 128
         
-        self.key_heap = torch.zeros(
+        self.key_heap = torch.empty(
             (heap_blocks_needed, num_heads, head_dim // self.x, block_size, self.x),
             dtype=dtype, device=device
         )
-        self.val_heap = torch.zeros(
+        self.val_heap = torch.empty(
             (heap_blocks_needed, num_heads, head_dim, block_size),
             dtype=dtype, device=device
         )
@@ -119,8 +119,8 @@ class PagedOffloadTransformerData:
         for _ in range(num_layers - 1):
             # Decode buffers (Read from CPU)
             if dec_off_size > 0:
-                self.k_offload_cpu.append(torch.randn((dec_off_size, num_heads, head_dim // self.x, block_size, self.x), dtype=dtype, device='cpu').pin_memory())
-                self.v_offload_cpu.append(torch.randn((dec_off_size, num_heads, head_dim, block_size), dtype=dtype, device='cpu').pin_memory())
+                self.k_offload_cpu.append(torch.empty((dec_off_size, num_heads, head_dim // self.x, block_size, self.x), dtype=dtype, device='cpu').pin_memory())
+                self.v_offload_cpu.append(torch.empty((dec_off_size, num_heads, head_dim, block_size), dtype=dtype, device='cpu').pin_memory())
             else:
                 self.k_offload_cpu.append(torch.empty(0, dtype=dtype, device='cpu').pin_memory())
                 self.v_offload_cpu.append(torch.empty(0, dtype=dtype, device='cpu').pin_memory())
@@ -448,7 +448,7 @@ class PagedOffloadTransformer(PagedTransformer):
     def forward(self, x: torch.Tensor, data: PagedOffloadTransformerData):
         if data.total_offload_blocks_batch == 0:
             return self.forward_resident_impl(x, data)
-
+            
         # 1. Launch H2D Pipeline (Decode)
         if data.total_decode_offload_blocks > 0:
             self.forward_onload_H2D(data)
@@ -457,10 +457,9 @@ class PagedOffloadTransformer(PagedTransformer):
         # Dependent on compute events, will block on GPU until ready
         if data.total_prefill_offload_blocks > 0:
             self.forward_offload_D2H(data)
-        
+
         # 3. Dispatch Compute
         max_seq_len_scalar = 0
         if data.num_decodes > 0:
             max_seq_len_scalar = max(data.decode_lengths) + 1
-            
         return self.forward_offload(x, data, max_seq_len_scalar)

@@ -19,7 +19,7 @@ def parse_batch_distribution(arg_list):
     if not arg_list:
         return []
     
-    # Handle explicit empty request (e.g. "--prefill 0")
+    # Handle explicit empty request
     if len(arg_list) == 1 and arg_list[0].lower() in ['0', 'none']:
         return []
     
@@ -37,7 +37,6 @@ def parse_batch_distribution(arg_list):
         else:
             try:
                 val = int(item)
-                # Filter out accidental 0s if mixed with other numbers, though usually 0 means "stop/empty"
                 if val > 0:
                     result.append(val)
             except ValueError:
@@ -59,7 +58,6 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark Paged Transformer (Mixed Batch)")
     
     # --- Input Options ---
-    # Default Batches updated as requested
     parser.add_argument("--decode", nargs='+', type=str, 
                         default=["1024", "8192", "32768", "100000"],
                         help="Decode sequences. Pass '0' to disable.")
@@ -84,6 +82,10 @@ def main():
     parser.add_argument("--randomize_blocks", action="store_true")
     parser.add_argument("-C", "--compile_mode", type=str, default="default")
     
+    # Profiling
+    parser.add_argument("--profile", action="store_true", help="Enable PyTorch profiler (chrome trace)")
+    parser.add_argument("--trace_path", type=str, default="trace.json", help="Path to save chrome trace")
+
     # Runtime
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--trials", type=int, default=50)
@@ -96,23 +98,18 @@ def main():
     decode_lengths = []
     prefill_lengths = []
 
-    # If batch file is present, load it
     if args.batch_file:
         print(f"Loading batch config from {args.batch_file}...")
         file_decode, file_prefill = load_batch_from_file(args.batch_file)
         decode_lengths.extend(file_decode)
         prefill_lengths.extend(file_prefill)
 
-    # CLI args override/append to file args if present, or use defaults
-    # Note: If batch_file is NOT used, args.decode/prefill will contain the defaults
     if args.decode is not None:
         if args.batch_file: print("Overriding/Appending Decode lengths from CLI...")
-        # If user passed "0", this returns []
         decode_lengths = parse_batch_distribution(args.decode)
         
     if args.prefill is not None:
         if args.batch_file: print("Overriding/Appending Prefill lengths from CLI...")
-        # If user passed "0", this returns []
         prefill_lengths = parse_batch_distribution(args.prefill)
 
     # ------------------------------------------------------------------
@@ -179,7 +176,6 @@ def main():
 
     model.eval()
     
-    # Input Tensor
     total_tokens = data.total_tokens
     if total_tokens == 0:
         print("Error: No tokens to process (empty batch).")
@@ -204,7 +200,7 @@ def main():
     print("Compilation finished.")
 
     # ------------------------------------------------------------------
-    # 4. Benchmarking
+    # 4. Benchmarking with NVTX
     # ------------------------------------------------------------------
     print("\n--- Running Benchmark ---")
     
@@ -213,6 +209,7 @@ def main():
     def run_step():
         with torch.no_grad():
             compiled_model(x_input, data)
+        torch.cuda.synchronize()
 
     # Warmup
     for _ in range(args.warmup):
@@ -221,14 +218,43 @@ def main():
     torch.cuda.synchronize()
 
     # Timing
+    if args.profile:
+        print(f"Profiling enabled. Limiting to 2 trials...")
+        args.trials = 2
+
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(args.trials)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(args.trials)]
 
-    for i in range(args.trials):
-        torch.compiler.cudagraph_mark_step_begin()
-        start_events[i].record()
-        run_step()
-        end_events[i].record()
+    if args.profile:
+        print(f"Saving trace to {args.trace_path}...")
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=0, warmup=0, active=args.trials, repeat=1),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False
+        ) as prof:
+            for i in range(args.trials):
+                torch.cuda.nvtx.range_push(f"Trial")
+                torch.compiler.cudagraph_mark_step_begin()
+                start_events[i].record()
+                run_step()
+                end_events[i].record()
+                torch.cuda.nvtx.range_pop() # Trial
+                prof.step()
+        
+        print("\n--- Profiler Summary (Top 15 CUDA Kernels) ---")
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+        prof.export_chrome_trace(args.trace_path)
+    else:
+        # Standard loop with NVTX for external profilers (nsys)
+        for i in range(args.trials):
+            torch.cuda.nvtx.range_push(f"Trial")
+            torch.compiler.cudagraph_mark_step_begin()
+            start_events[i].record()
+            run_step()
+            end_events[i].record()
+            torch.cuda.nvtx.range_pop() # Trial
 
     torch.cuda.synchronize()
     
@@ -243,26 +269,18 @@ def main():
     # 5. Bandwidth Calculations
     # ------------------------------------------------------------------
     element_size = torch.tensor([], dtype=DTYPE).element_size() # 2 bytes
-    
-    # A. Weights Load (Read for every step)
     weights_bytes = args.layers * (16 * args.dim * args.dim) * element_size
-    
-    # B. KV Cache Write (New Tokens)
     total_new_tokens = data.total_tokens
     kv_write_bytes = args.layers * total_new_tokens * args.dim * 2 * element_size
-    
-    # C. KV Cache Read
     total_history_tokens = sum(decode_lengths) + sum(prefill_lengths)
     kv_read_bytes = args.layers * total_history_tokens * args.dim * 2 * element_size
     
-    # D. PCIe Traffic
     pcie_bytes = 0
     if args.offload_ratio > 0:
         moved_blocks = data.total_decode_offload_blocks + data.total_prefill_offload_blocks
         bytes_per_layer = moved_blocks * args.block_size * args.dim * 2 * element_size
         pcie_bytes = bytes_per_layer * (args.layers - 1)
 
-    # Metrics
     total_mem_bytes = weights_bytes + kv_write_bytes + kv_read_bytes
     effective_bw = (total_mem_bytes / 1e9) / (avg_ms / 1000.0)
     tokens_per_sec = total_new_tokens / (avg_ms / 1000.0)

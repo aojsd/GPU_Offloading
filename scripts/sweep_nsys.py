@@ -16,15 +16,15 @@ import time
 VALUES_TO_SWEEP = list(range(0, 26))
 
 # 2. Command Template
-#    {ratio}  -> Replaced by "0.01", "0.05", etc.
-#    Note: The output prefix logic is handled dynamically in the loop below.
-APP_CMD_TEMPLATE = "python ../src/benchmark_paged_transformer.py -C max-autotune --decode 158000 -r {ratio} --trials 10"
+#    {ratio}      -> Replaced by "0.01", "0.05", etc.
+#    {extra_args} -> Replaced by user input (default: "--decode 158000")
+APP_CMD_TEMPLATE = "python ../src/benchmark_paged_transformer.py -C max-autotune {extra_args} -r {ratio} --trials 10"
 
 # 3. Nsight Systems Settings
 NSYS_CMD_TEMPLATE = (
     "nsys profile "
     "--trace=cuda,nvtx "
-    "--gpu-metrics-device=all "
+    "--gpu-metrics-devices=all "
     "--sample=process-tree "
     "--output={prefix_path} "
     "--force-overwrite=true "
@@ -150,7 +150,6 @@ def parse_application_log(log_text):
     return data
 
 def confirm_overwrite(filename):
-    """Prompts the user to overwrite existing file."""
     while True:
         response = input(f"File '{filename}' already exists. Overwrite? (y/n): ").strip().lower()
         if response in ('y', 'yes'):
@@ -167,8 +166,16 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark Suite with Nsight Profiling")
     parser.add_argument("filename", help="Output CSV filename (Required)")
     
+    # New Argument for extra flags
+    parser.add_argument(
+        "--extra_args", 
+        default="--decode 158000", 
+        help="Additional args to pass to the benchmark command (Default: '--decode 158000')"
+    )
+    
     args = parser.parse_args()
     csv_filename = args.filename
+    extra_args = args.extra_args
 
     headers = [
         "Offload Ratio (%)",
@@ -192,16 +199,15 @@ def main():
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
 
-
     print(f"--- Starting Benchmark Suite ({len(VALUES_TO_SWEEP)} runs) ---")
     print(f"Output: {csv_filename}")
+    print(f"Extra Args: {extra_args}")
     print(f"Temp Directory: /tmp\n")
 
     for val in VALUES_TO_SWEEP:
         ratio_str = f"0.{val:02d}"
         
         # Define paths in /tmp
-        # Using a unique prefix ensures no collisions if you run multiple instances
         prefix_name = f"offload_bench_{val}_{int(time.time())}"
         temp_dir = "/tmp"
         prefix_path = os.path.join(temp_dir, prefix_name)
@@ -213,8 +219,9 @@ def main():
         print(f">>> Running: Ratio={ratio_str}")
 
         # A. Construct Commands
-        app_cmd = APP_CMD_TEMPLATE.format(ratio=ratio_str)
-        # We pass the full path prefix to nsys output
+        # Inject extra_args here
+        app_cmd = APP_CMD_TEMPLATE.format(ratio=ratio_str, extra_args=extra_args)
+        
         full_nsys_cmd = NSYS_CMD_TEMPLATE.format(prefix_path=prefix_path, app_cmd=app_cmd)
 
         # B. Run NSYS
@@ -232,14 +239,10 @@ def main():
             continue
 
         # C. Export to SQLite
-        # print("    Exporting to SQLite...")
         export_cmd = f"nsys export --type sqlite --output {sqlite_file} {rep_file} --force-overwrite=true"
         subprocess.run(export_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         # D. Analyze Data
-        # print("    Analyzing results...")
-        
-        # 1. Parse App Log
         app_stats = {}
         if os.path.exists(log_file):
             with open(log_file, 'r') as f:
@@ -247,7 +250,6 @@ def main():
         else:
              print("    [Error] Log file missing, skipping log parse.")
             
-        # 2. Extract Hardware Stats
         hw_stats = get_hardware_metrics(sqlite_file)
         
         # E. Save to CSV
@@ -261,7 +263,7 @@ def main():
             writer = csv.DictWriter(f, fieldnames=headers)
             writer.writerow(row_data)
 
-        # F. Cleanup (Delete temp files from /tmp)
+        # F. Cleanup
         try:
             if os.path.exists(sqlite_file): os.remove(sqlite_file)
             if os.path.exists(rep_file): os.remove(rep_file)

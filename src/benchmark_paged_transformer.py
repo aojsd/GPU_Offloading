@@ -243,8 +243,8 @@ def main():
                 torch.cuda.nvtx.range_pop() # Trial
                 prof.step()
         
-        print("\n--- Profiler Summary (Top 15 CUDA Kernels) ---")
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+        print("\n--- Profiler Summary (Top 25 CUDA Kernels) ---")
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=25))
         prof.export_chrome_trace(args.trace_path)
     else:
         # Standard loop with NVTX for external profilers (nsys)

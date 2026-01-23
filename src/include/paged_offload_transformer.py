@@ -360,32 +360,22 @@ class PagedOffloadTransformer(PagedTransformer):
         # Compilation
         self.forward_resident_impl = compile_if_needed(self._forward_resident_wrapper, compile_mode)
         self.forward_offload = compile_if_needed(self.forward_offload_, compile_mode)
+        self.H2D_onload_indices = compile_if_needed(self.H2D_onload_indices_, compile_mode)
+        self.D2H_offload_indices = compile_if_needed(self.D2H_offload_indices_, compile_mode)
 
     def _forward_resident_wrapper(self, x, data):
         return super().forward(x, data)
 
-    def load_data_H2D(self, data: PagedOffloadTransformerData, layer_idx):
-        # [Decode] CPU -> GPU Scratchpad
+    def H2D_onload_indices_(self, data: PagedOffloadTransformerData, layer_idx):
         sp_idx = layer_idx % 2
         sp_start, sp_end = data.scratchpad_ranges[sp_idx]
         
         k_src = data.k_offload_cpu[layer_idx - 1]
         v_src = data.v_offload_cpu[layer_idx - 1]
         decode_size = data.total_decode_offload_blocks
-        
-        # Wait for buffer to be free
-        # Needs: compute_done[i-2] (Previous usage of this scratchpad portion)
-        if layer_idx >= 3:
-            self.H2D_stream.wait_event(self.compute_done_events[layer_idx - 3])
-            
-        with torch.cuda.stream(self.H2D_stream):
-            if decode_size > 0:
-                data.key_heap[sp_start : sp_start + decode_size].copy_(k_src, non_blocking=True)
-                data.val_heap[sp_start : sp_start + decode_size].copy_(v_src, non_blocking=True)
-            self.H2D_stream.record_event(self.h2d_ready_events[layer_idx - 1])
+        return sp_start, sp_start + decode_size, k_src, v_src, decode_size
 
-    def evict_data_D2H(self, data: PagedOffloadTransformerData, layer_idx):
-        # [Prefill] GPU Scratchpad -> CPU
+    def D2H_offload_indices_(self, data: PagedOffloadTransformerData, layer_idx):
         sp_idx = layer_idx % 2
         sp_start, sp_end = data.scratchpad_ranges[sp_idx]
         
@@ -396,28 +386,35 @@ class PagedOffloadTransformer(PagedTransformer):
         
         k_dst = data.k_prefill_cpu[layer_idx - 1]
         v_dst = data.v_prefill_cpu[layer_idx - 1]
-        
-        # Wait for Compute to finish writing Prefill data
-        self.D2H_stream.wait_event(self.prefill_ready_events[layer_idx - 1])
-        
-        with torch.cuda.stream(self.D2H_stream):
-            if copy_size > 0:
-                k_src = data.key_heap[prefill_start:prefill_end]
-                v_src = data.val_heap[prefill_start:prefill_end]
-                k_dst.copy_(k_src, non_blocking=True)
-                v_dst.copy_(v_src, non_blocking=True)
-            self.D2H_stream.record_event(self.d2h_done_events[layer_idx - 1])
+        k_src = data.key_heap[prefill_start:prefill_end]
+        v_src = data.val_heap[prefill_start:prefill_end]
+        return k_src, v_src, k_dst, v_dst, copy_size
 
+    # [Decode] CPU -> GPU Scratchpad
     def forward_onload_H2D(self, data: PagedOffloadTransformerData):
-        if self.n_layers > 1: self.load_data_H2D(data, 1)
-        if self.n_layers > 2: self.load_data_H2D(data, 2)
-        for layer_idx in range(3, self.n_layers):
-            self.load_data_H2D(data, layer_idx)
+        for layer_idx in range(1, self.n_layers):
+            start, end, k_src, v_src, decode_size = self.H2D_onload_indices(data, layer_idx)
+            
+            with torch.cuda.stream(self.H2D_stream):
+                if layer_idx >= 3:
+                    self.H2D_stream.wait_event(self.compute_done_events[layer_idx - 3])
+                if decode_size > 0:
+                    data.key_heap[start:end].copy_(k_src, non_blocking=True)
+                    data.val_heap[start:end].copy_(v_src, non_blocking=True)
+                self.H2D_stream.record_event(self.h2d_ready_events[layer_idx - 1])
 
+    # [Prefill] GPU Scratchpad -> CPU
     def forward_offload_D2H(self, data: PagedOffloadTransformerData):
         # Starts from layer 1
         for layer_idx in range(1, self.n_layers):
-            self.evict_data_D2H(data, layer_idx)
+            k_src, v_src, k_dst, v_dst, copy_size = self.D2H_offload_indices(data, layer_idx)
+        
+            with torch.cuda.stream(self.D2H_stream):
+                self.D2H_stream.wait_event(self.prefill_ready_events[layer_idx - 1])
+                if copy_size > 0:
+                    k_dst.copy_(k_src, non_blocking=True)
+                    v_dst.copy_(v_src, non_blocking=True)
+                self.D2H_stream.record_event(self.d2h_done_events[layer_idx - 1])
 
     def forward_offload_(self, x, data, max_seq_len_scalar):
         # Layer 0 (Resident)
@@ -446,20 +443,16 @@ class PagedOffloadTransformer(PagedTransformer):
         return self.norm(x)
 
     def forward(self, x: torch.Tensor, data: PagedOffloadTransformerData):
-        if data.total_offload_blocks_batch == 0:
-            return self.forward_resident_impl(x, data)
-            
-        # 1. Launch H2D Pipeline (Decode)
-        if data.total_decode_offload_blocks > 0:
-            self.forward_onload_H2D(data)
-            
-        # 2. Launch D2H Pipeline (Prefill)
-        # Dependent on compute events, will block on GPU until ready
-        if data.total_prefill_offload_blocks > 0:
-            self.forward_offload_D2H(data)
-
-        # 3. Dispatch Compute
+        # 1. Dispatch Compute
         max_seq_len_scalar = 0
         if data.num_decodes > 0:
             max_seq_len_scalar = max(data.decode_lengths) + 1
-        return self.forward_offload(x, data, max_seq_len_scalar)
+        res = self.forward_offload(x, data, max_seq_len_scalar)
+        
+        # 2. Launch H2D Pipeline (Decode)
+        self.forward_onload_H2D(data)
+            
+        # 3. Launch D2H Pipeline (Prefill)
+        # Dependent on compute events, will block on GPU until ready
+        self.forward_offload_D2H(data)
+        return res

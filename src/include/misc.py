@@ -282,4 +282,4 @@ def compile_if_needed(module, compile_mode):
     else:
         # Suppress compile output and logs
         with suppress_all_output():
-            return torch.compile(module, mode=compile_mode, fullgraph=True)
+            return torch.compile(module, mode=compile_mode)

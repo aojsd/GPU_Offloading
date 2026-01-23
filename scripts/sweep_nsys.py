@@ -18,7 +18,7 @@ VALUES_TO_SWEEP = list(range(0, 26))
 # 2. Command Template
 #    {ratio}      -> Replaced by "0.01", "0.05", etc.
 #    {extra_args} -> Replaced by user input (default: "--decode 158000")
-APP_CMD_TEMPLATE = "python ../src/benchmark_paged_transformer.py -C max-autotune {extra_args} -r {ratio} --trials 10"
+APP_CMD_TEMPLATE = "python ../src/benchmark_paged_transformer.py {extra_args} -r {ratio}"
 
 # 3. Nsight Systems Settings
 NSYS_CMD_TEMPLATE = (

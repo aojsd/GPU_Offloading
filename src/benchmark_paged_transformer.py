@@ -84,7 +84,7 @@ def main():
     
     # Profiling
     parser.add_argument("--profile", action="store_true", help="Enable PyTorch profiler (chrome trace)")
-    parser.add_argument("--trace_path", type=str, default="trace.json", help="Path to save chrome trace")
+    parser.add_argument("--trace_path", type=str, default=None, help="Path to save chrome trace")
 
     # Runtime
     parser.add_argument("--warmup", type=int, default=10)
@@ -218,15 +218,13 @@ def main():
     torch.cuda.synchronize()
 
     # Timing
-    if args.profile:
-        print(f"Profiling enabled. Limiting to 2 trials...")
-        args.trials = 2
-
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(args.trials)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(args.trials)]
 
     if args.profile:
-        print(f"Saving trace to {args.trace_path}...")
+        trace_file_string = f"(saving to {args.trace_path})" if args.trace_path is not None else \
+                             "(not saving, no trace file provided)"
+        print(f"Profiling kernel data {trace_file_string}")
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CUDA],
             schedule=torch.profiler.schedule(wait=0, warmup=0, active=args.trials, repeat=1),
@@ -243,9 +241,11 @@ def main():
                 torch.cuda.nvtx.range_pop() # Trial
                 prof.step()
         
-        print("\n--- Profiler Summary (Top 25 CUDA Kernels) ---")
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=25))
-        prof.export_chrome_trace(args.trace_path)
+        print("\n--- Profiler Summary (Top 15 CUDA Kernels) ---")
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+        if args.trace_path:
+            print(f"Saving trace to {args.trace_path}...")
+            prof.export_chrome_trace(args.trace_path)
     else:
         # Standard loop with NVTX for external profilers (nsys)
         for i in range(args.trials):

@@ -6,7 +6,7 @@ import sys
 # ==========================================
 # HARDCODED SEQUENCE LENGTHS
 # ==========================================
-SEQUENCE_LENGTHS = [8192, 16384, 1024, 32768, 100000]
+SEQUENCE_LENGTHS = [150000]
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Paged KV Cache I/O (Dynamic Batch)")
@@ -14,11 +14,11 @@ def main():
     # Configuration
     parser.add_argument("--dim", type=int, default=4096, help="Hidden dimension")
     parser.add_argument("--heads", type=int, default=32, help="Number of attention heads")
-    parser.add_argument("--layers", type=int, default=25, help="Number of layers")
+    parser.add_argument("--layers", type=int, default=32, help="Number of layers")
     parser.add_argument("--block_size", type=int, default=16, help="PagedAttention block size")
     
     # Offloading
-    parser.add_argument("--offload_ratio", type=float, default=0.5, 
+    parser.add_argument("-r", "--offload_ratio", type=float, default=0.1, 
                         help="Ratio of KV cache to offload to CPU")
     
     # Benchmarking
@@ -99,6 +99,7 @@ def main():
             for i in range(args.layers - 1):
                 gpu_scratchpad_k.copy_(cpu_buffers_k[i], non_blocking=True)
                 gpu_scratchpad_v.copy_(cpu_buffers_v[i], non_blocking=True)
+        torch.cuda.synchronize()
 
     print("\n--- Starting Benchmark ---")
     
@@ -108,27 +109,23 @@ def main():
     torch.cuda.synchronize()
     
     # Timing
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(args.trials)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(args.trials)]
     
     # Use NVTX range for Nsight Systems analysis
     torch.cuda.nvtx.range_push("IO_Benchmark_Trials")
     
-    # Record start event ON THE IO STREAM
-    start_event.record(io_stream)
-    
-    for _ in range(args.trials):
+    for i in range(args.trials):
+        start_events[i].record()
         run_transfer_step()
-    
-    # Record end event ON THE IO STREAM
-    end_event.record(io_stream)
+        end_events[i].record()
     
     # Wait for GPU to finish
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
     
-    elapsed_ms = start_event.elapsed_time(end_event)
-    avg_ms = elapsed_ms / args.trials
+    times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    avg_ms = sum(times) / len(times)
     gb_s = (total_transfer_bytes / 1e9) / (avg_ms / 1000.0)
     
     print(f"\nResults:")

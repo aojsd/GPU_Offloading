@@ -29,15 +29,21 @@ except FileNotFoundError as e:
 # ==========================================
 
 # --- NEW: Hardcoded Interconnect Bandwidth (GB/s) ---
-INTERCONNECT_BW = 300.0  # e.g., PCIe Gen4 x16 ~24 GB/s effective. Adjust as needed.
+INTERCONNECT_BW = 300.0 # Example: NVLink C2C bandwidth
 
 # List of tuples: (path_to_csv, legend_label)
 PREFIX = f"{PROJECT_ROOT}/data/full_transformers/gh200_32L_4096H_D150K"
+PREFILL = lambda x: (f"{PREFIX}_P{x}.csv", f"{x}-Prefill")
 FILES_TO_PLOT = [
     (f"{PREFIX}.csv", "Decode-Only"),
-    (f"{PREFIX}_P256.csv", "256-Prefill"),
-    (f"{PREFIX}_P512.csv", "512-Prefill"),
-    (f"{PREFIX}_P768.csv", "768-Prefill"),
+    PREFILL(256),
+    PREFILL(512),
+    PREFILL(768),
+    PREFILL(1024),
+    PREFILL(1280),
+    PREFILL(1536),
+    PREFILL(1792),
+    PREFILL(2048),
     # Add more files here...
 ]
 
@@ -171,7 +177,7 @@ def process_and_plot():
     plt.ylabel(Y_LABEL, fontsize=12)
     plt.grid(True, linestyle=GRID_STYLE, alpha=0.7)
     plt.ylim(bottom=0)
-    plt.legend(fontsize=10)
+    plt.legend(fontsize=9)
     
     # Format X-axis as percentage
     plt.gca().xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f'{x:.0%}'))

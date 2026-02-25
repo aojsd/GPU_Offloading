@@ -125,6 +125,7 @@ def write_custom_driver(path, seq_len, model_dir):
         # Warmup (graph already captured, just exercise replay)
         for _ in range(NUM_WARMUP):
             engine.seq_lens[0] = SEQ_LEN
+            engine._seq_lens_cpu[0] = SEQ_LEN
             engine._decode_step_graphed(token, pos)
         torch.cuda.synchronize()
 
@@ -132,6 +133,7 @@ def write_custom_driver(path, seq_len, model_dir):
         torch.cuda.cudart().cudaProfilerStart()
         for _ in range(NUM_DECODE):
             engine.seq_lens[0] = SEQ_LEN
+            engine._seq_lens_cpu[0] = SEQ_LEN
             engine._decode_step_graphed(token, pos)
         torch.cuda.synchronize()
         torch.cuda.cudart().cudaProfilerStop()

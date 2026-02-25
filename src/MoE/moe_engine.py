@@ -468,7 +468,9 @@ class MoEEngine:
         pos_i32 = positions.to(torch.int32)
         slot_mapping = self._compute_slot_mapping(pos_i32, B)
 
-        # Plan FlashInfer decode (must be before layer loop / CUDA graph)
+        # Increment seq_lens BEFORE plan so FlashInfer includes the current
+        # token's K/V (written to cache before attention within each layer).
+        self._seq_lens_cpu[:B] += 1
         self._plan_flashinfer_decode(self._decode_wrapper, B)
 
         hidden = F.embedding(token_ids, self.embed_tokens)
@@ -479,7 +481,6 @@ class MoEEngine:
         hidden = F.rms_norm(hidden, (self.hidden_size,), self.final_norm, self.rms_norm_eps)
         logits = F.linear(hidden, self.lm_head)
         self.seq_lens[:B] += 1
-        self._seq_lens_cpu[:B] += 1
         return logits
 
     def _layer_decode(self, hidden, layer, positions, slot_mapping, decode_wrapper):
@@ -680,6 +681,10 @@ class MoEEngine:
             paged_kv_indices_buffer=fi_indices,
             paged_kv_last_page_len_buffer=fi_last_page_len)
 
+        # Increment _seq_lens_cpu to account for current token (written to cache
+        # before attention within each layer, so FlashInfer must include it).
+        self._seq_lens_cpu[:batch_size] += 1
+
         # Initial plan() — JIT compiles the FlashInfer kernel
         self._plan_flashinfer_decode(graph_wrapper, batch_size)
 
@@ -734,7 +739,11 @@ class MoEEngine:
         info['static_pos'].copy_(pos_i32)
         info['static_slot_mapping'].copy_(self._compute_slot_mapping(pos_i32, B))
 
-        # Re-plan FlashInfer with current seq_lens (plan_info must match page count)
+        # Increment seq_lens BEFORE plan so FlashInfer includes the current
+        # token's K/V (written to cache before attention within each layer).
+        self._seq_lens_cpu[:B] += 1
+
+        # Re-plan FlashInfer with updated seq_lens (plan_info must match page count)
         wrapper = info['graph_wrapper']
         seq_lens = self._seq_lens_cpu[:B]
         pages_per_seq = (seq_lens + self.page_size - 1) // self.page_size
@@ -754,7 +763,6 @@ class MoEEngine:
         info['graph'].replay()
 
         self.seq_lens[:B] += 1
-        self._seq_lens_cpu[:B] += 1
         return info['static_output']
 
 

@@ -6,94 +6,94 @@
 COMPARISON SUMMARY
   Metric                                   Custom        vLLM         Delta
   ------------------------------------------------------------------------
-  GPU kernel time / step                    2.85ms       2.92ms       -66us (-2.3%)
+  GPU kernel time / step                    2.87ms       2.93ms       -59us (-2.0%)
   Kernel launches / step                      989        1032         -43
 
 KERNEL CATEGORY COMPARISON (per decode step)
   Category                                 Custom        vLLM       Delta
   ----------------------------------------------------------------------
-  Attention (FlashInfer graph)                0us       199us      -199us
-  Elementwise                               643us       739us       -95us
-  Attention (FlashInfer)                     90us         0us       +90us
+  Attention (FlashInfer graph)                0us       200us      -200us
+  Elementwise                               644us       742us       -98us
+  Attention (FlashInfer)                     95us         0us       +95us
   KV cache store                             90us        37us       +53us
-  MoE (fused_experts)                       732us       697us       +36us
-  Other                                      31us         0us       +31us
+  Other                                      45us         0us       +45us
+  MoE (fused_experts)                       730us       697us       +33us
   Router (softmax)                            0us        25us       -25us
-  Linear (cuBLAS)                           436us       419us       +17us
-  KV cache indexing                         182us       170us       +11us
-  MoE align (patched)                       180us       170us       +10us
-  Reduce / sum                               81us        90us        -9us
-  Router (sort)                             139us       132us        +7us
-  torch.compile fused                       132us       126us        +6us
+  Linear (cuBLAS)                           437us       420us       +17us
+  KV cache indexing                         182us       171us       +11us
+  MoE align (patched)                       180us       170us        +9us
+  Reduce / sum                               82us        90us        -8us
+  Router (sort)                             140us       133us        +6us
+  torch.compile fused                       132us       126us        +5us
   RMSNorm                                     4us         0us        +4us
   Attention (FlashInfer meta)                 0us         2us        -2us
   MoE (SiLU gate)                            29us        31us        -2us
-  Router (topk)                              83us        82us        +1us
+  Router (topk)                              81us        82us        -2us
   ----------------------------------------------------------------------
-  TOTAL                                    2.85ms      2.92ms       -66us
+  TOTAL                                    2.87ms      2.93ms       -59us
 
 ====================================================================================================
   CUSTOM ENGINE — CUDA Graph Decode
-  GPU kernel time / step: 2.85ms
+  GPU kernel time / step: 2.87ms
   Kernel launches / step: 989
 
   Category                                   Time/step    % GPU   Launches
   ----------------------------------------------------------------------
-  MoE (fused_experts)                            732us    25.7%        32/step
-  Elementwise                                    643us    22.6%       473/step
-  Linear (cuBLAS)                                436us    15.3%        49/step
-  KV cache indexing                              182us     6.4%        98/step
+  MoE (fused_experts)                            730us    25.5%        32/step
+  Elementwise                                    644us    22.4%       473/step
+  Linear (cuBLAS)                                437us    15.2%        49/step
+  KV cache indexing                              182us     6.3%        98/step
   MoE align (patched)                            180us     6.3%       112/step
-  Router (sort)                                  139us     4.9%        32/step
+  Router (sort)                                  140us     4.9%        32/step
   torch.compile fused                            132us     4.6%        80/step
-  Attention (FlashInfer)                          90us     3.2%        16/step
+  Attention (FlashInfer)                          95us     3.3%        16/step
   KV cache store                                  90us     3.1%        32/step
-  Router (topk)                                   83us     2.9%        16/step
-  Reduce / sum                                    81us     2.8%        16/step
-  Other                                           31us     1.1%        16/step
+  Reduce / sum                                    82us     2.8%        16/step
+  Router (topk)                                   81us     2.8%        16/step
+  Other                                           45us     1.6%        16/step
   MoE (SiLU gate)                                 29us     1.0%        16/step
   RMSNorm                                          4us     0.1%         1/step
   ----------------------------------------------------------------------
-  TOTAL                                         2.85ms   100.0%       989/step
+  TOTAL                                         2.87ms   100.0%       989/step
 
   Top 20 individual kernels:
       #  Kernel                                                       Total   Count       Avg  Category
   ------------------------------------------------------------------------------------------------
-      1  fused_moe_kernel                                            21.96ms     960     22.9us  MoE (fused_experts)
+      1  fused_moe_kernel                                            21.90ms     960     22.8us  MoE (fused_experts)
       2  vectorized_elementwise_kernel                                9.18ms    6870      1.3us  Elementwise
-      3  nvjet_tst_64x8_64x16_4x1_v_bz_TNT                            8.39ms     960      8.7us  Linear (cuBLAS)
+      3  nvjet_tst_64x8_64x16_4x1_v_bz_TNT                            8.40ms     960      8.8us  Linear (cuBLAS)
       4  unrolled_elementwise_kernel                                  7.90ms    5370      1.5us  Elementwise
-      5  index_elementwise_kernel                                     3.65ms    1950      1.9us  KV cache indexing
-      6  BatchDecodeWithPagedKVCacheKernel                            2.71ms     480      5.6us  Attention (FlashInfer)
+      5  index_elementwise_kernel                                     3.66ms    1950      1.9us  KV cache indexing
+      6  BatchDecodeWithPagedKVCacheKernel                            2.84ms     480      5.9us  Attention (FlashInfer)
       7  DeviceScanKernel                                             2.58ms    1440      1.8us  MoE align (patched)
       8  nvjet_tst_64x8_64x16_1x1_v_bz_TNT                            2.52ms     480      5.3us  Linear (cuBLAS)
-      9  gatherTopK                                                   2.48ms     480      5.2us  Router (topk)
-     10  reduce_kernel                                                2.42ms     480      5.0us  Reduce / sum
+      9  reduce_kernel                                                2.45ms     480      5.1us  Reduce / sum
+     10  gatherTopK                                                   2.42ms     480      5.0us  Router (topk)
      11  elementwise_kernel_with_index                                2.23ms    1950      1.1us  Elementwise
-     12  nvjet_tst_384x8_64x4_2x1_v_bz_TNT                            2.17ms      30     72.4us  Linear (cuBLAS)
+     12  nvjet_tst_384x8_64x4_2x1_v_bz_TNT                            2.18ms      30     72.7us  Linear (cuBLAS)
      13  radixSortKVInPlace                                           2.10ms     480      4.4us  Router (sort)
      14  bitonicSortKVInPlace                                         2.08ms     480      4.3us  Router (sort)
      15  triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_sele..      1.95ms     960      2.0us  torch.compile fused
      16  _scatter_gather_elementwise_kernel                           1.71ms     960      1.8us  KV cache indexing
      17  DeviceScanInitKernel                                         1.70ms    1440      1.2us  MoE align (patched)
      18  triton_red_fused__to_copy_add_as_strided_cat_index_me..      1.51ms     480      3.1us  KV cache store
-     19  reshape_and_cache_flash_kernel                               1.18ms     480      2.5us  KV cache store
-     20  searchsorted_cuda_kernel                                     1.12ms     480      2.3us  MoE align (patched)
+     19  PersistentVariableLengthMergeStatesKernel                    1.36ms     480      2.8us  Other
+     20  reshape_and_cache_flash_kernel                               1.18ms     480      2.5us  KV cache store
 
 ====================================================================================================
   vLLM SOTA — CUDA Graphs + torch.compile
-  GPU kernel time / step: 2.92ms
+  GPU kernel time / step: 2.93ms
   Kernel launches / step: 1032
 
   Category                                   Time/step    % GPU   Launches
   ----------------------------------------------------------------------
-  Elementwise                                    739us    25.3%       548/step
-  MoE (fused_experts)                            697us    23.9%        31/step
-  Linear (cuBLAS)                                419us    14.4%        47/step
-  Attention (FlashInfer graph)                   199us     6.8%        31/step
-  KV cache indexing                              170us     5.8%        94/step
+  Elementwise                                    742us    25.3%       548/step
+  MoE (fused_experts)                            697us    23.8%        31/step
+  Linear (cuBLAS)                                420us    14.3%        47/step
+  Attention (FlashInfer graph)                   200us     6.8%        31/step
+  KV cache indexing                              171us     5.8%        94/step
   MoE align (patched)                            170us     5.8%       108/step
-  Router (sort)                                  132us     4.5%        31/step
+  Router (sort)                                  133us     4.6%        31/step
   torch.compile fused                            126us     4.3%        63/step
   Reduce / sum                                    90us     3.1%        16/step
   Router (topk)                                   82us     2.8%        15/step
@@ -102,30 +102,30 @@ KERNEL CATEGORY COMPARISON (per decode step)
   Router (softmax)                                25us     0.9%        15/step
   Attention (FlashInfer meta)                      2us     0.1%         1/step
   ----------------------------------------------------------------------
-  TOTAL                                         2.92ms   100.0%      1032/step
+  TOTAL                                         2.93ms   100.0%      1032/step
 
   Top 20 individual kernels:
       #  Kernel                                                       Total   Count       Avg  Category
   ------------------------------------------------------------------------------------------------
-      1  fused_moe_kernel                                            20.90ms     928     22.5us  MoE (fused_experts)
-      2  unrolled_elementwise_kernel                                  9.74ms    6670      1.5us  Elementwise
-      3  vectorized_elementwise_kernel                                9.13ms    6989      1.3us  Elementwise
-      4  nvjet_tst_64x8_64x16_4x1_v_bz_TNT                            8.05ms     928      8.7us  Linear (cuBLAS)
-      5  device_kernel                                                5.98ms     928      6.4us  Attention (FlashInfer graph)
-      6  index_elementwise_kernel                                     3.49ms    1885      1.9us  KV cache indexing
-      7  reduce_kernel                                                2.69ms     493      5.4us  Reduce / sum
-      8  elementwise_kernel_with_index                                2.62ms    2320      1.1us  Elementwise
-      9  DeviceScanKernel                                             2.45ms    1392      1.8us  MoE align (patched)
-     10  gatherTopK                                                   2.45ms     464      5.3us  Router (topk)
-     11  nvjet_tst_64x8_64x16_1x1_v_bz_TNT                            2.42ms     464      5.2us  Linear (cuBLAS)
+      1  fused_moe_kernel                                            20.92ms     928     22.5us  MoE (fused_experts)
+      2  unrolled_elementwise_kernel                                  9.79ms    6670      1.5us  Elementwise
+      3  vectorized_elementwise_kernel                                9.17ms    6989      1.3us  Elementwise
+      4  nvjet_tst_64x8_64x16_4x1_v_bz_TNT                            8.06ms     928      8.7us  Linear (cuBLAS)
+      5  device_kernel                                                5.99ms     928      6.5us  Attention (FlashInfer graph)
+      6  index_elementwise_kernel                                     3.51ms    1885      1.9us  KV cache indexing
+      7  reduce_kernel                                                2.69ms     493      5.5us  Reduce / sum
+      8  elementwise_kernel_with_index                                2.63ms    2320      1.1us  Elementwise
+      9  gatherTopK                                                   2.46ms     464      5.3us  Router (topk)
+     10  DeviceScanKernel                                             2.46ms    1392      1.8us  MoE align (patched)
+     11  nvjet_tst_64x8_64x16_1x1_v_bz_TNT                            2.43ms     464      5.2us  Linear (cuBLAS)
      12  nvjet_tst_384x8_64x4_2x1_v_bz_TNT                            2.11ms      29     72.8us  Linear (cuBLAS)
-     13  radixSortKVInPlace                                           1.99ms     464      4.3us  Router (sort)
-     14  bitonicSortKVInPlace                                         1.98ms     464      4.3us  Router (sort)
-     15  DeviceScanInitKernel                                         1.64ms    1392      1.2us  MoE align (patched)
-     16  _scatter_gather_elementwise_kernel                           1.62ms     928      1.7us  KV cache indexing
+     13  radixSortKVInPlace                                           2.01ms     464      4.3us  Router (sort)
+     14  bitonicSortKVInPlace                                         1.99ms     464      4.3us  Router (sort)
+     15  DeviceScanInitKernel                                         1.65ms    1392      1.2us  MoE align (patched)
+     16  _scatter_gather_elementwise_kernel                           1.63ms     928      1.8us  KV cache indexing
      17  reshape_and_cache_flash_kernel                               1.10ms     464      2.4us  KV cache store
      18  triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_1           1.01ms     464      2.2us  torch.compile fused
-     19  searchsorted_cuda_kernel                                     1.00ms     464      2.2us  MoE align (patched)
+     19  searchsorted_cuda_kernel                                     1.01ms     464      2.2us  MoE align (patched)
      20  triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_0           0.96ms     464      2.1us  torch.compile fused
 
 ====================================================================================================

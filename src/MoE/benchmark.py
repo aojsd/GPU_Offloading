@@ -129,6 +129,7 @@ def _time_custom_decode_once(engine, target_seq_len, n_steps, n_warmup):
     engine.k_cache.normal_(0, 0.01)
     engine.v_cache.normal_(0, 0.01)
     engine.seq_lens[0] = target_seq_len
+    engine._seq_lens_cpu[0] = target_seq_len
 
     token = torch.tensor([100], device="cuda")
     pos = torch.tensor([target_seq_len], dtype=torch.int32, device="cuda")
@@ -137,6 +138,7 @@ def _time_custom_decode_once(engine, target_seq_len, n_steps, n_warmup):
 
     for _ in range(n_warmup):
         engine.seq_lens[0] = target_seq_len
+        engine._seq_lens_cpu[0] = target_seq_len
         if use_graph:
             engine._decode_step_graphed(token, pos)
         else:
@@ -148,6 +150,7 @@ def _time_custom_decode_once(engine, target_seq_len, n_steps, n_warmup):
     start.record()
     for _ in range(n_steps):
         engine.seq_lens[0] = target_seq_len
+        engine._seq_lens_cpu[0] = target_seq_len
         if use_graph:
             engine._decode_step_graphed(token, pos)
         else:

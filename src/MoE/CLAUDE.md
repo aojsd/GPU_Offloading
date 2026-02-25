@@ -10,9 +10,11 @@ We want to create a sort of sandbox environment for experimenting with expert of
 Note that in order for this sandbox to be useful, we need to accurately capture both the behavior (expert selection) and compute performance of state-of-the-art serving systems. Ideally, we'd implement this using a framework like vLLM or SGLang, but I'm not sure if their APIs are enough to build this trace-based sandbox. If we instead build our implementation from scratch, we need to ensure that step 3 uses existing state-of-the-art kernels and compilation frameworks to maximize potential performance to provide useful insights. We'd also need to make sure our trace collection is accurate.
 
 Meta-Instructions:
-After every major progression, summarize important ideas and changes to be appended to the end of this CLAUDE.md file. Alternatively, do this whenever you have been working for a long time and may soon exceed the 200k context limit.
+After reasonable checkpoints, or when finding a critical bug, summarize important ideas and changes and append them to the end of this CLAUDE.md file. Alternatively, do this whenever you have been working for a long time and may soon exceed the 200k context limit. When a major progression is finished (e.g., completing a long task given by user prompt), refactor the CLAUDE.md file to remove the intermediate checkpoint information.
 
 Aim to write most, if not all, code in Python/Pytorch or Pytorch-compatible packages.
+
+DO NOT commit or push using Git unless explicitly asked to do so.
 
 ---
 
@@ -119,26 +121,34 @@ engine.capture_decode_cuda_graph(batch_size=1, warmup_seq_len=128, max_decode_to
 
 ### Correctness
 
-- Greedy generation: exact match vs HuggingFace (37/37 tokens, logits cosine=0.9999)
+- Greedy generation: exact match vs HuggingFace (56/56 tokens on test prompt)
 - CUDA graph vs eager: exact match (30 tokens)
+- vs vLLM: 2/3 prompts exact match (1 diverges at BF16 tie-break, gap=0.0625)
 
 ### CUDA Graph Decode Pipeline
 
 Per layer: fused QKV projection → Q/K RMSNorm → rope_pytorch → reshape_and_cache_flash →
-flash_attn_varlen_func → output projection → RMSNorm + residual → router → fused_experts → residual.
+FlashInfer BatchDecode → output projection → RMSNorm + residual → router → fused_experts → residual.
 
 With `torch.compile(fullgraph=False)`, Inductor fuses RMSNorm + residual + RoPE into Triton
-kernels. Graph breaks at `reshape_and_cache_flash` and `flash_attn_varlen_func` (no fake impls)
-are acceptable — Inductor fuses the regions between breaks. `fused_experts` has proper
-`torch.library` registration with fake impl → no graph break.
+kernels. Graph breaks at `reshape_and_cache_flash` and FlashInfer `run()` are acceptable —
+Inductor fuses the regions between breaks. `fused_experts` has proper `torch.library`
+registration with fake impl → no graph break.
 
-`static_seq_lens` and `static_slot_mapping` tensors are updated before each graph replay via `.copy_()`.
+`static_slot_mapping` is updated before each graph replay via `.copy_()`.
+FlashInfer `plan()` is called before each graph replay to update page metadata.
 
 Key implementation details:
-- KV cache format: flat NHD `[L, blocks, block_size, num_kv_heads, head_dim]`
-- Decode attention: `flash_attn_varlen_func` from `vllm.vllm_flash_attn` (FA2/FA3, same as vLLM v1)
-- KV write: `reshape_and_cache_flash` (flat NHD, simpler than x-packed `reshape_and_cache`)
+- KV cache format: flat NHD `[L, total_pages, page_size, num_kv_heads, head_dim]`
+- Decode attention: `BatchDecodeWithPagedKVCacheWrapper` from FlashInfer 0.5.2
+- FlashInfer two-phase API: `plan()` (CPU, outside graph) → `run()` (GPU, inside graph)
+- `plan()` must be called before each replay (not just buffer copy) — it recomputes `_plan_info`
+  containing split-KV tile counts that depend on actual page count
+- `_seq_lens_cpu` mirror avoids GPU→CPU sync for plan metadata computation
+- KV write: `reshape_and_cache_flash` (flat NHD, same as vLLM)
 - RoPE: `rope_pytorch` for decode (pure PyTorch, compilable), FlashInfer for prefill
+- **Critical**: `_seq_lens_cpu` must be incremented BEFORE `plan()` so FlashInfer includes
+  the current token's K/V (written to cache before attention within each layer)
 - torch.compile Inductor produces numerically different tokens from eager (expected, vLLM does too)
 - `use_torch_compile=False` for exact correctness validation, `True` for performance
 
@@ -166,58 +176,55 @@ Custom engine uses torch.compile + CUDA graphs (same as vLLM).
 
 ```
 seq_len  Custom  vLLM   Gap      Gap%   Custom launches  vLLM launches
-  128     2.87   2.92  -0.05     -1.6%          974           1032
-  256     2.92   2.93  -0.02     -0.5%          974           1032
-  512     2.99   2.94  +0.04     +1.5%          974           1032
- 1024     3.15   2.95  +0.20     +6.6%          974           1032
- 2048     3.47   3.01  +0.46    +15.1%          974           1032
+  128     2.87   2.93  -0.06     -1.9%          989           1032
+  256     2.87   2.93  -0.06     -2.0%          989           1032
+  512     2.89   2.93  -0.05     -1.7%          989           1032
+ 1024     2.91   2.95  -0.04     -1.4%          989           1032
+ 2048     2.96   3.00  -0.04     -1.3%          989           1032
 ```
 
-At short sequences (128-512), custom engine matches or beats vLLM.
-At longer sequences, FA2 splitKV attention scales worse than vLLM's FlashInfer decode kernel.
-Custom uses fewer kernel launches (974 vs 1032) due to Inductor fusion.
+Custom engine beats or matches vLLM at ALL sequence lengths.
+Fewer kernel launches (989 vs 1032) due to Inductor fusion.
 
 ### Kernel Category Breakdown at seq_len=128
 
 ```
 Category                        Custom     vLLM     Delta    Notes
-MoE (fused_experts)              730us     696us    +34us    noise
-Elementwise                      643us     741us    -98us    custom has more Inductor fusion
-Linear (cuBLAS)                  438us     420us    +19us    near parity
-KV cache indexing                181us     171us    +10us    near parity
-MoE align (patched)              180us     170us    +10us    noise
-Router (sort)                    139us     133us     +6us    noise
-Attention (FlashAttention)       137us       —         —     custom uses FA2 splitKV
-Attention (FlashInfer graph)       —       198us       —     vLLM uses FlashInfer
-torch.compile fused              135us     126us     +9us    both use Inductor
-KV cache store                    91us      37us    +54us    reshape_and_cache_flash vs vLLM
-Router (topk)                     84us      79us     +5us    noise
-Reduce / sum                      82us      90us     -8us    noise
+MoE (fused_experts)              731us     698us    +33us    noise
+Elementwise                      643us     743us   -101us    custom has more Inductor fusion
+Linear (cuBLAS)                  436us     420us    +15us    near parity
+Attention (FlashInfer graph)       —       199us       —     vLLM uses CUDA graph FlashInfer
+Attention (FlashInfer)            90us       —        —      custom uses eager FlashInfer
+KV cache indexing                182us     172us    +10us    near parity
+MoE align (patched)              179us     171us     +9us    noise
+Router (sort)                    139us     134us     +6us    noise
+torch.compile fused              131us     126us     +5us    both use Inductor
+KV cache store                    90us      37us    +53us    reshape_and_cache_flash overhead
+Router (topk)                     82us      79us     +3us    noise
+Reduce / sum                      81us      90us     -8us    noise
 MoE (SiLU gate)                   29us      31us     -2us    noise
                                  -----    -----    -----
-TOTAL                           2.87ms   2.92ms   -0.05ms
+TOTAL                           2.87ms   2.93ms   -0.06ms
 ```
 
-Custom is 50us faster overall at seq128. Main differences:
-- Attention: FA2 (137us) vs FlashInfer (198us) — FA2 is 31% faster at short sequences
-- KV store: custom 91us vs vLLM 37us (+54us) — reshape_and_cache_flash overhead
-- Elementwise: custom 643us vs vLLM 741us (-98us) — more aggressive Inductor fusion
+Custom is 60us faster overall at seq128. Main differences:
+- Attention: FlashInfer (90us) vs vLLM FlashInfer (199us) — our non-graph wrapper is faster
+- KV store: custom 90us vs vLLM 37us (+53us) — reshape_and_cache_flash overhead
+- Elementwise: custom 643us vs vLLM 743us (-101us) — more aggressive Inductor fusion
 
 ### Attention Scaling Behavior
 
 ```
-seq_len   Custom FA2    vLLM FlashInfer    Delta
-  128       137us          198us           -61us  (FA2 faster)
-  256       178us          201us           -23us
-  512       257us          212us           +45us  (FlashInfer faster)
- 1024       414us          230us          +184us
- 2048       732us          274us          +458us
+seq_len   Custom FlashInfer   vLLM FlashInfer    Delta
+  128        90us                198us           -108us
+  256        95us                201us           -106us
+  512       107us                212us           -105us
+ 1024       133us                230us            -97us
+ 2048       173us                272us            -99us
 ```
 
-FA2 splitKV decode scales O(seq_len) while FlashInfer has better constant factors at long
-sequences. This is the dominant source of the gap at seq_len >= 512. Could be addressed by
-switching to FlashInfer BatchDecode (requires plan() outside CUDA graph) or FA3 (full
-CUDA graph support with scheduler_metadata).
+Both engines use FlashInfer BatchDecode. Custom's non-graph wrapper is consistently ~100us
+faster than vLLM's CUDA-graph FlashInfer wrapper across all sequence lengths.
 
 ### Bandwidth Analysis (batch=1, top-8 of 64 experts)
 
@@ -242,13 +249,17 @@ At long seq_lens: attention KV reads dominate
 - w1 gate/up ordering: gate first (rows 0:1024), up second (rows 1024:2048)
 - norm_topk_prob=False: do NOT renormalize routing weights
 - `moe_align_block_size`: sorted_ids = FLAT indices; Triton kernel does `flat_idx // top_k`
-- `flash_attn_varlen_func`: use `cu_seqlens_q=[0,1,...,B]`, `max_seqlen_q=1`, `seqused_k=seq_lens`
-- `reshape_and_cache_flash` + `flash_attn_varlen_func` lack fake impls → graph breaks with `fullgraph=False`
+- FlashInfer `plan()` must be called with `seq_len + 1` (include current token in attention)
+  — `_seq_lens_cpu` incremented BEFORE plan, not after
+- FlashInfer `plan()` must be called before EVERY graph replay (not just buffer copy) because
+  `_plan_info` contains split-KV tile counts that depend on page count
+- `reshape_and_cache_flash` + FlashInfer `run()` lack fake impls → graph breaks with `fullgraph=False`
 - `fused_experts` has proper `torch.library` registration with fake impl → no graph break
 - torch.compile Inductor produces numerically different greedy tokens from eager (expected behavior)
 - V tensor after QKV split is non-contiguous -> needs `.contiguous()` or `.reshape()`
 - FlashInfer RoPE JIT needs `ninja` in PATH (used for prefill only)
 - `slot_mapping` for reshape_and_cache must be computed outside CUDA graph and copied to static buffer
+- When manually setting `seq_lens` for benchmarking, must also set `_seq_lens_cpu` to match
 
 ---
 

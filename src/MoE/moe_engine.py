@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from pathlib import Path
 from safetensors import safe_open
 from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 try:
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
@@ -239,11 +240,13 @@ class MoEEngine:
         self.seq_lens = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
         self._seq_lens_cpu = torch.zeros(max_batch_size, dtype=torch.int32)
 
-        # FlashInfer decode workspace (128 MB) and non-graph wrapper
+        # FlashInfer workspace (128 MB) — shared between prefill and decode wrappers
+        # (only one is active at a time; each re-plans before use)
         self._workspace_buf = torch.zeros(
             128 * 1024 * 1024, dtype=torch.uint8, device=device)
         self._decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
             self._workspace_buf, kv_layout="NHD", use_cuda_graph=False)
+        # No prefill wrapper needed — FA3 (flash_attn_varlen_func) is stateless
 
         # Guard: check model fits on GPU
         mem_gb = torch.cuda.memory_allocated() / 1024**3
@@ -366,19 +369,45 @@ class MoEEngine:
         Returns: logits [B, S, vocab_size]
         """
         B, S = input_ids.shape
-        hidden = F.embedding(input_ids, self.embed_tokens)
+
+        # Use CUDA graph if captured for this (batch_size, padded_seq_len)
+        if hasattr(self, '_prefill_cuda_graphs'):
+            padded_S = self._find_nearest_prefill_size(B, S)
+            if padded_S is not None:
+                return self._prefill_graphed(input_ids, B, S, padded_S)
+
+        # Eager path
         positions_flat = torch.arange(S, dtype=torch.int32, device=self.device).repeat(B)
+        slot_mapping = self._compute_prefill_slot_mapping(B, S)
 
-        for layer in range(self.num_layers):
-            hidden = self._layer_prefill(hidden, layer, positions_flat)
+        # cu_seqlens for FA3 ragged attention (no plan/run two-phase API)
+        cu_seqlens = torch.arange(0, (B + 1) * S, S, dtype=torch.int32, device=self.device)
 
-        hidden = F.rms_norm(hidden, (self.hidden_size,), self.final_norm, self.rms_norm_eps)
-        logits = F.linear(hidden, self.lm_head)
+        logits = self._full_prefill_graph_body(
+            input_ids, positions_flat, slot_mapping, cu_seqlens)
         self.seq_lens[:B] = S
         self._seq_lens_cpu[:B] = S
         return logits
 
-    def _layer_prefill(self, hidden, layer, positions_flat):
+    def _full_prefill_graph_body(self, input_ids, positions_flat, slot_mapping,
+                                 cu_seqlens):
+        """Full prefill forward from input_ids to logits.
+
+        Designed for torch.compile + CUDA graph capture. Graph breaks at
+        reshape_and_cache_flash, fused_experts, and flash_attn_varlen_func
+        are fine — CUDA graph captures ALL kernel launches regardless of
+        graph breaks.
+        """
+        hidden = F.embedding(input_ids, self.embed_tokens)
+        for layer in range(self.num_layers):
+            hidden = self._layer_prefill(hidden, layer, positions_flat,
+                                         slot_mapping, cu_seqlens)
+        hidden = F.rms_norm(hidden, (self.hidden_size,), self.final_norm,
+                            self.rms_norm_eps)
+        return F.linear(hidden, self.lm_head)
+
+    def _layer_prefill(self, hidden, layer, positions_flat, slot_mapping,
+                       cu_seqlens):
         B, S, H = hidden.shape
 
         residual = hidden
@@ -404,17 +433,22 @@ class MoEEngine:
             q, k = rope_pytorch(q, k, self.cos_sin_cache, positions_flat,
                                 self.num_heads, self.head_dim)
 
-        # Write K, V to paged cache for subsequent decode
-        k_for_cache = k.view(B, S, self.num_kv_heads, self.head_dim)
-        v_for_cache = v.view(B, S, self.num_kv_heads, self.head_dim)
-        self._write_kv_prefill(layer, k_for_cache, v_for_cache, B, S)
+        # Write K, V to paged cache (same reshape_and_cache_flash as decode)
+        k_write = k.reshape(B * S, self.num_kv_heads, self.head_dim)
+        v_write = v.reshape(B * S, self.num_kv_heads, self.head_dim)
+        _vllm_ops.reshape_and_cache_flash(
+            k_write, v_write,
+            self.k_cache[layer], self.v_cache[layer],
+            slot_mapping, "auto", self._k_scale, self._v_scale)
 
-        # SDPA attention
-        q_attn = q.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
-        k_attn = k_for_cache.transpose(1, 2)
-        v_attn = v_for_cache.transpose(1, 2)
-        attn_out = F.scaled_dot_product_attention(q_attn, k_attn, v_attn, is_causal=True)
-        attn_out = attn_out.transpose(1, 2).reshape(B, S, H)
+        # FA3 ragged prefill attention (stateless, no plan/run two-phase API)
+        q_attn = q.reshape(B * S, self.num_heads, self.head_dim)
+        attn_out = flash_attn_varlen_func(
+            q_attn, k_write, v_write,
+            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=S, max_seqlen_k=S,
+            causal=True, fa_version=3)
+        attn_out = attn_out.view(B, S, H)
 
         hidden = residual + F.linear(attn_out, self.o_proj[layer])
 
@@ -436,22 +470,110 @@ class MoEEngine:
 
         return residual + hidden_flat.view(B, S, H)
 
-    def _write_kv_prefill(self, layer, k, v, B, S):
-        """Write prefill K,V to paged cache. k,v: [B, S, nkv, hd]
-        Cache layout: [blocks, block_size, nkv, hd] (flat NHD)
+    def _compute_prefill_slot_mapping(self, B, S):
+        """Compute slot_mapping for all B*S tokens in prefill.
+        slot = block_table[batch, pos // page_size] * page_size + pos % page_size
         """
-        num_pages = math.ceil(S / self.page_size)
-        S_padded = num_pages * self.page_size
-        if S_padded > S:
-            k = F.pad(k, (0, 0, 0, 0, 0, S_padded - S))
-            v = F.pad(v, (0, 0, 0, 0, 0, S_padded - S))
-        # k,v: [B, S_padded, nkv, hd] → already in [B, pages, ps, nkv, hd] via view
-        k_paged = k.view(B, num_pages, self.page_size, self.num_kv_heads, self.head_dim).contiguous()
-        v_paged = v.view(B, num_pages, self.page_size, self.num_kv_heads, self.head_dim).contiguous()
-        for b in range(B):
-            start = b * self.max_pages_per_seq
-            self.k_cache[layer][start:start + num_pages] = k_paged[b]
-            self.v_cache[layer][start:start + num_pages] = v_paged[b]
+        positions = torch.arange(S, device=self.device).unsqueeze(0).expand(B, S)
+        batch_idx = torch.arange(B, device=self.device).unsqueeze(1).expand(B, S)
+        page_idx = (positions // self.page_size).long()
+        offset = (positions % self.page_size).long()
+        pages = self.block_table[batch_idx, page_idx]
+        return (pages.long() * self.page_size + offset).reshape(-1)
+
+    def capture_prefill_cuda_graph(self, batch_size=1, seq_lengths=None,
+                                   use_torch_compile=None):
+        """Capture piecewise CUDA graphs for prefill at padded seq lengths.
+
+        Uses vLLM FA3 (flash_attn_varlen_func) for attention — stateless,
+        no plan/run two-phase API. cu_seqlens is constant per padded size,
+        so multiple CUDA graphs just work (no shared wrapper state issues).
+
+        Args:
+            batch_size: Fixed batch size for captured graphs
+            seq_lengths: Padded seq lengths to capture (default: powers of 2)
+            use_torch_compile: Override instance default
+        """
+        if seq_lengths is None:
+            seq_lengths = [128, 256, 512, 1024, 2048]
+        if use_torch_compile is None:
+            use_torch_compile = self.use_torch_compile
+
+        if not hasattr(self, '_prefill_cuda_graphs'):
+            self._prefill_cuda_graphs = {}
+
+        forward_fn = self._full_prefill_graph_body
+        if use_torch_compile:
+            forward_fn = torch.compile(forward_fn, fullgraph=False)
+
+        for S in seq_lengths:
+            self.reset()
+
+            # Static input buffers
+            static_input_ids = torch.randint(
+                1, 1000, (batch_size, S), device=self.device)
+            static_positions = torch.arange(
+                S, dtype=torch.int32, device=self.device).repeat(batch_size)
+            static_slot_mapping = self._compute_prefill_slot_mapping(
+                batch_size, S)
+            static_cu_seqlens = torch.arange(
+                0, (batch_size + 1) * S, S, dtype=torch.int32, device=self.device)
+
+            # Warmup — triggers torch.compile JIT, stabilizes CUDA allocator
+            n_warmup = 5 if use_torch_compile else 3
+            for _ in range(n_warmup):
+                static_output = forward_fn(
+                    static_input_ids, static_positions,
+                    static_slot_mapping, static_cu_seqlens)
+            torch.cuda.synchronize()
+
+            # Capture CUDA graph — each graph gets its own private pool
+            # (shared pool causes illegal memory access with 3+ graphs)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                static_output = forward_fn(
+                    static_input_ids, static_positions,
+                    static_slot_mapping, static_cu_seqlens)
+
+            self._prefill_cuda_graphs[(batch_size, S)] = {
+                'graph': graph,
+                'static_input_ids': static_input_ids,
+                'static_output': static_output,
+                # Keep references to ALL static buffers captured by the graph —
+                # if these get GC'd, the graph replays with freed addresses.
+                'static_positions': static_positions,
+                'static_slot_mapping': static_slot_mapping,
+                'static_cu_seqlens': static_cu_seqlens,
+            }
+
+            compile_str = " + torch.compile" if use_torch_compile else ""
+            print(f"  Prefill CUDA graph{compile_str} captured for "
+                  f"batch={batch_size}, seq_len={S}")
+
+    def _find_nearest_prefill_size(self, B, S):
+        """Find smallest captured padded seq length >= S for batch size B."""
+        candidates = [
+            s for (b, s) in self._prefill_cuda_graphs if b == B and s >= S]
+        return min(candidates) if candidates else None
+
+    def _prefill_graphed(self, input_ids, B, S, padded_S):
+        """Run prefill using pre-captured CUDA graph.
+
+        Pads input_ids to padded_S, replays the graph, slices output to
+        real seq_len S. FA3 is stateless — no re-planning needed.
+        """
+        info = self._prefill_cuda_graphs[(B, padded_S)]
+
+        # Copy real input into static buffer (pad with zeros)
+        info['static_input_ids'][:, :S].copy_(input_ids)
+        if S < padded_S:
+            info['static_input_ids'][:, S:].zero_()
+
+        info['graph'].replay()
+
+        self.seq_lens[:B] = S
+        self._seq_lens_cpu[:B] = S
+        return info['static_output'][:, :S, :]
 
     # ── Decode ───────────────────────────────────────────────────────
 

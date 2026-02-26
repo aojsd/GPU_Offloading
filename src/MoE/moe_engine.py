@@ -364,167 +364,84 @@ class MoEEngine:
 
     @torch.no_grad()
     def prefill(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Prefill forward pass.
+        """Prefill forward pass (CUDA graph only).
+
         Args: input_ids [B, S]
         Returns: logits [B, S, vocab_size]
+        Requires: capture_prefill_cuda_graph() called with sufficient sizes.
         """
         B, S = input_ids.shape
+        total = B * S
+        padded_N = self._find_nearest_prefill_total(total)
+        seq_ids = list(range(B))
+        seq_lengths = [S] * B
+        token_ids_flat = input_ids.reshape(-1)
+        logits_flat = self._prefill_graphed_flat(
+            token_ids_flat, seq_lengths, seq_ids, padded_N)
+        return logits_flat.view(B, S, -1)
 
-        # Use CUDA graph if captured for this (batch_size, padded_seq_len)
-        if hasattr(self, '_prefill_cuda_graphs'):
-            padded_S = self._find_nearest_prefill_size(B, S)
-            if padded_S is not None:
-                return self._prefill_graphed(input_ids, B, S, padded_S)
-
-        # Eager path
-        positions_flat = torch.arange(S, dtype=torch.int32, device=self.device).repeat(B)
-        slot_mapping = self._compute_prefill_slot_mapping(B, S)
-
-        # cu_seqlens for FA3 ragged attention (no plan/run two-phase API)
-        cu_seqlens = torch.arange(0, (B + 1) * S, S, dtype=torch.int32, device=self.device)
-
-        logits = self._full_prefill_graph_body(
-            input_ids, positions_flat, slot_mapping, cu_seqlens)
-        self.seq_lens[:B] = S
-        self._seq_lens_cpu[:B] = S
-        return logits
-
-    def _full_prefill_graph_body(self, input_ids, positions_flat, slot_mapping,
-                                 cu_seqlens):
-        """Full prefill forward from input_ids to logits.
-
-        Designed for torch.compile + CUDA graph capture. Graph breaks at
-        reshape_and_cache_flash, fused_experts, and flash_attn_varlen_func
-        are fine — CUDA graph captures ALL kernel launches regardless of
-        graph breaks.
-        """
-        hidden = F.embedding(input_ids, self.embed_tokens)
-        for layer in range(self.num_layers):
-            hidden = self._layer_prefill(hidden, layer, positions_flat,
-                                         slot_mapping, cu_seqlens)
-        hidden = F.rms_norm(hidden, (self.hidden_size,), self.final_norm,
-                            self.rms_norm_eps)
-        return F.linear(hidden, self.lm_head)
-
-    def _layer_prefill(self, hidden, layer, positions_flat, slot_mapping,
-                       cu_seqlens):
-        B, S, H = hidden.shape
-
-        residual = hidden
-        hidden = F.rms_norm(hidden, (H,), self.input_layernorm[layer], self.rms_norm_eps)
-
-        # Fused QKV projection (single GEMM)
-        kv_dim = self.num_kv_heads * self.head_dim
-        qkv = F.linear(hidden, self.qkv_proj[layer])
-        q, k, v = qkv.split([H, kv_dim, kv_dim], dim=-1)
-        v = v.contiguous()
-
-        # Q/K norm (flat, before head reshape, before RoPE) — OLMoE only
-        if self.has_qk_norm:
-            q = F.rms_norm(q.reshape(-1, H), (H,), self.q_norm[layer], self.rms_norm_eps).contiguous()
-            k = F.rms_norm(k.reshape(-1, kv_dim), (kv_dim,), self.k_norm[layer], self.rms_norm_eps).contiguous()
-
-        # RoPE — use FlashInfer for prefill if available, else PyTorch
-        if HAS_FLASHINFER:
-            apply_rope_with_cos_sin_cache_inplace(
-                positions=positions_flat, query=q, key=k,
-                head_size=self.head_dim, cos_sin_cache=self.cos_sin_cache, is_neox=True)
-        else:
-            q, k = rope_pytorch(q, k, self.cos_sin_cache, positions_flat,
-                                self.num_heads, self.head_dim)
-
-        # Write K, V to paged cache (same reshape_and_cache_flash as decode)
-        k_write = k.reshape(B * S, self.num_kv_heads, self.head_dim)
-        v_write = v.reshape(B * S, self.num_kv_heads, self.head_dim)
-        _vllm_ops.reshape_and_cache_flash(
-            k_write, v_write,
-            self.k_cache[layer], self.v_cache[layer],
-            slot_mapping, "auto", self._k_scale, self._v_scale)
-
-        # FA3 ragged prefill attention (stateless, no plan/run two-phase API)
-        q_attn = q.reshape(B * S, self.num_heads, self.head_dim)
-        attn_out = flash_attn_varlen_func(
-            q_attn, k_write, v_write,
-            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=S, max_seqlen_k=S,
-            causal=True, fa_version=3)
-        attn_out = attn_out.view(B, S, H)
-
-        hidden = residual + F.linear(attn_out, self.o_proj[layer])
-
-        # Post-attention norm + MoE
-        residual = hidden
-        hidden = F.rms_norm(hidden, (H,), self.post_attn_layernorm[layer], self.rms_norm_eps)
-
-        router_logits = F.linear(hidden, self.router[layer])
-        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-        topk_weights, topk_ids = torch.topk(routing_weights, self.top_k, dim=-1)
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-
-        hidden_flat = fused_experts(
-            hidden_states=hidden.reshape(-1, H),
-            w1=self.w1[layer], w2=self.w2[layer],
-            topk_weights=topk_weights.reshape(-1, self.top_k),
-            topk_ids=topk_ids.reshape(-1, self.top_k).to(torch.int32))
-
-        return residual + hidden_flat.view(B, S, H)
-
-    def _compute_prefill_slot_mapping(self, B, S):
-        """Compute slot_mapping for all B*S tokens in prefill.
-        slot = block_table[batch, pos // page_size] * page_size + pos % page_size
-        """
-        positions = torch.arange(S, device=self.device).unsqueeze(0).expand(B, S)
-        batch_idx = torch.arange(B, device=self.device).unsqueeze(1).expand(B, S)
-        page_idx = (positions // self.page_size).long()
-        offset = (positions % self.page_size).long()
-        pages = self.block_table[batch_idx, page_idx]
-        return (pages.long() * self.page_size + offset).reshape(-1)
-
-    def capture_prefill_cuda_graph(self, batch_size=1, seq_lengths=None,
+    def capture_prefill_cuda_graph(self, total_token_sizes=None,
                                    use_torch_compile=None):
-        """Capture piecewise CUDA graphs for prefill at padded seq lengths.
+        """Capture flat CUDA graphs for prefill keyed by total token count.
 
-        Uses vLLM FA3 (flash_attn_varlen_func) for attention — stateless,
-        no plan/run two-phase API. cu_seqlens is constant per padded size,
-        so multiple CUDA graphs just work (no shared wrapper state issues).
+        Each graph serves any combination of sequences whose total tokens
+        fit within the captured size (e.g., N=256 serves 1×256, 4×64,
+        2×100+1×56, etc.). Uses _full_mixed_graph_body with
+        num_decode_tokens=0 (pure prefill via FA3 flash_attn_varlen_func).
+
+        Padding tokens use slot_mapping=-1 (vLLM sentinel — KV writes skipped).
 
         Args:
-            batch_size: Fixed batch size for captured graphs
-            seq_lengths: Padded seq lengths to capture (default: powers of 2)
+            total_token_sizes: List of total token counts to capture
+                (default: [128, 256, 512, 1024, 2048])
             use_torch_compile: Override instance default
         """
-        if seq_lengths is None:
-            seq_lengths = [128, 256, 512, 1024, 2048]
+        if total_token_sizes is None:
+            total_token_sizes = [128, 256, 512, 1024, 2048]
         if use_torch_compile is None:
             use_torch_compile = self.use_torch_compile
 
         if not hasattr(self, '_prefill_cuda_graphs'):
             self._prefill_cuda_graphs = {}
 
-        forward_fn = self._full_prefill_graph_body
+        forward_fn = self._full_mixed_graph_body
         if use_torch_compile:
             forward_fn = torch.compile(forward_fn, fullgraph=False)
 
-        for S in seq_lengths:
+        for N in total_token_sizes:
             self.reset()
 
-            # Static input buffers
-            static_input_ids = torch.randint(
-                1, 1000, (batch_size, S), device=self.device)
-            static_positions = torch.arange(
-                S, dtype=torch.int32, device=self.device).repeat(batch_size)
-            static_slot_mapping = self._compute_prefill_slot_mapping(
-                batch_size, S)
-            static_cu_seqlens = torch.arange(
-                0, (batch_size + 1) * S, S, dtype=torch.int32, device=self.device)
+            # Static input buffers — flat [N] layout
+            static_token_ids = torch.randint(
+                1, 1000, (N,), device=self.device)
+            # Positions: wrap to stay within RoPE cache range when N > max_seq_len
+            # (during warmup, exact positions don't matter — just need valid RoPE indices)
+            static_positions = (torch.arange(N, dtype=torch.int32, device=self.device)
+                                % self.max_seq_len)
+            # Slot mapping: cycle through valid KV cache addresses
+            # (N may exceed per-sequence capacity; during warmup, exact slots don't matter)
+            total_kv_slots = self.total_pages * self.page_size
+            static_slot_mapping = torch.arange(
+                N, dtype=torch.long, device=self.device) % total_kv_slots
+            # cu_seqlens: 1 sequence of length N, rest zero-length
+            static_cu_seqlens = torch.full(
+                (self.max_batch_size + 1,), N,
+                dtype=torch.int32, device=self.device)
+            static_cu_seqlens[0] = 0
+
+            # Baked-in Python ints: num_decode_tokens=0, prefill_max_seqlen=N
+            # torch.compile dead-code-eliminates decode branches
+            num_decode_tokens = 0
+            prefill_max_seqlen = N
 
             # Warmup — triggers torch.compile JIT, stabilizes CUDA allocator
             n_warmup = 5 if use_torch_compile else 3
             for _ in range(n_warmup):
                 static_output = forward_fn(
-                    static_input_ids, static_positions,
-                    static_slot_mapping, static_cu_seqlens)
+                    static_token_ids, static_positions,
+                    static_slot_mapping, num_decode_tokens,
+                    self._decode_wrapper, static_cu_seqlens,
+                    prefill_max_seqlen)
             torch.cuda.synchronize()
 
             # Capture CUDA graph — each graph gets its own private pool
@@ -532,12 +449,14 @@ class MoEEngine:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 static_output = forward_fn(
-                    static_input_ids, static_positions,
-                    static_slot_mapping, static_cu_seqlens)
+                    static_token_ids, static_positions,
+                    static_slot_mapping, num_decode_tokens,
+                    self._decode_wrapper, static_cu_seqlens,
+                    prefill_max_seqlen)
 
-            self._prefill_cuda_graphs[(batch_size, S)] = {
+            self._prefill_cuda_graphs[N] = {
                 'graph': graph,
-                'static_input_ids': static_input_ids,
+                'static_token_ids': static_token_ids,
                 'static_output': static_output,
                 # Keep references to ALL static buffers captured by the graph —
                 # if these get GC'd, the graph replays with freed addresses.
@@ -548,32 +467,52 @@ class MoEEngine:
 
             compile_str = " + torch.compile" if use_torch_compile else ""
             print(f"  Prefill CUDA graph{compile_str} captured for "
-                  f"batch={batch_size}, seq_len={S}")
+                  f"total_tokens={N}")
 
-    def _find_nearest_prefill_size(self, B, S):
-        """Find smallest captured padded seq length >= S for batch size B."""
-        candidates = [
-            s for (b, s) in self._prefill_cuda_graphs if b == B and s >= S]
-        return min(candidates) if candidates else None
+    def _prefill_graphed_flat(self, token_ids_flat, seq_lengths, seq_ids, padded_N):
+        """Replay flat prefill CUDA graph.
 
-    def _prefill_graphed(self, input_ids, B, S, padded_S):
-        """Run prefill using pre-captured CUDA graph.
+        Unified replay for all prefill paths (single, batch, variable-length).
 
-        Pads input_ids to padded_S, replays the graph, slices output to
-        real seq_len S. FA3 is stateless — no re-planning needed.
+        Args:
+            token_ids_flat: [sum(seq_lengths)] concatenated token IDs
+            seq_lengths: list[int] per-sequence lengths
+            seq_ids: list[int] KV cache slot indices
+            padded_N: captured total_token_size (from _find_nearest_prefill_total)
+        Returns: logits [sum(seq_lengths), vocab_size]
         """
-        info = self._prefill_cuda_graphs[(B, padded_S)]
+        info = self._prefill_cuda_graphs[padded_N]
+        n_real = token_ids_flat.shape[0]
 
-        # Copy real input into static buffer (pad with zeros)
-        info['static_input_ids'][:, :S].copy_(input_ids)
-        if S < padded_S:
-            info['static_input_ids'][:, S:].zero_()
+        # 1. Copy token_ids into static buffer, zero-pad remainder
+        info['static_token_ids'][:n_real].copy_(token_ids_flat)
+        if n_real < padded_N:
+            info['static_token_ids'][n_real:].zero_()
 
+        # 2. Compute and copy positions
+        positions = self._compute_flat_positions(seq_lengths, padded_N)
+        info['static_positions'].copy_(positions)
+
+        # 3. Compute and copy slot_mapping (padding → -1)
+        slot_mapping = self._compute_flat_slot_mapping(
+            seq_ids, seq_lengths, padded_N)
+        info['static_slot_mapping'].copy_(slot_mapping)
+
+        # 4. Compute and copy cu_seqlens
+        cu_seqlens = self._compute_flat_cu_seqlens(
+            seq_lengths, self.max_batch_size)
+        info['static_cu_seqlens'].copy_(cu_seqlens)
+
+        # 5. Replay graph
         info['graph'].replay()
 
-        self.seq_lens[:B] = S
-        self._seq_lens_cpu[:B] = S
-        return info['static_output'][:, :S, :]
+        # 6. Update seq_lens for all sequences
+        for sid, length in zip(seq_ids, seq_lengths):
+            self.seq_lens[sid] = length
+            self._seq_lens_cpu[sid] = length
+
+        # 7. Return only real token logits
+        return info['static_output'][:n_real]
 
     # ── Decode ───────────────────────────────────────────────────────
 
@@ -705,6 +644,719 @@ class MoEEngine:
             head_dim=self.head_dim, page_size=self.page_size,
             pos_encoding_mode="NONE", q_data_type=self.dtype)
 
+    # ── Slot-based Prefill ────────────────────────────────────────────
+
+    @torch.no_grad()
+    def prefill_to_slot(self, seq_id: int, input_ids: torch.Tensor) -> torch.Tensor:
+        """Prefill a single sequence into a specific KV cache slot (CUDA graph only).
+
+        Args:
+            seq_id: slot index in block_table / seq_lens
+            input_ids: [S] token IDs (1-D)
+        Returns:
+            logits: [S, vocab_size]
+        Requires: capture_prefill_cuda_graph() called with sufficient sizes.
+        """
+        S = input_ids.shape[0]
+        padded_N = self._find_nearest_prefill_total(S)
+        return self._prefill_graphed_flat(input_ids, [S], [seq_id], padded_N)
+
+    # ── Multi-Batch Prefill ─────────────────────────────────────────
+
+    @torch.no_grad()
+    def prefill_batch_to_slots(self, seq_ids, input_ids):
+        """Prefill multiple sequences into specific KV cache slots (CUDA graph only).
+
+        Supports both same-length and variable-length sequences.
+
+        Args:
+            seq_ids: list[int] — KV cache slot indices for each sequence
+            input_ids: list[Tensor] (variable-length 1D) or Tensor [B, S] (same-length)
+        Returns:
+            logits: Tensor [N_total, vocab_size] (flat)
+        Requires: capture_prefill_cuda_graph() called with sufficient sizes.
+        """
+        # Normalize to list of 1D tensors
+        if isinstance(input_ids, torch.Tensor) and input_ids.dim() == 2:
+            input_ids = [input_ids[i] for i in range(input_ids.shape[0])]
+
+        seq_lengths = [ids.shape[0] for ids in input_ids]
+        total = sum(seq_lengths)
+        padded_N = self._find_nearest_prefill_total(total)
+        token_ids_flat = torch.cat(input_ids)
+        return self._prefill_graphed_flat(
+            token_ids_flat, seq_lengths, seq_ids, padded_N)
+
+    # ── Flat Prefill Helpers ─────────────────────────────────────────
+
+    def _find_nearest_prefill_total(self, total_tokens):
+        """Find smallest captured flat prefill graph with N >= total_tokens.
+        Raises RuntimeError if none found (no eager fallback).
+        """
+        candidates = [n for n in self._prefill_cuda_graphs if n >= total_tokens]
+        if not candidates:
+            captured = sorted(self._prefill_cuda_graphs.keys())
+            raise RuntimeError(
+                f"No prefill CUDA graph captured for {total_tokens} tokens. "
+                f"Captured sizes: {captured}. Call capture_prefill_cuda_graph() "
+                f"with a sufficient total_token_sizes list.")
+        return min(candidates)
+
+    def _compute_flat_slot_mapping(self, seq_ids, seq_lengths, padded_total):
+        """Compute slot_mapping for variable-length sequences at arbitrary KV slots.
+
+        Real tokens get valid slot indices; padding tokens get -1 (vLLM sentinel
+        — reshape_and_cache_flash skips writes for slot_idx < 0).
+
+        Args:
+            seq_ids: list[int] — KV cache slot indices
+            seq_lengths: list[int] — per-sequence token counts
+            padded_total: int — total length including padding
+        Returns: [padded_total] int64 tensor
+        """
+        parts = []
+        for sid, length in zip(seq_ids, seq_lengths):
+            pos = torch.arange(length, device=self.device)
+            pg = (pos // self.page_size).long()
+            off = (pos % self.page_size).long()
+            parts.append(self.block_table[sid, pg].long() * self.page_size + off)
+        real = torch.cat(parts) if parts else torch.empty(
+            0, dtype=torch.long, device=self.device)
+        n_real = real.shape[0]
+        if n_real < padded_total:
+            padding = torch.full(
+                (padded_total - n_real,), -1, dtype=torch.long, device=self.device)
+            return torch.cat([real, padding])
+        return real
+
+    def _compute_flat_positions(self, seq_lengths, padded_total):
+        """Compute positions [0..S1-1, 0..S2-1, ...], pad remainder with 0.
+
+        Args:
+            seq_lengths: list[int] — per-sequence token counts
+            padded_total: int — total length including padding
+        Returns: [padded_total] int32 tensor
+        """
+        parts = [torch.arange(s, dtype=torch.int32, device=self.device)
+                 for s in seq_lengths]
+        real = torch.cat(parts) if parts else torch.empty(
+            0, dtype=torch.int32, device=self.device)
+        n_real = real.shape[0]
+        if n_real < padded_total:
+            padding = torch.zeros(
+                padded_total - n_real, dtype=torch.int32, device=self.device)
+            return torch.cat([real, padding])
+        return real
+
+    def _compute_flat_cu_seqlens(self, seq_lengths, max_bs):
+        """Build cu_seqlens [max_bs + 1] for FA3 varlen attention.
+
+        Unused entries repeat the final cumsum value, creating zero-length
+        sequences that FA3 handles as no-ops.
+
+        Args:
+            seq_lengths: list[int] — per-sequence token counts
+            max_bs: int — max batch size (determines output length)
+        Returns: [max_bs + 1] int32 tensor
+        """
+        cu = torch.zeros(max_bs + 1, dtype=torch.int32, device=self.device)
+        cum = 0
+        for i, s in enumerate(seq_lengths):
+            cum += s
+            cu[i + 1] = cum
+        # Fill remaining entries with final cumsum (zero-length seqs)
+        cu[len(seq_lengths) + 1:] = cum
+        return cu
+
+    # ── Mixed Batch Support ──────────────────────────────────────────
+
+    def _plan_flashinfer_decode_for_subset(self, seq_ids):
+        """Plan FlashInfer decode for a subset of sequence slots.
+
+        Unlike _plan_flashinfer_decode which assumes contiguous [:B],
+        this handles arbitrary slot indices.
+        """
+        B = len(seq_ids)
+        sid_tensor = torch.tensor(seq_ids, dtype=torch.long)
+        seq_lens = self._seq_lens_cpu[sid_tensor]
+        pages_per_seq = (seq_lens + self.page_size - 1) // self.page_size
+
+        indptr = torch.zeros(B + 1, dtype=torch.int32)
+        indptr[1:] = pages_per_seq.cumsum(0)
+
+        last_page_len = (seq_lens - 1) % self.page_size + 1
+
+        max_pages = pages_per_seq.max().item() if B > 0 else 0
+        if max_pages == 0:
+            indices = torch.zeros(0, dtype=torch.int32, device=self.device)
+        else:
+            page_range = torch.arange(max_pages, dtype=torch.int32)
+            valid = page_range.unsqueeze(0) < pages_per_seq.unsqueeze(1)
+            all_pages = self.block_table[sid_tensor, :max_pages].cpu()
+            indices = all_pages[valid].to(torch.int32).to(self.device)
+
+        self._decode_wrapper.plan(
+            indptr, indices, last_page_len,
+            num_qo_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim, page_size=self.page_size,
+            pos_encoding_mode="NONE", q_data_type=self.dtype)
+
+    def _layer_mixed(self, hidden, layer, positions, slot_mapping,
+                     num_decode_tokens, decode_wrapper,
+                     prefill_cu_seqlens, prefill_max_seqlen):
+        """Single transformer layer for mixed decode+prefill batch.
+
+        Args:
+            hidden: [N_total, H] — concatenated [decode_hidden | prefill_hidden]
+            layer: layer index
+            positions: [N_total] int32
+            slot_mapping: [N_total] int64
+            num_decode_tokens: boundary — hidden[:D] are decode, [D:] are prefill
+            decode_wrapper: FlashInfer BatchDecode (pre-planned)
+            prefill_cu_seqlens: [num_prefill_reqs + 1] int32, for FA3
+            prefill_max_seqlen: max prefill seq length
+        """
+        N = hidden.shape[0]
+        H = self.hidden_size
+        kv_dim = self.num_kv_heads * self.head_dim
+        D = num_decode_tokens
+
+        residual = hidden
+        hidden = F.rms_norm(hidden, (H,), self.input_layernorm[layer],
+                            self.rms_norm_eps)
+
+        # Fused QKV projection on ALL tokens
+        qkv = F.linear(hidden, self.qkv_proj[layer])
+        q, k, v = qkv.split([H, kv_dim, kv_dim], dim=-1)
+        v = v.contiguous()
+
+        # Q/K norm (if model has it)
+        if self.has_qk_norm:
+            q = F.rms_norm(q, (H,), self.q_norm[layer],
+                           self.rms_norm_eps).contiguous()
+            k = F.rms_norm(k, (kv_dim,), self.k_norm[layer],
+                           self.rms_norm_eps).contiguous()
+
+        # RoPE on ALL tokens
+        q, k = rope_pytorch(q, k, self.cos_sin_cache, positions,
+                            self.num_heads, self.head_dim)
+
+        # Write K,V to paged cache for ALL tokens
+        k_write = k.reshape(N, self.num_kv_heads, self.head_dim)
+        v_write = v.reshape(N, self.num_kv_heads, self.head_dim)
+        _vllm_ops.reshape_and_cache_flash(
+            k_write, v_write,
+            self.k_cache[layer], self.v_cache[layer],
+            slot_mapping, "auto", self._k_scale, self._v_scale)
+
+        # ── Split attention ──
+        # Decode tokens [0:D]: FlashInfer BatchDecode (reads paged KV cache)
+        if D > 0 and N > D:
+            # Mixed: both decode and prefill
+            q_decode = q[:D].view(D, self.num_heads, self.head_dim)
+            decode_out = decode_wrapper.run(
+                q_decode, (self.k_cache[layer], self.v_cache[layer]))
+            decode_out = decode_out.reshape(D, H)
+
+            # Prefill tokens [D:]: FA3 self-attention on freshly computed Q/K/V
+            N_pf = N - D
+            q_pf = q[D:].reshape(N_pf, self.num_heads, self.head_dim)
+            k_pf = k_write[D:]
+            v_pf = v_write[D:]
+            prefill_out = flash_attn_varlen_func(
+                q_pf, k_pf, v_pf,
+                cu_seqlens_q=prefill_cu_seqlens,
+                cu_seqlens_k=prefill_cu_seqlens,
+                max_seqlen_q=prefill_max_seqlen,
+                max_seqlen_k=prefill_max_seqlen,
+                causal=True, fa_version=3)
+            prefill_out = prefill_out.reshape(N_pf, H)
+
+            attn_out = torch.cat([decode_out, prefill_out], dim=0)
+
+        elif D > 0:
+            # Pure decode
+            q_decode = q[:D].view(D, self.num_heads, self.head_dim)
+            attn_out = decode_wrapper.run(
+                q_decode, (self.k_cache[layer], self.v_cache[layer]))
+            attn_out = attn_out.reshape(D, H)
+
+        else:
+            # Pure prefill
+            N_pf = N
+            q_pf = q.reshape(N_pf, self.num_heads, self.head_dim)
+            k_pf = k_write
+            v_pf = v_write
+            attn_out = flash_attn_varlen_func(
+                q_pf, k_pf, v_pf,
+                cu_seqlens_q=prefill_cu_seqlens,
+                cu_seqlens_k=prefill_cu_seqlens,
+                max_seqlen_q=prefill_max_seqlen,
+                max_seqlen_k=prefill_max_seqlen,
+                causal=True, fa_version=3)
+            attn_out = attn_out.reshape(N_pf, H)
+
+        hidden = residual + F.linear(attn_out, self.o_proj[layer])
+
+        # Post-attention norm + MoE on ALL tokens
+        residual = hidden
+        hidden = F.rms_norm(hidden, (H,), self.post_attn_layernorm[layer],
+                            self.rms_norm_eps)
+
+        router_logits = F.linear(hidden, self.router[layer])
+        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+        topk_weights, topk_ids = torch.topk(routing_weights, self.top_k, dim=-1)
+        if self.norm_topk_prob:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+        hidden = fused_experts(
+            hidden_states=hidden, w1=self.w1[layer], w2=self.w2[layer],
+            topk_weights=topk_weights, topk_ids=topk_ids.to(torch.int32))
+
+        return residual + hidden
+
+    # ── Piecewise Stage Functions ────────────────────────────────────
+
+    def _layer_stage1_pre_attn(self, hidden, positions, slot_mapping, layer,
+                               q_buf, k_buf, v_buf, residual_buf):
+        """Stage 1: RMSNorm -> QKV -> Q/K norm -> RoPE -> KV cache write.
+
+        Writes to q_buf, k_buf, v_buf, residual_buf (pre-allocated static
+        buffers for CUDA graph capture). Returns nothing — outputs are in buffers.
+        """
+        N = hidden.shape[0]
+        H = self.hidden_size
+        kv_dim = self.num_kv_heads * self.head_dim
+
+        normed = F.rms_norm(hidden, (H,), self.input_layernorm[layer],
+                            self.rms_norm_eps)
+
+        qkv = F.linear(normed, self.qkv_proj[layer])
+        q, k, v = qkv.split([H, kv_dim, kv_dim], dim=-1)
+        v = v.contiguous()
+
+        if self.has_qk_norm:
+            q = F.rms_norm(q, (H,), self.q_norm[layer],
+                           self.rms_norm_eps).contiguous()
+            k = F.rms_norm(k, (kv_dim,), self.k_norm[layer],
+                           self.rms_norm_eps).contiguous()
+
+        q, k = rope_pytorch(q, k, self.cos_sin_cache, positions,
+                            self.num_heads, self.head_dim)
+
+        k_3d = k.reshape(N, self.num_kv_heads, self.head_dim)
+        v_3d = v.reshape(N, self.num_kv_heads, self.head_dim)
+        _vllm_ops.reshape_and_cache_flash(
+            k_3d, v_3d,
+            self.k_cache[layer], self.v_cache[layer],
+            slot_mapping, "auto", self._k_scale, self._v_scale)
+
+        q_buf.copy_(q.view(N, self.num_heads, self.head_dim))
+        k_buf.copy_(k_3d)
+        v_buf.copy_(v_3d)
+        residual_buf.copy_(hidden)
+
+    def _layer_stage4_post_attn(self, attn_out, residual, hidden_out, layer):
+        """Stage 4: O proj -> residual add -> post-attn norm -> MoE.
+
+        Writes result into hidden_out [N, H] for next layer.
+        """
+        H = self.hidden_size
+        hidden = residual + F.linear(attn_out, self.o_proj[layer])
+
+        residual = hidden
+        hidden = F.rms_norm(hidden, (H,), self.post_attn_layernorm[layer],
+                            self.rms_norm_eps)
+
+        router_logits = F.linear(hidden, self.router[layer])
+        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+        topk_weights, topk_ids = torch.topk(routing_weights, self.top_k, dim=-1)
+        if self.norm_topk_prob:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+        hidden = fused_experts(
+            hidden_states=hidden, w1=self.w1[layer], w2=self.w2[layer],
+            topk_weights=topk_weights, topk_ids=topk_ids.to(torch.int32))
+
+        hidden_out.copy_(residual + hidden)
+
+    def _full_mixed_graph_body(self, all_token_ids, positions, slot_mapping,
+                               num_decode_tokens, decode_wrapper,
+                               prefill_cu_seqlens, prefill_max_seqlen):
+        """Full mixed forward — embed + layers + final norm + lm_head.
+
+        Designed for torch.compile(dynamic=True) to fuse RMSNorm + residual
+        + RoPE between graph-breaking external kernels.
+        """
+        hidden = F.embedding(all_token_ids, self.embed_tokens)
+        for layer in range(self.num_layers):
+            hidden = self._layer_mixed(hidden, layer, positions, slot_mapping,
+                                       num_decode_tokens, decode_wrapper,
+                                       prefill_cu_seqlens, prefill_max_seqlen)
+        hidden = F.rms_norm(hidden, (self.hidden_size,), self.final_norm,
+                            self.rms_norm_eps)
+        return F.linear(hidden, self.lm_head)
+
+    @torch.no_grad()
+    def mixed_step(self, decode_seq_ids, decode_token_ids,
+                   prefill_seq_ids, prefill_input_ids):
+        """Mixed prefill+decode forward pass.
+
+        Concatenates all tokens as [decode | prefill], runs shared compute,
+        splits only at attention (FlashInfer decode + FA3 prefill).
+
+        Args:
+            decode_seq_ids: list[int] — KV cache slot indices for decode requests
+            decode_token_ids: Tensor [D] — one token per decode request
+            prefill_seq_ids: list[int] — KV cache slot indices for prefill requests
+            prefill_input_ids: list[Tensor] — variable-length prefill sequences
+        Returns:
+            logits: Tensor [N_total, vocab_size]
+                logits[:D] = decode logits, logits[D:] = prefill logits (concat)
+        """
+        D = len(decode_seq_ids)
+        prefill_lengths = [ids.shape[0] for ids in prefill_input_ids]
+        N_total = D + sum(prefill_lengths)
+
+        # ── Auto-dispatch to piecewise graphs if available ──
+        graph_N = self._find_nearest_piecewise_graph(N_total)
+        if graph_N is not None:
+            return self._mixed_step_piecewise(
+                decode_seq_ids, decode_token_ids,
+                prefill_seq_ids, prefill_input_ids, graph_N)
+
+        # ── Eager fallback below ──
+
+        # ── Positions ──
+        # Decode: current seq_len (position of next token) — capture BEFORE incr
+        decode_positions = (self._seq_lens_cpu[decode_seq_ids].to(torch.int32)
+                            .to(self.device)) if D > 0 else torch.empty(
+                                0, dtype=torch.int32, device=self.device)
+
+        # Prefill: 0..S-1 per request
+        prefill_pos_parts = [
+            torch.arange(s, dtype=torch.int32, device=self.device)
+            for s in prefill_lengths
+        ]
+        positions = torch.cat([decode_positions] + prefill_pos_parts)
+
+        # ── Increment _seq_lens_cpu for decode BEFORE FlashInfer plan ──
+        if D > 0:
+            for sid in decode_seq_ids:
+                self._seq_lens_cpu[sid] += 1
+            self._plan_flashinfer_decode_for_subset(decode_seq_ids)
+
+        # ── Slot mapping ──
+        if D > 0:
+            d_idx = torch.tensor(decode_seq_ids, device=self.device, dtype=torch.long)
+            d_page = (decode_positions // self.page_size).long()
+            d_offset = (decode_positions % self.page_size).long()
+            decode_slots = (self.block_table[d_idx, d_page].long() * self.page_size
+                            + d_offset)
+        else:
+            decode_slots = torch.empty(0, dtype=torch.long, device=self.device)
+
+        prefill_slot_parts = []
+        for sid, length in zip(prefill_seq_ids, prefill_lengths):
+            pos = torch.arange(length, device=self.device)
+            pg = (pos // self.page_size).long()
+            off = (pos % self.page_size).long()
+            prefill_slot_parts.append(
+                self.block_table[sid, pg].long() * self.page_size + off)
+
+        slot_mapping = torch.cat([decode_slots] + prefill_slot_parts)
+
+        # ── Concatenate all token IDs ──
+        token_parts = []
+        if D > 0:
+            token_parts.append(decode_token_ids)
+        for ids in prefill_input_ids:
+            token_parts.append(ids)
+        all_token_ids = torch.cat(token_parts)
+
+        # ── Prefill cu_seqlens for FA3 ──
+        prefill_cu = torch.zeros(len(prefill_lengths) + 1, dtype=torch.int32,
+                                 device=self.device)
+        for i, s in enumerate(prefill_lengths):
+            prefill_cu[i + 1] = prefill_cu[i] + s
+        prefill_max = max(prefill_lengths) if prefill_lengths else 0
+
+        # ── Forward ──
+        logits = self._full_mixed_graph_body(
+            all_token_ids, positions, slot_mapping,
+            D, self._decode_wrapper, prefill_cu, prefill_max)
+
+        # ── Update GPU seq_lens ──
+        for sid in decode_seq_ids:
+            self.seq_lens[sid] += 1
+        for sid, length in zip(prefill_seq_ids, prefill_lengths):
+            self.seq_lens[sid] = length
+            self._seq_lens_cpu[sid] = length
+
+        return logits
+
+    # ── Piecewise CUDA Graph Capture & Replay ────────────────────────
+
+    def capture_mixed_cuda_graphs(self, total_token_sizes=None,
+                                  use_torch_compile=None):
+        """Capture per-layer piecewise CUDA graphs for mixed batches.
+
+        For each N in total_token_sizes, captures 2 graphs per layer:
+          - Stage 1: RMSNorm -> QKV -> Q/K norm -> RoPE -> KV cache write
+          - Stage 4: O proj -> residual add -> post-attn norm -> MoE
+
+        Stages 2 & 3 (attention) run eagerly — single kernel each.
+
+        Args:
+            total_token_sizes: List of total token counts to capture
+                (default: [128, 256, 512, 1024, 2048])
+            use_torch_compile: Override instance default
+        """
+        if total_token_sizes is None:
+            total_token_sizes = [128, 256, 512, 1024, 2048]
+        if use_torch_compile is None:
+            use_torch_compile = self.use_torch_compile
+
+        if not hasattr(self, '_piecewise_graphs'):
+            self._piecewise_graphs = {}
+
+        # Optionally compile stage functions
+        stage1_fn = self._layer_stage1_pre_attn
+        stage4_fn = self._layer_stage4_post_attn
+        if use_torch_compile:
+            stage1_fn = torch.compile(stage1_fn, fullgraph=False)
+            stage4_fn = torch.compile(stage4_fn, fullgraph=False)
+
+        for N in total_token_sizes:
+            self.reset()
+
+            # ── Shared intermediate buffers (fixed addresses for graph replay) ──
+            q_buf = torch.zeros(N, self.num_heads, self.head_dim,
+                                dtype=self.dtype, device=self.device)
+            k_buf = torch.zeros(N, self.num_kv_heads, self.head_dim,
+                                dtype=self.dtype, device=self.device)
+            v_buf = torch.zeros(N, self.num_kv_heads, self.head_dim,
+                                dtype=self.dtype, device=self.device)
+            attn_out_buf = torch.zeros(N, self.num_heads * self.head_dim,
+                                       dtype=self.dtype, device=self.device)
+            residual_buf = torch.zeros(N, self.hidden_size,
+                                       dtype=self.dtype, device=self.device)
+            hidden_buf = torch.zeros(N, self.hidden_size,
+                                     dtype=self.dtype, device=self.device)
+
+            # Static inputs (same for all layers within a step)
+            static_positions = (torch.arange(N, dtype=torch.int32,
+                                             device=self.device)
+                                % self.max_seq_len)
+            total_kv_slots = self.total_pages * self.page_size
+            static_slot_mapping = torch.arange(
+                N, dtype=torch.long, device=self.device) % total_kv_slots
+            static_token_ids = torch.randint(1, 1000, (N,),
+                                             device=self.device)
+
+            # ── Warmup all layers ──
+            n_warmup = 5 if use_torch_compile else 3
+            for _ in range(n_warmup):
+                hidden_buf.copy_(F.embedding(static_token_ids,
+                                             self.embed_tokens))
+                for layer in range(self.num_layers):
+                    stage1_fn(hidden_buf, static_positions,
+                              static_slot_mapping, layer,
+                              q_buf, k_buf, v_buf, residual_buf)
+                    # Fake attention output for warmup
+                    attn_out_buf.copy_(q_buf.reshape(N, -1))
+                    stage4_fn(attn_out_buf, residual_buf, hidden_buf, layer)
+            torch.cuda.synchronize()
+
+            # ── Capture per-layer graphs ──
+            stage1_graphs = []
+            stage4_graphs = []
+
+            # Re-init hidden for capture
+            hidden_buf.copy_(F.embedding(static_token_ids,
+                                         self.embed_tokens))
+
+            for layer in range(self.num_layers):
+                # Capture stage 1
+                g1 = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g1):
+                    stage1_fn(hidden_buf, static_positions,
+                              static_slot_mapping, layer,
+                              q_buf, k_buf, v_buf, residual_buf)
+                stage1_graphs.append(g1)
+
+                # Simulate attention (write something into attn_out_buf)
+                attn_out_buf.copy_(q_buf.reshape(N, -1))
+
+                # Capture stage 4
+                g4 = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g4):
+                    stage4_fn(attn_out_buf, residual_buf, hidden_buf,
+                              layer)
+                stage4_graphs.append(g4)
+
+            self._piecewise_graphs[N] = {
+                'stage1_graphs': stage1_graphs,
+                'stage4_graphs': stage4_graphs,
+                'q_buf': q_buf,
+                'k_buf': k_buf,
+                'v_buf': v_buf,
+                'attn_out_buf': attn_out_buf,
+                'residual_buf': residual_buf,
+                'hidden_buf': hidden_buf,
+                'static_positions': static_positions,
+                'static_slot_mapping': static_slot_mapping,
+                'static_token_ids': static_token_ids,
+            }
+
+            compile_str = " + torch.compile" if use_torch_compile else ""
+            print(f"  Piecewise CUDA graphs{compile_str} captured for "
+                  f"N={N} ({self.num_layers * 2} graphs)")
+
+    def _find_nearest_piecewise_graph(self, total_tokens):
+        """Find smallest piecewise graph with N >= total_tokens, or None."""
+        if not hasattr(self, '_piecewise_graphs'):
+            return None
+        candidates = [n for n in self._piecewise_graphs if n >= total_tokens]
+        return min(candidates) if candidates else None
+
+    @torch.no_grad()
+    def _mixed_step_piecewise(self, decode_seq_ids, decode_token_ids,
+                              prefill_seq_ids, prefill_input_ids,
+                              graph_N):
+        """Replay mixed step using per-layer piecewise CUDA graphs.
+
+        Stage 1 & 4 are CUDA graphs (keyed by N_total).
+        Stage 2 (FlashInfer decode) & Stage 3 (FA3 prefill) run eagerly.
+        """
+        info = self._piecewise_graphs[graph_N]
+        D = len(decode_seq_ids)
+        prefill_lengths = [ids.shape[0] for ids in prefill_input_ids]
+        N_actual = D + sum(prefill_lengths)
+        H = self.hidden_size
+
+        # ── 1. Build token_ids and copy into static buffer ──
+        token_parts = []
+        if D > 0:
+            token_parts.append(decode_token_ids)
+        for ids in prefill_input_ids:
+            token_parts.append(ids)
+        all_token_ids = torch.cat(token_parts)
+
+        info['static_token_ids'][:N_actual].copy_(all_token_ids)
+        if N_actual < graph_N:
+            info['static_token_ids'][N_actual:].zero_()
+
+        # ── 2. Compute positions and copy ──
+        decode_positions = (self._seq_lens_cpu[decode_seq_ids].to(torch.int32)
+                            .to(self.device)) if D > 0 else torch.empty(
+                                0, dtype=torch.int32, device=self.device)
+        prefill_pos_parts = [
+            torch.arange(s, dtype=torch.int32, device=self.device)
+            for s in prefill_lengths
+        ]
+        positions = torch.cat([decode_positions] + prefill_pos_parts)
+        info['static_positions'][:N_actual].copy_(positions)
+        if N_actual < graph_N:
+            info['static_positions'][N_actual:].zero_()
+
+        # ── 3. Compute slot_mapping and copy ──
+        if D > 0:
+            d_idx = torch.tensor(decode_seq_ids, device=self.device,
+                                 dtype=torch.long)
+            d_page = (decode_positions // self.page_size).long()
+            d_offset = (decode_positions % self.page_size).long()
+            decode_slots = (self.block_table[d_idx, d_page].long()
+                            * self.page_size + d_offset)
+        else:
+            decode_slots = torch.empty(0, dtype=torch.long,
+                                       device=self.device)
+
+        prefill_slot_parts = []
+        for sid, length in zip(prefill_seq_ids, prefill_lengths):
+            pos = torch.arange(length, device=self.device)
+            pg = (pos // self.page_size).long()
+            off = (pos % self.page_size).long()
+            prefill_slot_parts.append(
+                self.block_table[sid, pg].long() * self.page_size + off)
+
+        slot_mapping = torch.cat([decode_slots] + prefill_slot_parts)
+        info['static_slot_mapping'][:N_actual].copy_(slot_mapping)
+        if N_actual < graph_N:
+            info['static_slot_mapping'][N_actual:].fill_(-1)
+
+        # ── 4. Increment decode seq_lens and plan FlashInfer ──
+        if D > 0:
+            for sid in decode_seq_ids:
+                self._seq_lens_cpu[sid] += 1
+            self._plan_flashinfer_decode_for_subset(decode_seq_ids)
+
+        # ── 5. Build prefill cu_seqlens for FA3 ──
+        prefill_cu = torch.zeros(len(prefill_lengths) + 1, dtype=torch.int32,
+                                 device=self.device)
+        for i, s in enumerate(prefill_lengths):
+            prefill_cu[i + 1] = prefill_cu[i] + s
+        prefill_max = max(prefill_lengths) if prefill_lengths else 0
+
+        # ── 6. Embed tokens into hidden_buf ──
+        info['hidden_buf'].copy_(
+            F.embedding(info['static_token_ids'], self.embed_tokens))
+
+        # ── 7. Per-layer piecewise replay ──
+        q_buf = info['q_buf']
+        k_buf = info['k_buf']
+        v_buf = info['v_buf']
+        attn_out_buf = info['attn_out_buf']
+
+        for layer in range(self.num_layers):
+            # Stage 1: pre-attention (CUDA graph)
+            info['stage1_graphs'][layer].replay()
+
+            # Stage 2: FlashInfer decode on q_buf[:D]
+            if D > 0:
+                q_decode = q_buf[:D]  # [D, num_heads, head_dim]
+                decode_out = self._decode_wrapper.run(
+                    q_decode,
+                    (self.k_cache[layer], self.v_cache[layer]))
+                attn_out_buf[:D].copy_(decode_out.reshape(D, H))
+
+            # Stage 3: FA3 prefill on q_buf[D:N_actual]
+            if prefill_lengths:
+                N_pf = N_actual - D
+                q_pf = q_buf[D:N_actual]
+                k_pf = k_buf[D:N_actual]
+                v_pf = v_buf[D:N_actual]
+                prefill_out = flash_attn_varlen_func(
+                    q_pf, k_pf, v_pf,
+                    cu_seqlens_q=prefill_cu,
+                    cu_seqlens_k=prefill_cu,
+                    max_seqlen_q=prefill_max,
+                    max_seqlen_k=prefill_max,
+                    causal=True, fa_version=3)
+                attn_out_buf[D:N_actual].copy_(prefill_out.reshape(N_pf, H))
+
+            # Zero padding region of attn_out_buf
+            if N_actual < graph_N:
+                attn_out_buf[N_actual:].zero_()
+
+            # Stage 4: post-attention (CUDA graph)
+            info['stage4_graphs'][layer].replay()
+
+        # ── 8. Final norm + lm_head (eager — single kernel each) ──
+        hidden = info['hidden_buf']
+        hidden = F.rms_norm(hidden, (self.hidden_size,), self.final_norm,
+                            self.rms_norm_eps)
+        logits = F.linear(hidden, self.lm_head)
+
+        # ── 9. Update GPU seq_lens ──
+        for sid in decode_seq_ids:
+            self.seq_lens[sid] += 1
+        for sid, length in zip(prefill_seq_ids, prefill_lengths):
+            self.seq_lens[sid] = length
+            self._seq_lens_cpu[sid] = length
+
+        return logits[:N_actual]
+
     # ── Generation ───────────────────────────────────────────────────
 
     @torch.no_grad()
@@ -773,11 +1425,15 @@ class MoEEngine:
         if not hasattr(self, '_cuda_graphs'):
             self._cuda_graphs = {}
 
-        # Dummy prefill to populate KV cache
+        # Dummy prefill to populate KV cache (direct call, no graph needed)
         self.reset()
-        dummy = torch.randint(1, 1000, (batch_size, warmup_seq_len), device=self.device)
+        dummy = torch.randint(1, 1000, (warmup_seq_len,), device=self.device)
         with torch.no_grad():
-            self.prefill(dummy)
+            for b in range(batch_size):
+                # Use mixed_step for eager prefill (no CUDA graph dependency)
+                self.mixed_step(
+                    [], torch.empty(0, dtype=torch.long, device=self.device),
+                    [b], [dummy])
 
         # Static input buffers (updated via copy_ before each replay)
         static_token = torch.zeros(batch_size, dtype=torch.long, device=self.device)
@@ -894,6 +1550,11 @@ if __name__ == "__main__":
     engine = MoEEngine(model_path, max_batch_size=4, max_seq_len=512,
                        use_torch_compile=False)
 
+    # Capture prefill graphs (required before any prefill call)
+    engine.capture_prefill_cuda_graph(
+        total_token_sizes=[4, 128, 256, 512],
+        use_torch_compile=False)
+
     # Quick smoke test
     input_ids = torch.tensor([[1, 2, 3, 4]], device="cuda")
     print("\nSmoke test: prefill...")
@@ -902,6 +1563,10 @@ if __name__ == "__main__":
     print(f"  Top token: {logits[0, -1].argmax().item()}")
 
     print("Smoke test: generate...")
+    engine.reset()
+    engine.capture_decode_cuda_graph(batch_size=1, warmup_seq_len=4,
+                                     max_decode_tokens=20,
+                                     use_torch_compile=False)
     engine.reset()
     tokens = engine.generate(input_ids, max_new_tokens=10)
     print(f"  Generated shape: {tokens.shape}")

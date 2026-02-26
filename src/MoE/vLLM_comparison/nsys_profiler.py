@@ -4,10 +4,10 @@ Runs each (engine, seq_len) pair as a separate process under nsys.
 Outputs per-seq-len .prof files to profiling/<model_name>/.
 
 Usage:
-    python src/MoE/nsys_seq_len_comparison.py custom 128     # one run
-    python src/MoE/nsys_seq_len_comparison.py vllm 1024      # one run
-    python src/MoE/nsys_seq_len_comparison.py all             # all combos
-    python src/MoE/nsys_seq_len_comparison.py all --model path/to/model
+    python vLLM_comparison/nsys_profiler.py custom 128     # one run
+    python vLLM_comparison/nsys_profiler.py vllm 1024      # one run
+    python vLLM_comparison/nsys_profiler.py all             # all combos
+    python vLLM_comparison/nsys_profiler.py all --model path/to/model
 """
 
 import os
@@ -19,7 +19,8 @@ from pathlib import Path
 from collections import defaultdict
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_DIR = str(SCRIPT_DIR / "models" / "OLMoE-1B-7B")
+MOE_DIR = SCRIPT_DIR.parent
+DEFAULT_MODEL_DIR = str(MOE_DIR / "models" / "OLMoE-1B-7B")
 PROFILE_BASE = SCRIPT_DIR / "profiling"
 NSYS = os.path.expanduser("~/software/cuda-12.8/bin/nsys")
 
@@ -103,7 +104,7 @@ def write_custom_driver(path, seq_len, model_dir):
     max_seq = max(seq_len + 256, 2560)  # headroom
     code = textwrap.dedent(f"""\
         import sys, torch
-        sys.path.insert(0, "{SCRIPT_DIR}")
+        sys.path.insert(0, "{MOE_DIR}")
         from moe_engine import MoEEngine
 
         SEQ_LEN = {seq_len}
@@ -149,7 +150,7 @@ def write_vllm_driver(path, seq_len, model_dir):
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
 
-        sys.path.insert(0, "{SCRIPT_DIR}")
+        sys.path.insert(0, "{MOE_DIR}")
         import moe_engine  # glibc patches
 
         from vllm import LLM, SamplingParams
@@ -208,7 +209,7 @@ def write_custom_prefill_driver(path, seq_len, model_dir):
     """Driver: custom engine CUDA graph prefill at target seq_len."""
     code = textwrap.dedent(f"""\
         import sys, torch
-        sys.path.insert(0, "{SCRIPT_DIR}")
+        sys.path.insert(0, "{MOE_DIR}")
         from moe_engine import MoEEngine
 
         SEQ_LEN = {seq_len}
@@ -217,7 +218,7 @@ def write_custom_prefill_driver(path, seq_len, model_dir):
         engine = MoEEngine("{model_dir}", max_batch_size=1, max_seq_len=4096,
                            use_torch_compile=True)
         engine.capture_prefill_cuda_graph(
-            batch_size=1, seq_lengths=[SEQ_LEN],
+            total_token_sizes=[SEQ_LEN],
             use_torch_compile=True)
 
         input_ids = torch.randint(1, 1000, (1, SEQ_LEN), device="cuda")
@@ -246,7 +247,7 @@ def write_vllm_prefill_driver(path, seq_len, model_dir):
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
 
-        sys.path.insert(0, "{SCRIPT_DIR}")
+        sys.path.insert(0, "{MOE_DIR}")
         import moe_engine  # glibc patches
 
         from vllm import LLM, SamplingParams

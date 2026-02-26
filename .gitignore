@@ -4,3 +4,11 @@ bin/*
 *.png
 *__pycache__*
 *.ipynb_checkpoints*
+
+# MoE model weights (downloaded via models/download.sh)
+src/MoE/models/*
+!src/MoE/models/download.sh
+
+# Generated trace files (reproduced via trace_replay.py --trace)
+src/MoE/trace_*.json
+src/MoE/vLLM_comparison/trace_*.json

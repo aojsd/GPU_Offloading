@@ -64,7 +64,7 @@ warmup runs that used the same prompt tokens.
 
 ### Root Cause
 
-The benchmark scripts (`benchmark_prefill.py`, `nsys_seq_len_comparison.py`) reused
+The benchmark scripts (`microbenchmark.py prefill`, `nsys_profiler.py`) reused
 `prompt_ids = list(range(100, 100 + seq_len))` for both warmup and timed trials. With
 prefix caching enabled, vLLM V1's scheduler detected that most tokens were already in the
 KV cache and only scheduled the remaining ~16 new tokens (out of 128) per profiled run.
@@ -84,7 +84,7 @@ kernel launch. In reality, it was just doing 8x less work.
 1. Set `enable_prefix_caching=False` in vLLM `LLM()` constructor
 2. Use unique random prompts (`torch.randint(1, 1000, (seq_len,)).tolist()`) per trial
 
-Both fixes applied to `benchmark_prefill.py` and `nsys_seq_len_comparison.py`.
+Both fixes applied to `microbenchmark.py prefill` and `nsys_profiler.py`.
 
 ### Previous (buggy) vs Corrected Numbers
 
@@ -144,7 +144,7 @@ further amplifying the apparent speedup beyond the 8x work reduction.
 Prefill kernel profiles need to be regenerated with the corrected vLLM driver
 (prefix caching disabled, unique prompts). Previous `.prof` files are invalid.
 
-Regenerate: `python src/MoE/nsys_seq_len_comparison.py prefill`
+Regenerate: `python src/MoE/vLLM_comparison/nsys_profiler.py prefill`
 
 ---
 
@@ -207,4 +207,4 @@ to log kernel M values and Triton configs, (2) `fused_experts` to log hidden_sta
 (3) `GPUModelRunner.execute_model` to log `total_num_scheduled_tokens` from the scheduler.
 The smoking gun was the scheduler logging 16 scheduled tokens for a 128-token prompt after
 warmup with the same prompt had populated the prefix cache. Scripts have been removed;
-the fix is in `benchmark_prefill.py` and `nsys_seq_len_comparison.py`.
+the fix is in `microbenchmark.py prefill` and `nsys_profiler.py`.

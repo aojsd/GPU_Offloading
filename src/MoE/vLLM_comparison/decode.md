@@ -73,7 +73,7 @@ Detailed per-seq-len kernel profiles:
 - `profiling/OLMoE-1B-7B/decode_seq1024.prof`
 - `profiling/OLMoE-1B-7B/decode_seq2048.prof`
 
-Regenerate: `python src/MoE/nsys_seq_len_comparison.py all`
+Regenerate: `python src/MoE/vLLM_comparison/nsys_profiler.py all`
 
 ---
 

@@ -83,11 +83,13 @@ for each layer:
 
 ## Implementation Phases
 
-1. **Core Compute Engine** (complete): Custom MoE engine with CUDA graph + torch.compile, validated against vLLM SOTA on OLMoE-1B-7B. See [decode.md](decode.md) and [prefill.md](prefill.md) for detailed performance data.
-2. **Expert Cache & Async Transfer** (not started): Double-buffered GPU expert slots, CPU pinned memory, three CUDA streams.
-3. **Trace Format & Replay Controller** (not started): Replay loop with data movement orchestration + timing.
-4. **Trace Collection** (not started): Hook router to record expert selections per layer per token.
-5. **Policy Simulation** (not started): LRU, Oracle/Belady, frequency-based, pre-gated policies.
+1. **Core Compute Engine** (complete): Custom MoE engine with CUDA graph + torch.compile, validated against vLLM SOTA on OLMoE-1B-7B. See [decode.md](vLLM_comparison/decode.md) and [prefill.md](vLLM_comparison/prefill.md) for detailed performance data.
+2. **Mixed Batch Support** (complete): Mixed prefill+decode batches via `mixed_step()`, trace-and-replay benchmark vs vLLM. See [mixed_batch.md](vLLM_comparison/mixed_batch.md).
+   - **Piecewise CUDA Graphs** (merged into `moe_engine.py`): Per-layer 4-stage decomposition eliminates eager dispatch overhead on mixed batches. Correctness: bit-identical to eager (260/260 tokens, full logit match). Performance: mixed steps 2.03x faster than vLLM, overall staggered 1.19x (was 1.11x). Cross-engine correctness: **80.4% token match vs vLLM without torch.compile** (expected BF16 divergence). The 4% match with torch.compile is confirmed Inductor numerical noise (CUDA graphs add zero error). See [mixed_batch.md](vLLM_comparison/mixed_batch.md).
+3. **Expert Cache & Async Transfer** (not started): Double-buffered GPU expert slots, CPU pinned memory, three CUDA streams.
+4. **Trace Format & Replay Controller** (not started): Replay loop with data movement orchestration + timing.
+5. **Trace Collection** (not started): Hook router to record expert selections per layer per token.
+6. **Policy Simulation** (not started): LRU, Oracle/Belady, frequency-based, pre-gated policies.
 
 ---
 
@@ -115,12 +117,34 @@ RoPE scaling, and models exceeding GPU memory (offloading not yet implemented).
 
 ```python
 engine = MoEEngine("src/MoE/models/OLMoE-1B-7B")
-logits = engine.prefill(input_ids)          # [B, S, vocab]  (CUDA graph auto-dispatch)
-logits = engine.decode_step(token_ids, pos) # [B, vocab]     (CUDA graph auto-dispatch)
-tokens = engine.generate(input_ids, max_new_tokens=128)
-engine.capture_prefill_cuda_graph(batch_size=1, seq_lengths=[128, 256, 512, 1024, 2048])
+
+# CUDA graph capture — REQUIRED before any prefill/decode
+engine.capture_prefill_cuda_graph(total_token_sizes=[128, 256, 512, 1024, 2048])
 engine.capture_decode_cuda_graph(batch_size=1, warmup_seq_len=128, max_decode_tokens=256)
+engine.capture_mixed_cuda_graphs(total_token_sizes=[128, 256, 512, 1024, 2048])
+
+# Prefill (graph-only, no eager fallback)
+logits = engine.prefill(input_ids)            # [B, S, vocab]
+logits = engine.prefill_to_slot(seq_id, ids)  # [S, vocab]
+logits = engine.prefill_batch_to_slots(       # [N_total, vocab] (flat output)
+    seq_ids, input_ids)                       # input_ids: list[Tensor] or Tensor[B,S]
+
+# Decode (graph auto-dispatch)
+logits = engine.decode_step(token_ids, pos)   # [B, vocab]
+
+# Mixed batch (auto-dispatches to piecewise CUDA graphs if captured, else eager)
+logits = engine.mixed_step(                   # [N_total, vocab]
+    decode_seq_ids, decode_tokens, prefill_seq_ids, prefill_input_ids)
+
+tokens = engine.generate(input_ids, max_new_tokens=128)
 ```
+
+Prefill CUDA graphs are keyed by **total token count** (not `(batch_size, seq_len)` pairs).
+One graph serves any sequence combination fitting within that total — e.g., a graph
+captured at `total_token_sizes=[256]` handles `1×256`, `4×64`, `2×100+1×56`, etc.
+Padding tokens use `slot_mapping = -1` (vLLM sentinel — `reshape_and_cache_flash` skips
+KV writes for negative slots). No eager prefill fallback; `_find_nearest_prefill_total`
+raises `RuntimeError` if no captured graph covers the requested total.
 
 ### Correctness
 
@@ -130,16 +154,27 @@ engine.capture_decode_cuda_graph(batch_size=1, warmup_seq_len=128, max_decode_to
 
 ### Performance Summary
 
-| Phase | Custom (CUDA graph) | vLLM (CUDA graph + compile) | Status |
-|-------|--------|------|--------|
-| **Decode** (seq128) | 2.87ms/step | 2.93ms/step | **1-2% faster** — see [decode.md](decode.md) |
-| **Prefill** (seq128) | 7.65ms | 7.86ms | **2-3% faster** — see [prefill.md](prefill.md) |
-| **Prefill** (seq1024) | 11.61ms | 17.20ms | **32% faster** — see [prefill.md](prefill.md) |
+**Standalone benchmarks** (CUDA graph + torch.compile):
 
-Custom engine beats vLLM at both prefill and decode across all sequence lengths.
-Previous measurements showing vLLM 3x faster at prefill were caused by vLLM V1's
-prefix caching silently reusing KV cache from warmup runs with the same prompt.
-See [prefill.md](prefill.md) for the full investigation.
+| Phase | Custom | vLLM | Status |
+|-------|--------|------|--------|
+| **Decode** (seq128) | 2.87ms/step | 2.93ms/step | **1-2% faster** — see [decode.md](vLLM_comparison/decode.md) |
+| **Prefill** (seq128) | 7.65ms | 7.86ms | **2-3% faster** — see [prefill.md](vLLM_comparison/prefill.md) |
+| **Prefill** (seq1024) | 11.61ms | 17.20ms | **32% faster** — see [prefill.md](vLLM_comparison/prefill.md) |
+
+**Trace-and-replay** (piecewise CUDA graphs + torch.compile, vLLM batches replayed):
+
+| Workload | Custom total | vLLM total | Speedup |
+|----------|-------------|-----------|---------|
+| Single (1 req, 50 decode) | 178.43ms | 206.16ms | **1.16x** |
+| Staggered (8 req, mixed) | 204.32ms | 243.21ms | **1.19x** |
+
+Custom engine beats vLLM on all workloads. Pure decode (1.11x faster) dominates single.
+Piecewise CUDA graphs for mixed batches: 2.03x faster than vLLM (was 0.52x with eager).
+Cross-engine correctness: piecewise is bit-identical to eager (260/260 tokens). Without
+torch.compile, custom matches vLLM at **80.4%** (expected BF16 divergence). The 4% match
+with torch.compile is confirmed Inductor numerical noise — CUDA graphs add zero error.
+See [mixed_batch.md](vLLM_comparison/mixed_batch.md) for full results.
 
 ### glibc 2.28 Workaround
 
@@ -161,7 +196,7 @@ expert_ids via `searchsorted(..., right=True)`.
 - V tensor after QKV split is non-contiguous → needs `.contiguous()` or `.reshape()`
 - FlashInfer RoPE JIT needs `ninja` in PATH (prefill only)
 
-See [decode.md](decode.md) and [prefill.md](prefill.md) for phase-specific pitfalls.
+See [decode.md](vLLM_comparison/decode.md) and [prefill.md](vLLM_comparison/prefill.md) for phase-specific pitfalls.
 
 ---
 
@@ -169,27 +204,30 @@ See [decode.md](decode.md) and [prefill.md](prefill.md) for phase-specific pitfa
 
 | File | Purpose |
 |------|---------|
-| `moe_engine.py` | `MoEEngine` — model-agnostic engine with piecewise CUDA graphs for both prefill and decode |
-| `test_cuda_graph.py` | CUDA graph correctness (eager vs graph exact match) + timing |
-| `benchmark.py` | Correctness validation (custom vs HuggingFace vs vLLM) + wall-clock timing |
-| `benchmark_prefill.py` | Prefill performance: Custom FA3 vs vLLM FA3, combined prefill+decode |
-| `nsys_seq_len_comparison.py` | Nsight Systems kernel profiling: Custom vs vLLM (decode + prefill) |
-| `profiling/<model>/` | Per-seq-len kernel profiles (`decode_seq{N}.prof`, `prefill_seq{N}.prof`) |
-| `models/OLMoE-1B-7B/` | Model weights + config |
-| `decode.md` | Decode pipeline details, profiling data, challenges |
-| `prefill.md` | Prefill pipeline details, profiling data, gap analysis, challenges |
+| `moe_engine.py` | `MoEEngine` — model-agnostic engine with mixed batch support, piecewise + monolithic CUDA graphs, torch.compile |
+| `models/download.sh` | Download OLMoE-1B-7B weights to target dir + create symlink |
+| `vLLM_comparison/microbenchmark.py` | Consolidated benchmarks: decode, prefill, CUDA graph correctness, mixed smoke tests |
+| `vLLM_comparison/trace_replay.py` | Trace-and-replay benchmark: run vLLM, trace batches, replay on custom engine |
+| `vLLM_comparison/nsys_profiler.py` | Nsight Systems kernel profiling: Custom vs vLLM (decode + prefill) |
+| `vLLM_comparison/profiling/<model>/` | Per-seq-len kernel profiles (`decode_seq{N}.prof`, `prefill_seq{N}.prof`) |
+| `vLLM_comparison/decode.md` | Decode pipeline details, profiling data, challenges |
+| `vLLM_comparison/prefill.md` | Prefill pipeline details, profiling data, gap analysis, challenges |
+| `vLLM_comparison/mixed_batch.md` | Mixed prefill+decode batch support: design, piecewise CUDA graph plan |
 
-Regenerate decode profiles: `python src/MoE/nsys_seq_len_comparison.py all`
-Regenerate prefill profiles: `python src/MoE/nsys_seq_len_comparison.py prefill`
+Regenerate decode profiles: `python src/MoE/vLLM_comparison/nsys_profiler.py all`
+Regenerate prefill profiles: `python src/MoE/vLLM_comparison/nsys_profiler.py prefill`
 
 ---
 
-## Next: Batch Trace Execution — Compilation Constraints (Phase 2 Prep)
+## Next: Expert Cache & Async Transfer (Phase 3)
 
-Analysis needed: what parts of the algorithm are "baked in" to torch.compile / CUDA graphs?
-- FlashInfer decode `plan()` must run outside CUDA graph (CPU metadata) — already handled
-- Block tables for paged attention — how static are they w.r.t. compilation?
-- What changes between batches in a trace replay? Expert selections, KV lengths, positions
-- Which of these can be updated via `.copy_()` on static buffers vs requiring re-capture?
+Engine now supports mixed prefill+decode batches and beats vLLM on realistic workloads.
+Next step: expert offloading infrastructure for Mixtral-8x7B.
+
+Key questions:
+- Double-buffered GPU expert slots: how many slots needed? Which eviction policy?
+- Three CUDA streams: compute, prefetch, demand_load — synchronization model?
+- CPU pinned memory layout for 256 experts (~86 GB total)
+- PCIe transfer overlap with attention compute (expert prefetch during attention)
 
 ---

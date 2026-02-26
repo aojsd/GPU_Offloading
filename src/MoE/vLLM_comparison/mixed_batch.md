@@ -21,7 +21,9 @@ CUDA graphs for pure decode/prefill, and torch.compile fusion. This is the produ
 configuration — eager mixed_step performance is not representative (see "Eager vs
 Piecewise" section for context).
 
-### Single Request (prompt=128, generate 50 tokens)
+### OLMoE-1B-7B (16 layers, 64 experts top-8)
+
+#### Single Request (prompt=128, generate 50 tokens)
 
 | Phase | Custom (ms) | vLLM (ms) | Speedup |
 |-------|-----------|---------|---------|
@@ -29,7 +31,7 @@ Piecewise" section for context).
 | Prefill (1 step) | 7.58 | 8.18 | **1.08x** |
 | **Total** | **178.43** | **206.16** | **1.16x** |
 
-### Staggered (4 at step 0, 2 at step 10, 2 at step 20)
+#### Staggered (4 at step 0, 2 at step 10, 2 at step 20)
 
 | Step Type | Steps | Custom avg (ms) | vLLM avg (ms) | Speedup |
 |-----------|-------|-----------------|---------------|---------|
@@ -44,6 +46,60 @@ Key observations:
 - Step 20 (518 tokens): **10.39ms** vs vLLM 29.62ms — 2.85x faster
 - **Pure decode dominates** (37/40 steps) and is 1.11x faster
 - **Overall 1.19x**, up from 1.11x before piecewise
+
+### Mixtral-8x7B-20L (20 layers, 8 experts top-2)
+
+Benchmarked with `trace_replay.py`. vLLM runs with default settings (chunked prefill enabled,
+prefix caching disabled). Custom engine uses piecewise CUDA graphs + torch.compile.
+
+#### Single Request (prompt=128, generate 50 tokens)
+
+| Phase | Custom (ms) | vLLM (ms) | Speedup |
+|-------|-----------|---------|---------|
+| Decode (avg, 49 steps) | 9.14 | 9.46 | **1.03x** |
+| Prefill (1 step) | 25.68 | 25.87 | **1.01x** |
+| **Total** | **473.47** | **489.65** | **1.03x** |
+
+| Metric | Custom | vLLM | Speedup |
+|--------|--------|------|---------|
+| Avg TTFT | 25.68ms | 25.87ms | **1.01x** |
+| Throughput | 105.6 tok/s | 102.1 tok/s | **1.03x** |
+
+#### Staggered (4 at step 0, 2 at step 10, 2 at step 20)
+
+| Step Type | Steps | Custom avg (ms) | vLLM avg (ms) | Speedup |
+|-----------|-------|-----------------|---------------|---------|
+| Pure Decode | 37 | 16.83 | 16.50 | **0.98x** |
+| Pure Prefill (4x128) | 1 | 29.52 | 30.27 | **1.03x** |
+| Mixed (D+P combined) | 2 | 28.44 | 96.49 | **3.39x** |
+| **Total (40 steps)** | | **709.19** | **833.70** | **1.18x** |
+
+| Metric | Custom | vLLM | Speedup |
+|--------|--------|------|---------|
+| Avg TTFT | 28.98ms | 63.38ms | **2.19x** |
+| Throughput | 366.6 tok/s | 311.9 tok/s | **1.18x** |
+
+Key observations:
+- **Mixed batches 3.39x faster than vLLM** — the dominant factor in the 1.18x overall speedup
+- Step 20 (6D + 2P@256 = 518 tokens): **30.46ms** vs vLLM **166.25ms** (5.46x faster)
+- Step 10 (4D + 2P@64 = 132 tokens): **26.42ms** vs vLLM **26.72ms** (1.01x)
+- **TTFT 2.19x faster** — vLLM's step 20 takes 166ms for TTFT of the two 256-token prefills
+- **Pure decode 0.98x** — essentially tied (16.83ms vs 16.50ms)
+
+#### Mixed batch performance: vLLM's piecewise vs ours
+
+With `enable_chunked_prefill=True` (default), vLLM uses its own piecewise CUDA graph
+implementation for mixed batches. Step 20 dropped from 934ms (eager with chunked prefill
+off) to 166ms — a 5.6x improvement. But our piecewise CUDA graphs still win at 30ms (5.46x
+faster), because:
+
+1. **vLLM pads to captured graph sizes**: Its `cudagraph_capture_sizes` go up to 512, but
+   the 518-token mixed batch exceeds this and likely falls back to a larger padded execution
+   or partial eager execution.
+2. **Our piecewise graphs are captured at exact sizes**: We pre-capture for the exact
+   total_tokens observed in the trace (132, 518), eliminating padding overhead.
+3. **Fewer intermediary layers**: Our 4-stage decomposition has less overhead per layer
+   than vLLM's general-purpose piecewise implementation.
 
 ### Optimization Breakdown (Single Request)
 

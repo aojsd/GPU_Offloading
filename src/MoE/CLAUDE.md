@@ -96,11 +96,11 @@ for each layer:
 ## Custom MoE Engine (Phase 1 — Complete)
 
 Model-agnostic engine supporting any HuggingFace MoE model with gate/up/down expert
-projections. Architecture params read from `config.json`. Validated on OLMoE-1B-7B;
-Mixtral support pending expert offloading (model too large for single GPU).
+projections. Architecture params read from `config.json`. Validated on OLMoE-1B-7B
+and Mixtral-8x7B (truncated to 20 layers, 54.6 GB BF16, fits single H100).
 
-Guards raise `NotImplementedError` for unsupported features: sliding window attention,
-RoPE scaling, and models exceeding GPU memory (offloading not yet implemented).
+Guards raise `NotImplementedError` for unsupported features: sliding window attention
+and RoPE scaling.
 
 ### OLMoE-1B-7B Architecture
 
@@ -112,6 +112,23 @@ RoPE scaling, and models exceeding GPU memory (offloading not yet implemented).
 | Attention | 16 heads, 16 KV heads (MHA), head_dim=128 |
 | Special | Q/K norm on flat [B, 2048] **before** head reshape and RoPE; norm_topk_prob=False |
 | Total size | ~13.8 GB BF16 (fits on one H100) |
+
+### Mixtral-8x7B Architecture (Truncated)
+
+| Parameter | Value |
+|---|---|
+| Layers | 20 (truncated from 32 via `models/truncate_model.py`) |
+| Experts per layer | 8 (top-2 selected) |
+| Hidden / Intermediate | 4096 / 14336 |
+| Attention | 32 heads, 8 KV heads (GQA), head_dim=128 |
+| Special | norm_topk_prob=True; weight naming: w1/w2/w3 (not gate_proj/up_proj/down_proj) |
+| Total size | ~54.6 GB BF16 (fits on one H100 with ~17 GB for KV cache) |
+
+**Mixtral-specific adaptations**:
+- Weight loading detects `w1`/`w2`/`w3` naming (w1=gate, w3=up, w2=down)
+- GQA support: `rope_pytorch` takes separate `num_kv_heads` param for k reshape
+- w1/w2 kept as Python lists (not stacked) to avoid 2x peak memory for large FFNs
+- fused_moe config: copied from H200 to H100 (same SM90); without it, 10% slower on decode
 
 ### Engine API
 
@@ -154,7 +171,7 @@ raises `RuntimeError` if no captured graph covers the requested total.
 
 ### Performance Summary
 
-**Standalone benchmarks** (CUDA graph + torch.compile):
+**OLMoE-1B-7B standalone benchmarks** (CUDA graph + torch.compile):
 
 | Phase | Custom | vLLM | Status |
 |-------|--------|------|--------|
@@ -162,15 +179,39 @@ raises `RuntimeError` if no captured graph covers the requested total.
 | **Prefill** (seq128) | 7.65ms | 7.86ms | **2-3% faster** — see [prefill.md](vLLM_comparison/prefill.md) |
 | **Prefill** (seq1024) | 11.61ms | 17.20ms | **32% faster** — see [prefill.md](vLLM_comparison/prefill.md) |
 
+**Mixtral-8x7B-20L standalone benchmarks** (CUDA graph + torch.compile):
+
+| Phase | Custom | vLLM | Status |
+|-------|--------|------|--------|
+| **Decode** (seq128) | 9.13ms/step | 9.12ms/step | **1.00x** (exact match) |
+| **Decode** (seq2048) | 9.31ms/step | 9.15ms/step | **0.98x** |
+| **Prefill** (seq128) | 31.57ms | 31.66ms | **0.3% faster** |
+| **Prefill** (seq1024) | 86.34ms | 90.02ms | **4.1% faster** |
+| **Prefill** (seq2048) | 159.73ms | 162.93ms | **2.0% faster** |
+
 **Trace-and-replay** (piecewise CUDA graphs + torch.compile, vLLM batches replayed):
+
+**OLMoE-1B-7B:**
 
 | Workload | Custom total | vLLM total | Speedup |
 |----------|-------------|-----------|---------|
 | Single (1 req, 50 decode) | 178.43ms | 206.16ms | **1.16x** |
 | Staggered (8 req, mixed) | 204.32ms | 243.21ms | **1.19x** |
 
-Custom engine beats vLLM on all workloads. Pure decode (1.11x faster) dominates single.
-Piecewise CUDA graphs for mixed batches: 2.03x faster than vLLM (was 0.52x with eager).
+**Mixtral-8x7B-20L** (vLLM with chunked prefill enabled — default/best settings):
+
+| Workload | Custom total | vLLM total | Speedup |
+|----------|-------------|-----------|---------|
+| Single (1 req, 50 decode) | 473.47ms | 489.65ms | **1.03x** |
+| Staggered (8 req, mixed) | 709.19ms | 833.70ms | **1.18x** |
+
+| Metric (staggered) | Custom | vLLM | Speedup |
+|---------------------|--------|------|---------|
+| Avg TTFT | 28.98ms | 63.38ms | **2.19x** |
+| Throughput | 366.6 tok/s | 311.9 tok/s | **1.18x** |
+
+Custom engine beats vLLM on all workloads at vLLM's best default settings.
+Mixed steps 3.39x faster; TTFT 2.19x faster on staggered workload.
 Cross-engine correctness: piecewise is bit-identical to eager (260/260 tokens). Without
 torch.compile, custom matches vLLM at **80.4%** (expected BF16 divergence). The 4% match
 with torch.compile is confirmed Inductor numerical noise — CUDA graphs add zero error.
@@ -190,7 +231,7 @@ expert_ids via `searchsorted(..., right=True)`.
 - `VLLM_ENABLE_V1_MULTIPROCESSING=0` must be set **before** any vLLM import
 - Q/K norm on flat `[B, 2048]` **before** head reshape, not per-head
 - w1 gate/up ordering: gate first (rows 0:1024), up second (rows 1024:2048)
-- norm_topk_prob=False: do NOT renormalize routing weights
+- norm_topk_prob: model-specific (OLMoE=False, Mixtral=True) — read from config.json
 - `moe_align_block_size`: sorted_ids = FLAT indices; Triton kernel does `flat_idx // top_k`
 - torch.compile Inductor produces numerically different greedy tokens from eager (expected)
 - V tensor after QKV split is non-contiguous → needs `.contiguous()` or `.reshape()`
@@ -205,7 +246,8 @@ See [decode.md](vLLM_comparison/decode.md) and [prefill.md](vLLM_comparison/pref
 | File | Purpose |
 |------|---------|
 | `moe_engine.py` | `MoEEngine` — model-agnostic engine with mixed batch support, piecewise + monolithic CUDA graphs, torch.compile |
-| `models/download.sh` | Download OLMoE-1B-7B weights to target dir + create symlink |
+| `models/download.sh` | Download model weights (OLMoE, Mixtral) |
+| `models/truncate_model.py` | Truncate model to N layers (for fitting large models on single GPU) |
 | `vLLM_comparison/microbenchmark.py` | Consolidated benchmarks: decode, prefill, CUDA graph correctness, mixed smoke tests |
 | `vLLM_comparison/trace_replay.py` | Trace-and-replay benchmark: run vLLM, trace batches, replay on custom engine |
 | `vLLM_comparison/nsys_profiler.py` | Nsight Systems kernel profiling: Custom vs vLLM (decode + prefill) |

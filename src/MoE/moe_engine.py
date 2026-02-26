@@ -27,25 +27,30 @@ except ImportError:
     HAS_FLASHINFER = False
 
 
-def rope_pytorch(q, k, cos_sin_cache, positions, num_heads, head_dim):
+def rope_pytorch(q, k, cos_sin_cache, positions, num_heads, head_dim,
+                 num_kv_heads=None):
     """Pure PyTorch NeoX-style RoPE — fully compilable by torch.compile.
 
     Args:
-        q, k: [N, num_heads * head_dim] (flat, after Q/K norm)
+        q: [N, num_heads * head_dim]
+        k: [N, num_kv_heads * head_dim]
         cos_sin_cache: [max_seq, head_dim] (first half cos, second half sin)
         positions: [N] int32/int64
-        num_heads: number of attention heads
+        num_heads: number of Q attention heads
         head_dim: dimension per head
+        num_kv_heads: number of KV heads (defaults to num_heads for MHA)
     Returns:
-        q_rot, k_rot: [N, num_heads * head_dim] (same shape as input)
+        q_rot, k_rot: same shapes as input
     """
+    if num_kv_heads is None:
+        num_kv_heads = num_heads
     orig_dtype = q.dtype
     N = q.shape[0]
     half = head_dim // 2
     cos = cos_sin_cache[positions.long(), :half].unsqueeze(1)   # [N, 1, half]
     sin = cos_sin_cache[positions.long(), half:].unsqueeze(1)   # [N, 1, half]
     q_h = q.float().view(N, num_heads, head_dim)
-    k_h = k.float().view(N, num_heads, head_dim)
+    k_h = k.float().view(N, num_kv_heads, head_dim)
     q_rot = torch.cat([q_h[..., :half] * cos - q_h[..., half:] * sin,
                         q_h[..., :half] * sin + q_h[..., half:] * cos], dim=-1)
     k_rot = torch.cat([k_h[..., :half] * cos - k_h[..., half:] * sin,
@@ -191,7 +196,10 @@ class MoEEngine:
         self.vocab_size = cfg["vocab_size"]
         self.eos_token_id = cfg.get("eos_token_id", 2)
         self.rms_norm_eps = cfg.get("rms_norm_eps", 1e-5)
-        self.norm_topk_prob = cfg.get("norm_topk_prob", False)
+        # OLMoE has explicit "norm_topk_prob" in config. For Mixtral and other
+        # models that lack this field, vLLM defaults renormalize=True in FusedMoE.
+        # Match that behavior: renormalize unless explicitly set to False.
+        self.norm_topk_prob = cfg.get("norm_topk_prob", True)
 
         # Unsupported features — raise early rather than produce wrong results
         if cfg.get("sliding_window") is not None:
@@ -318,9 +326,15 @@ class MoEEngine:
                 expert_prefix = f"{p}.mlp.experts.{e}"
                 if f"{expert_prefix}.gate_proj.weight" not in weights:
                     expert_prefix = f"{p}.block_sparse_moe.experts.{e}"
-                gate = weights.pop(f"{expert_prefix}.gate_proj.weight")
-                up = weights.pop(f"{expert_prefix}.up_proj.weight")
-                down = weights.pop(f"{expert_prefix}.down_proj.weight")
+                # OLMoE: gate_proj/up_proj/down_proj; Mixtral: w1/w3/w2
+                if f"{expert_prefix}.gate_proj.weight" in weights:
+                    gate = weights.pop(f"{expert_prefix}.gate_proj.weight")
+                    up = weights.pop(f"{expert_prefix}.up_proj.weight")
+                    down = weights.pop(f"{expert_prefix}.down_proj.weight")
+                else:
+                    gate = weights.pop(f"{expert_prefix}.w1.weight")
+                    up = weights.pop(f"{expert_prefix}.w3.weight")
+                    down = weights.pop(f"{expert_prefix}.w2.weight")
                 w1_list.append(torch.cat([gate, up], dim=0))
                 w2_list.append(down)
             self.w1.append(torch.stack(w1_list))
@@ -349,8 +363,9 @@ class MoEEngine:
             self.q_norm = torch.stack(self.q_norm)    # [L, H]
             self.k_norm = torch.stack(self.k_norm)    # [L, H]
         self.router = torch.stack(self.router)    # [L, E, H]
-        self.w1 = torch.stack(self.w1)            # [L, E, 2*I, H]
-        self.w2 = torch.stack(self.w2)            # [L, E, H, I]
+        # Keep w1/w2 as lists — stacking would require 2x peak memory for large
+        # models (Mixtral w1 alone is 35 GB). Indexing self.w1[layer] works the
+        # same for both lists and stacked tensors.
 
     def _build_rope_cache(self) -> torch.Tensor:
         half_dim = self.head_dim // 2
@@ -566,7 +581,7 @@ class MoEEngine:
 
         # RoPE — always PyTorch (compilable, Inductor fuses with surrounding ops)
         q, k = rope_pytorch(q, k, self.cos_sin_cache, positions,
-                            self.num_heads, self.head_dim)
+                            self.num_heads, self.head_dim, self.num_kv_heads)
 
         # Write K,V to cache using reshape_and_cache_flash (flat NHD layout)
         k_write = k.view(B, self.num_kv_heads, self.head_dim)
@@ -839,7 +854,7 @@ class MoEEngine:
 
         # RoPE on ALL tokens
         q, k = rope_pytorch(q, k, self.cos_sin_cache, positions,
-                            self.num_heads, self.head_dim)
+                            self.num_heads, self.head_dim, self.num_kv_heads)
 
         # Write K,V to paged cache for ALL tokens
         k_write = k.reshape(N, self.num_kv_heads, self.head_dim)
@@ -942,7 +957,7 @@ class MoEEngine:
                            self.rms_norm_eps).contiguous()
 
         q, k = rope_pytorch(q, k, self.cos_sin_cache, positions,
-                            self.num_heads, self.head_dim)
+                            self.num_heads, self.head_dim, self.num_kv_heads)
 
         k_3d = k.reshape(N, self.num_kv_heads, self.head_dim)
         v_3d = v.reshape(N, self.num_kv_heads, self.head_dim)

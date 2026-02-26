@@ -133,10 +133,9 @@ def trace_vllm(model_path, workload, n_warmup_requests=3):
         model=model_path,
         dtype="bfloat16",
         max_model_len=4096,
-        gpu_memory_utilization=0.50,
+        gpu_memory_utilization=0.80,
         disable_log_stats=True,
         enable_prefix_caching=False,
-        enable_chunked_prefill=False,
     )
 
     # Warmup
@@ -612,6 +611,120 @@ def print_summary(traces, custom_latencies, correctness):
               f"{sp:>7.2f}x")
 
 
+def print_serving_metrics(traces, custom_latencies, workload):
+    """Print TTFT, throughput, and per-request generation latency."""
+
+    # Build request lookup
+    req_lookup = {r.request_id: r for r in workload}
+
+    # For each request, find:
+    #   - arrival_step (from workload definition)
+    #   - prefill_step (first step where it appears in prefill_requests)
+    #   - last_step (last step where it appears in any request list)
+    #   - output_token_count (number of decode steps)
+    req_first_step = {}   # req_id -> step index of prefill
+    req_last_step = {}    # req_id -> step index of last decode
+    req_decode_count = {}  # req_id -> number of decode steps
+
+    for i, step in enumerate(traces):
+        for p in step.prefill_requests:
+            rid = p['request_id']
+            if rid not in req_first_step:
+                req_first_step[rid] = i
+        for d in step.decode_requests:
+            rid = d['request_id']
+            req_last_step[rid] = i
+            req_decode_count[rid] = req_decode_count.get(rid, 0) + 1
+
+    # Compute cumulative latency at each step for both engines
+    vllm_cum = [0.0]
+    custom_cum = [0.0]
+    for i, step in enumerate(traces):
+        vllm_cum.append(vllm_cum[-1] + step.vllm_latency_ms)
+        c_ms = custom_latencies[i] if i < len(custom_latencies) else 0
+        custom_cum.append(custom_cum[-1] + c_ms)
+
+    # TTFT: time from arrival to end of prefill step
+    # For requests arriving at step S, TTFT = cum_latency[prefill_step+1] - cum_latency[S]
+    # where S is the first step at or after arrival_step
+    arrival_step_map = {}  # req_id -> first trace step at or after arrival
+    for i, step in enumerate(traces):
+        for p in step.prefill_requests:
+            rid = p['request_id']
+            if rid not in arrival_step_map:
+                arrival_step_map[rid] = i
+        for d in step.decode_requests:
+            rid = d['request_id']
+            if rid not in arrival_step_map:
+                arrival_step_map[rid] = i
+
+    print(f"\n{'':>12s}  {'TTFT (ms)':>20s}  {'Gen Latency (ms)':>20s}  "
+          f"{'Output':>7s}  {'Prompt':>7s}")
+    print(f"{'Request':>12s}  {'vLLM':>9s}  {'Custom':>9s}  "
+          f"{'vLLM':>9s}  {'Custom':>9s}  {'Tokens':>7s}  {'Tokens':>7s}")
+    print("-" * 80)
+
+    total_output_tokens = 0
+    vllm_ttfts = []
+    custom_ttfts = []
+
+    for r in workload:
+        rid = r.request_id
+        prompt_len = len(r.prompt_token_ids)
+        n_decode = req_decode_count.get(rid, 0)
+        total_output_tokens += n_decode + 1  # +1 for token produced at prefill
+
+        arrival_i = arrival_step_map.get(rid, 0)
+        prefill_i = req_first_step.get(rid, arrival_i)
+        last_i = req_last_step.get(rid, prefill_i)
+
+        # TTFT = time from arrival to end of prefill step
+        vllm_ttft = vllm_cum[prefill_i + 1] - vllm_cum[arrival_i]
+        custom_ttft = custom_cum[prefill_i + 1] - custom_cum[arrival_i]
+        vllm_ttfts.append(vllm_ttft)
+        custom_ttfts.append(custom_ttft)
+
+        # Generation latency = time from end of prefill to end of last decode
+        if last_i > prefill_i:
+            vllm_gen = vllm_cum[last_i + 1] - vllm_cum[prefill_i + 1]
+            custom_gen = custom_cum[last_i + 1] - custom_cum[prefill_i + 1]
+        else:
+            vllm_gen = 0.0
+            custom_gen = 0.0
+
+        print(f"{rid:>12s}  {vllm_ttft:>9.2f}  {custom_ttft:>9.2f}  "
+              f"{vllm_gen:>9.2f}  {custom_gen:>9.2f}  "
+              f"{n_decode + 1:>7d}  {prompt_len:>7d}")
+
+    print("-" * 80)
+
+    # Aggregate metrics
+    total_vllm_ms = vllm_cum[-1]
+    total_custom_ms = custom_cum[-1]
+
+    vllm_throughput = total_output_tokens / (total_vllm_ms / 1000)
+    custom_throughput = total_output_tokens / (total_custom_ms / 1000)
+
+    avg_vllm_ttft = sum(vllm_ttfts) / len(vllm_ttfts) if vllm_ttfts else 0
+    avg_custom_ttft = sum(custom_ttfts) / len(custom_ttfts) if custom_ttfts else 0
+
+    print(f"\n{'Metric':>25s}  {'vLLM':>12s}  {'Custom':>12s}  {'Speedup':>8s}")
+    print("-" * 62)
+    print(f"{'Avg TTFT':>25s}  {avg_vllm_ttft:>10.2f}ms  "
+          f"{avg_custom_ttft:>10.2f}ms  "
+          f"{avg_vllm_ttft / avg_custom_ttft:>7.2f}x"
+          if avg_custom_ttft > 0 else "")
+    print(f"{'Throughput':>25s}  {vllm_throughput:>9.1f}tok/s  "
+          f"{custom_throughput:>9.1f}tok/s  "
+          f"{custom_throughput / vllm_throughput:>7.2f}x"
+          if vllm_throughput > 0 else "")
+    print(f"{'Total wall-clock':>25s}  {total_vllm_ms:>10.2f}ms  "
+          f"{total_custom_ms:>10.2f}ms  "
+          f"{total_vllm_ms / total_custom_ms:>7.2f}x"
+          if total_custom_ms > 0 else "")
+    print(f"{'Total output tokens':>25s}  {total_output_tokens:>12d}")
+
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 def main():
@@ -712,6 +825,7 @@ def main():
 
     print_comparison(traces, custom_latencies, correctness)
     print_summary(traces, custom_latencies, correctness)
+    print_serving_metrics(traces, custom_latencies, workload)
 
     del engine
     torch.cuda.empty_cache()

@@ -34,6 +34,8 @@ Two-phase API: `plan()` (CPU, outside graph) → `run()` (GPU, inside graph).
 
 ## Performance vs vLLM (H100 80GB, batch=1, CUDA graphs + torch.compile)
 
+### OLMoE-1B-7B (16 layers, 64 experts top-8)
+
 Profiled with `nsys profile --cuda-graph-trace=node`. 30 decode steps per run.
 
 ```
@@ -46,6 +48,28 @@ seq_len  Custom  vLLM   Gap      Gap%
 ```
 
 Custom engine beats vLLM at all sequence lengths. Fewer kernel launches (989 vs 1032) due to more aggressive Inductor fusion.
+
+### Mixtral-8x7B-20L (20 layers, 8 experts top-2)
+
+Truncated to 20 layers (54.6 GB BF16). CUDA graph + torch.compile, batch=1, 50 decode steps.
+
+```
+seq_len  Custom   vLLM    Gap      Gap%
+  128     9.13    9.12   +0.01    +0.1%
+  256     9.13    9.13    0.00     0.0%
+  512     9.14    9.13   +0.01    +0.1%
+ 1024     9.14    9.12   +0.02    +0.2%
+ 2048     9.31    9.15   +0.16    +1.7%
+```
+
+Custom engine matches vLLM exactly at all sequence lengths up to 1024. At seq2048, a
+small ~2% gap appears (likely from KV cache page count scaling in FlashInfer attention).
+
+**Key to achieving parity**: Two factors were needed to close an initial ~6% gap:
+1. **fused_moe Triton config**: No pre-tuned config existed for E=8,N=14336 on H100.
+   Copying the H200 config (same SM90 arch) gave ~10% improvement to both engines.
+2. **torch.compile in CUDA graph**: Inductor fusion of RMSNorm + residual + RoPE closed
+   the remaining gap. Without compile, custom was ~10% slower.
 
 ### Kernel Category Breakdown (seq128, per decode step)
 

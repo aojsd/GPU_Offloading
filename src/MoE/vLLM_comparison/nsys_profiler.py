@@ -60,7 +60,6 @@ KERNEL_RULES = [
     ("rms_norm",                        "RMSNorm"),
     ("nvjet",                           "Linear (cuBLAS)"),
     ("gemm",                            "Linear (cuBLAS)"),
-    ("cutlass",                         "Linear (cuBLAS)"),
     ("cublasLt",                        "Linear (cuBLAS)"),
     ("ampere_sgemm",                    "Linear (cuBLAS)"),
     ("gatherTopK",                      "Router (topk)"),

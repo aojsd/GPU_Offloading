@@ -110,6 +110,10 @@ def _moe_align_block_size_torch(topk_ids, num_experts, block_size,
     cum_blocks[1:] = torch.cumsum(n_blocks, dim=0)
     block_positions = torch.arange(expert_ids.shape[0], device=topk_ids.device, dtype=torch.int32)
     expert_ids[:] = torch.searchsorted(cum_blocks[1:].contiguous(), block_positions, right=True)
+    # Clamp padding blocks to valid range. Blocks beyond num_tokens_post_padded
+    # are never processed by the Triton kernel, but expert_map[expert_ids] would
+    # OOB if searchsorted returns num_experts for these padding positions.
+    expert_ids.clamp_(max=num_experts - 1)
 
     num_tokens_post_pad.fill_(0)
     num_tokens_post_pad[0] = cum_padded[-1]
@@ -172,6 +176,8 @@ class MoEEngine:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         use_torch_compile: bool = True,
+        gpu_expert_budget: int = None,
+        experts_per_layer: int = None,
     ):
         self.device = device
         self.dtype = dtype
@@ -179,6 +185,15 @@ class MoEEngine:
         self.max_seq_len = max_seq_len
         self.page_size = page_size
         self.use_torch_compile = use_torch_compile
+
+        # Support both names during transition
+        if experts_per_layer is not None:
+            self.experts_per_layer = experts_per_layer
+        elif gpu_expert_budget is not None:
+            self.experts_per_layer = gpu_expert_budget
+        else:
+            self.experts_per_layer = None
+        self.gpu_expert_budget = self.experts_per_layer  # alias for compat
 
         # Load config
         with open(Path(model_path) / "config.json") as f:
@@ -256,35 +271,78 @@ class MoEEngine:
             self._workspace_buf, kv_layout="NHD", use_cuda_graph=False)
         # No prefill wrapper needed — FA3 (flash_attn_varlen_func) is stateless
 
-        # Guard: check model fits on GPU
-        mem_gb = torch.cuda.memory_allocated() / 1024**3
-        gpu_total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        if mem_gb > gpu_total_gb * 0.95:
-            raise NotImplementedError(
-                f"Model requires {mem_gb:.1f} GB but GPU has {gpu_total_gb:.0f} GB. "
-                f"Expert offloading is not yet implemented.")
+        # Guard: check model fits on GPU (skip in offloading mode — experts on CPU)
+        if self.experts_per_layer is None:
+            mem_gb = torch.cuda.memory_allocated() / 1024**3
+            gpu_total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            if mem_gb > gpu_total_gb * 0.95:
+                raise RuntimeError(
+                    f"Model requires {mem_gb:.1f} GB but GPU has "
+                    f"{gpu_total_gb:.0f} GB. Use experts_per_layer=K to enable "
+                    f"expert offloading (K expert cache slots per layer).")
+
+        # Expert offload engine — auto-created when experts_per_layer is set.
+        # Handles demand loading of non-resident experts between stage4a
+        # (routing) and stage4b (MoE compute) in piecewise CUDA graph replay.
+        if self.experts_per_layer is not None:
+            from expert_offload_engine import ExpertOffloadEngine
+            self.offload_engine = ExpertOffloadEngine(self)
+        else:
+            self.offload_engine = None
 
         model_type = cfg.get("model_type", "unknown")
+        budget_str = (f", experts_per_layer={self.experts_per_layer}"
+                      if self.experts_per_layer is not None else "")
         print(f"MoEEngine ready ({model_type}): {self.num_layers}L, "
               f"{self.num_experts}E (top-{self.top_k}), "
               f"hidden={self.hidden_size}, heads={self.num_heads}, "
               f"qk_norm={self.has_qk_norm}, norm_topk={self.norm_topk_prob}, "
-              f"torch_compile={use_torch_compile}")
+              f"torch_compile={use_torch_compile}{budget_str}")
+
+    # ── MoE Kernel Dispatch ──────────────────────────────────────────
+
+    def _moe_experts(self, hidden_states, w1, w2, topk_weights, topk_ids,
+                     expert_map=None):
+        """Dispatch MoE computation to vLLM Triton fused_experts.
+
+        Args:
+            hidden_states: [N, H] input hidden states
+            w1: [E, 2*I, H] gate+up fused weights
+            w2: [E, H, I] down projection weights
+            topk_weights: [N, top_k] routing weights
+            topk_ids: [N, top_k] expert indices (global IDs)
+            expert_map: [E] int32 mapping global expert_id -> cache slot (or None)
+        """
+        kwargs = {}
+        if expert_map is not None:
+            kwargs['expert_map'] = expert_map
+            kwargs['global_num_experts'] = self.num_experts
+        return fused_experts(
+            hidden_states=hidden_states, w1=w1, w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids.to(torch.int32),
+            **kwargs)
 
     # ── Weight Loading ───────────────────────────────────────────────
 
     def _load_weights(self, model_path: str):
         model_path = Path(model_path)
+        offloading = self.experts_per_layer is not None
+
+        # When offloading, load to CPU first to avoid GPU OOM on large models.
+        # Non-expert weights (~3 GB) move to GPU; expert weights stay on CPU.
+        load_device = "cpu" if offloading else self.device
+
         weights = {}
         for shard in sorted(model_path.glob("model-*.safetensors")):
-            with safe_open(str(shard), framework="pt", device=self.device) as f:
+            with safe_open(str(shard), framework="pt", device=load_device) as f:
                 for key in f.keys():
                     weights[key] = f.get_tensor(key).to(self.dtype)
 
-        # Global weights
-        self.embed_tokens = weights.pop("model.embed_tokens.weight")
-        self.final_norm = weights.pop("model.norm.weight")
-        self.lm_head = weights.pop("lm_head.weight")
+        # Global weights (ensure on GPU)
+        self.embed_tokens = weights.pop("model.embed_tokens.weight").to(self.device)
+        self.final_norm = weights.pop("model.norm.weight").to(self.device)
+        self.lm_head = weights.pop("lm_head.weight").to(self.device)
 
         # Per-layer weights
         self.input_layernorm = []
@@ -296,30 +354,85 @@ class MoEEngine:
         self.q_norm = []
         self.k_norm = []
         self.router = []
-        self.w1 = []
-        self.w2 = []
 
         # Detect Q/K norm from first layer's weights
         self.has_qk_norm = f"model.layers.0.self_attn.q_norm.weight" in weights
 
+        # Expert weight storage depends on mode
+        if offloading:
+            experts_per_layer = self.experts_per_layer
+            I = self.intermediate_size
+            H = self.hidden_size
+            E = self.num_experts
+            # Scratchpad must hold all experts that could be non-resident in
+            # a single layer. With batch_size=B and top_k=K, up to min(E, B*K)
+            # unique experts per layer could be needed. Use E to cover all cases.
+            scratchpad = E
+            total_slots = self.num_layers * experts_per_layer + scratchpad
+
+            # CPU pinned storage for all experts
+            self.w1_cpu = []
+            self.w2_cpu = []
+
+            # Unified GPU buffer: all layers' residents + scratchpad
+            self.w1_buf = torch.zeros(total_slots, 2 * I, H, dtype=self.dtype,
+                                      device=self.device)
+            self.w2_buf = torch.zeros(total_slots, H, I, dtype=self.dtype,
+                                      device=self.device)
+
+            # Expert maps
+            self.expert_map = []      # relative (for per-layer views)
+            self.expert_map_abs = []  # absolute (for full buffer in stage4b)
+            self.expert_map_buf = torch.full((E,), -1, dtype=torch.int32,
+                                             device=self.device)
+
+            # Per-layer views (zero-copy into unified buffer)
+            self.w1 = []
+            self.w2 = []
+
+            self.scratchpad_start = self.num_layers * experts_per_layer
+            self.scratchpad_slots = scratchpad
+
+            buf_bytes = (self.w1_buf.numel() * self.w1_buf.element_size() +
+                         self.w2_buf.numel() * self.w2_buf.element_size())
+            print(f"  Unified buffer: {total_slots} slots "
+                  f"({self.num_layers}L x {experts_per_layer} experts_per_layer"
+                  f" + {scratchpad} scratchpad), "
+                  f"w1_buf {list(self.w1_buf.shape)}, "
+                  f"w2_buf {list(self.w2_buf.shape)} "
+                  f"({buf_bytes / 1e9:.2f} GB)")
+        else:
+            self.w1 = []
+            self.w2 = []
+
         for l in range(self.num_layers):
             p = f"model.layers.{l}"
-            self.input_layernorm.append(weights.pop(f"{p}.input_layernorm.weight"))
-            self.post_attn_layernorm.append(weights.pop(f"{p}.post_attention_layernorm.weight"))
-            self.q_proj.append(weights.pop(f"{p}.self_attn.q_proj.weight"))
-            self.k_proj.append(weights.pop(f"{p}.self_attn.k_proj.weight"))
-            self.v_proj.append(weights.pop(f"{p}.self_attn.v_proj.weight"))
-            self.o_proj.append(weights.pop(f"{p}.self_attn.o_proj.weight"))
+            # Attention + norm weights → GPU
+            self.input_layernorm.append(
+                weights.pop(f"{p}.input_layernorm.weight").to(self.device))
+            self.post_attn_layernorm.append(
+                weights.pop(f"{p}.post_attention_layernorm.weight").to(self.device))
+            self.q_proj.append(
+                weights.pop(f"{p}.self_attn.q_proj.weight").to(self.device))
+            self.k_proj.append(
+                weights.pop(f"{p}.self_attn.k_proj.weight").to(self.device))
+            self.v_proj.append(
+                weights.pop(f"{p}.self_attn.v_proj.weight").to(self.device))
+            self.o_proj.append(
+                weights.pop(f"{p}.self_attn.o_proj.weight").to(self.device))
             if self.has_qk_norm:
-                self.q_norm.append(weights.pop(f"{p}.self_attn.q_norm.weight"))
-                self.k_norm.append(weights.pop(f"{p}.self_attn.k_norm.weight"))
+                self.q_norm.append(
+                    weights.pop(f"{p}.self_attn.q_norm.weight").to(self.device))
+                self.k_norm.append(
+                    weights.pop(f"{p}.self_attn.k_norm.weight").to(self.device))
             # Router key: OLMoE uses "mlp.gate", Mixtral uses "block_sparse_moe.gate"
             router_key = f"{p}.mlp.gate.weight"
             if router_key not in weights:
                 router_key = f"{p}.block_sparse_moe.gate.weight"
-            self.router.append(weights.pop(router_key))
+            self.router.append(weights.pop(router_key).to(self.device))
 
-            # Fuse expert weights: w1 = cat(gate, up) [E, 2*I, H], w2 = down [E, H, I]
+            # Fuse expert weights: w1 = [E, 2*I, H], w2 = down [E, H, I]
+            # Triton fused_experts: w1 = cat(gate, up)
             # Key format: OLMoE: "mlp.experts.{e}", Mixtral: "block_sparse_moe.experts.{e}"
             w1_list, w2_list = [], []
             for e in range(self.num_experts):
@@ -337,18 +450,67 @@ class MoEEngine:
                     down = weights.pop(f"{expert_prefix}.w2.weight")
                 w1_list.append(torch.cat([gate, up], dim=0))
                 w2_list.append(down)
-            self.w1.append(torch.stack(w1_list))
-            self.w2.append(torch.stack(w2_list))
-            print(f"  Layer {l}: w1 {self.w1[-1].shape}, w2 {self.w2[-1].shape}")
+
+            if offloading:
+                # Stack on CPU and pin for fast DMA transfers
+                w1_full = torch.stack(w1_list).pin_memory()  # [E, 2*I, H]
+                w2_full = torch.stack(w2_list).pin_memory()  # [E, H, I]
+                self.w1_cpu.append(w1_full)
+                self.w2_cpu.append(w2_full)
+
+                # Populate unified buffer: first experts_per_layer experts
+                base = l * experts_per_layer
+                copy_n = min(experts_per_layer, E)
+                for slot in range(copy_n):
+                    self.w1_buf[base + slot].copy_(w1_full[slot])
+                    self.w2_buf[base + slot].copy_(w2_full[slot])
+
+                # Per-layer views (zero-copy into unified buffer)
+                self.w1.append(self.w1_buf[base : base + experts_per_layer])
+                self.w2.append(self.w2_buf[base : base + experts_per_layer])
+
+                # Relative expert_map: first experts_per_layer → 0..N-1
+                emap_rel = torch.full((E,), -1, dtype=torch.int32,
+                                      device=self.device)
+                for slot in range(copy_n):
+                    emap_rel[slot] = slot
+                self.expert_map.append(emap_rel)
+
+                # Absolute expert_map: first experts_per_layer → base..base+N-1
+                emap_abs = torch.full((E,), -1, dtype=torch.int32,
+                                      device=self.device)
+                for slot in range(copy_n):
+                    emap_abs[slot] = base + slot
+                self.expert_map_abs.append(emap_abs)
+
+                print(f"  Layer {l}: w1_cpu {w1_full.shape}, "
+                      f"view [{base}:{base+experts_per_layer}] in unified "
+                      f"buffer, expert_map [{copy_n} resident / {E} total]")
+            else:
+                self.w1.append(torch.stack(w1_list))
+                self.w2.append(torch.stack(w2_list))
+                print(f"  Layer {l}: w1 {self.w1[-1].shape}, "
+                      f"w2 {self.w2[-1].shape}")
 
         del weights
         torch.cuda.empty_cache()
 
-        # Shape verification (before stacking)
+        # Initialize expert_map_buf with layer 0's absolute map for warmup
+        if offloading:
+            self.expert_map_buf.copy_(self.expert_map_abs[0])
+
+        # Shape verification
         assert self.embed_tokens.shape == (self.vocab_size, self.hidden_size)
         assert self.lm_head.shape == (self.vocab_size, self.hidden_size)
-        assert self.w1[0].shape == (self.num_experts, 2 * self.intermediate_size, self.hidden_size)
-        assert self.w2[0].shape == (self.num_experts, self.hidden_size, self.intermediate_size)
+        if offloading:
+            experts_per_layer = self.experts_per_layer
+            assert self.w1[0].shape == (experts_per_layer, 2 * self.intermediate_size, self.hidden_size)
+            assert self.w2[0].shape == (experts_per_layer, self.hidden_size, self.intermediate_size)
+            assert self.w1_buf.shape[0] == self.num_layers * experts_per_layer + self.scratchpad_slots
+            assert self.w1_cpu[0].shape == (self.num_experts, 2 * self.intermediate_size, self.hidden_size)
+        else:
+            assert self.w1[0].shape == (self.num_experts, 2 * self.intermediate_size, self.hidden_size)
+            assert self.w2[0].shape == (self.num_experts, self.hidden_size, self.intermediate_size)
 
         # Stack per-layer weights into single tensors for indexed access.
         self.input_layernorm = torch.stack(self.input_layernorm)    # [L, H]
@@ -375,6 +537,14 @@ class MoEEngine:
         angles = torch.outer(positions, inv_freq)
         return torch.cat([torch.cos(angles), torch.sin(angles)], dim=-1)  # [max_seq, head_dim]
 
+    # ── Offloading ────────────────────────────────────────────────────
+
+    @property
+    def offloading_active(self):
+        """True when experts_per_layer < num_experts (some experts on CPU)."""
+        return (self.experts_per_layer is not None
+                and self.experts_per_layer < self.num_experts)
+
     # ── Prefill ──────────────────────────────────────────────────────
 
     @torch.no_grad()
@@ -384,6 +554,8 @@ class MoEEngine:
         Args: input_ids [B, S]
         Returns: logits [B, S, vocab_size]
         Requires: capture_prefill_cuda_graph() called with sufficient sizes.
+        Prefill always uses flat CUDA graph (no offload engine hook — offloading
+        targets decode only, as in prefill-decode disaggregated systems).
         """
         B, S = input_ids.shape
         total = B * S
@@ -536,8 +708,19 @@ class MoEEngine:
         """Single decode step.
         Args: token_ids [B], positions [B]
         Returns: logits [B, vocab_size]
+        When offload_engine is present, routes through piecewise mixed_step.
         """
         B = token_ids.shape[0]
+
+        if self.offload_engine:
+            # Route through mixed_step for piecewise graphs + offload engine hook.
+            # decode_step assumes contiguous slots [0..B-1].
+            return self.mixed_step(
+                decode_seq_ids=list(range(B)),
+                decode_token_ids=token_ids,
+                prefill_seq_ids=[],
+                prefill_input_ids=[])
+
         if hasattr(self, '_cuda_graphs') and B in self._cuda_graphs:
             return self._decode_step_graphed(token_ids, positions)
 
@@ -608,9 +791,10 @@ class MoEEngine:
         if self.norm_topk_prob:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-        hidden = fused_experts(
-            hidden_states=hidden, w1=self.w1[layer], w2=self.w2[layer],
-            topk_weights=topk_weights, topk_ids=topk_ids.to(torch.int32))
+        expert_map = (self.expert_map[layer]
+                      if self.experts_per_layer is not None else None)
+        hidden = self._moe_experts(hidden, self.w1[layer], self.w2[layer],
+                                   topk_weights, topk_ids, expert_map)
 
         return residual + hidden
 
@@ -670,8 +854,18 @@ class MoEEngine:
             input_ids: [S] token IDs (1-D)
         Returns:
             logits: [S, vocab_size]
-        Requires: capture_prefill_cuda_graph() called with sufficient sizes.
+        Requires: capture_prefill_cuda_graph() (flat) or capture_mixed_cuda_graphs()
+        (piecewise, when offloading) called with sufficient sizes.
+        When offload_engine is active, uses piecewise graphs via mixed_step()
+        to enable expert demand-loading between stage4a and stage4b.
         """
+        if self.offload_engine:
+            return self.mixed_step(
+                decode_seq_ids=[],
+                decode_token_ids=torch.empty(0, dtype=torch.long,
+                                             device=self.device),
+                prefill_seq_ids=[seq_id],
+                prefill_input_ids=[input_ids])
         S = input_ids.shape[0]
         padded_N = self._find_nearest_prefill_total(S)
         return self._prefill_graphed_flat(input_ids, [S], [seq_id], padded_N)
@@ -689,11 +883,22 @@ class MoEEngine:
             input_ids: list[Tensor] (variable-length 1D) or Tensor [B, S] (same-length)
         Returns:
             logits: Tensor [N_total, vocab_size] (flat)
-        Requires: capture_prefill_cuda_graph() called with sufficient sizes.
+        Requires: capture_prefill_cuda_graph() (flat) or capture_mixed_cuda_graphs()
+        (piecewise, when offloading) called with sufficient sizes.
+        When offload_engine is active, uses piecewise graphs via mixed_step()
+        to enable expert demand-loading between stage4a and stage4b.
         """
         # Normalize to list of 1D tensors
         if isinstance(input_ids, torch.Tensor) and input_ids.dim() == 2:
             input_ids = [input_ids[i] for i in range(input_ids.shape[0])]
+
+        if self.offload_engine:
+            return self.mixed_step(
+                decode_seq_ids=[],
+                decode_token_ids=torch.empty(0, dtype=torch.long,
+                                             device=self.device),
+                prefill_seq_ids=list(seq_ids),
+                prefill_input_ids=list(input_ids))
 
         seq_lengths = [ids.shape[0] for ids in input_ids]
         total = sum(seq_lengths)
@@ -924,9 +1129,10 @@ class MoEEngine:
         if self.norm_topk_prob:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-        hidden = fused_experts(
-            hidden_states=hidden, w1=self.w1[layer], w2=self.w2[layer],
-            topk_weights=topk_weights, topk_ids=topk_ids.to(torch.int32))
+        expert_map = (self.expert_map[layer]
+                      if self.experts_per_layer is not None else None)
+        hidden = self._moe_experts(hidden, self.w1[layer], self.w2[layer],
+                                   topk_weights, topk_ids, expert_map)
 
         return residual + hidden
 
@@ -989,11 +1195,57 @@ class MoEEngine:
         if self.norm_topk_prob:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-        hidden = fused_experts(
-            hidden_states=hidden, w1=self.w1[layer], w2=self.w2[layer],
-            topk_weights=topk_weights, topk_ids=topk_ids.to(torch.int32))
+        expert_map = (self.expert_map[layer]
+                      if self.experts_per_layer is not None else None)
+        hidden = self._moe_experts(hidden, self.w1[layer], self.w2[layer],
+                                   topk_weights, topk_ids, expert_map)
 
         hidden_out.copy_(residual + hidden)
+
+    def _layer_stage4a_router(self, attn_out, residual, layer,
+                              moe_input_buf, moe_residual_buf,
+                              topk_weights_buf, topk_ids_buf):
+        """Stage 4a: O proj -> residual -> norm -> router -> topk.
+
+        Writes routing decisions into buffers for CPU-side inspection between
+        stage4a and stage4b. Used for expert offloading (demand loading between
+        the two sub-stages).
+        """
+        H = self.hidden_size
+        hidden = residual + F.linear(attn_out, self.o_proj[layer])
+        moe_residual_buf.copy_(hidden)
+        hidden = F.rms_norm(hidden, (H,), self.post_attn_layernorm[layer],
+                            self.rms_norm_eps)
+        moe_input_buf.copy_(hidden)
+
+        router_logits = F.linear(hidden, self.router[layer])
+        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+        topk_weights, topk_ids = torch.topk(routing_weights, self.top_k, dim=-1)
+        if self.norm_topk_prob:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights_buf.copy_(topk_weights)
+        topk_ids_buf.copy_(topk_ids)
+
+    def _layer_stage4b_moe(self, moe_input_buf, moe_residual_buf,
+                           topk_weights_buf, topk_ids_buf, hidden_out, layer):
+        """Stage 4b: MoE compute -> residual add.
+
+        Reads routing decisions and post-norm hidden states from buffers,
+        runs MoE, writes output into hidden_out for next layer.
+
+        When experts_per_layer is set (offloading mode), reads from the unified
+        buffer (w1_buf/w2_buf/expert_map_buf). The caller must update
+        expert_map_buf with this layer's absolute map before calling this.
+        """
+        if self.experts_per_layer is not None:
+            w1, w2 = self.w1_buf, self.w2_buf
+            expert_map = self.expert_map_buf
+        else:
+            w1, w2 = self.w1[layer], self.w2[layer]
+            expert_map = None
+        hidden = self._moe_experts(moe_input_buf, w1, w2,
+                                   topk_weights_buf, topk_ids_buf, expert_map)
+        hidden_out.copy_(moe_residual_buf + hidden)
 
     def _full_mixed_graph_body(self, all_token_ids, positions, slot_mapping,
                                num_decode_tokens, decode_wrapper,
@@ -1039,6 +1291,12 @@ class MoEEngine:
             return self._mixed_step_piecewise(
                 decode_seq_ids, decode_token_ids,
                 prefill_seq_ids, prefill_input_ids, graph_N)
+
+        if self.offload_engine:
+            raise RuntimeError(
+                f"No piecewise CUDA graph covers {N_total} tokens. "
+                f"Offload engine requires piecewise graphs. "
+                f"Call capture_mixed_cuda_graphs() with sizes >= {N_total}.")
 
         # ── Eager fallback below ──
 
@@ -1116,11 +1374,14 @@ class MoEEngine:
                                   use_torch_compile=None):
         """Capture per-layer piecewise CUDA graphs for mixed batches.
 
-        For each N in total_token_sizes, captures 2 graphs per layer:
-          - Stage 1: RMSNorm -> QKV -> Q/K norm -> RoPE -> KV cache write
-          - Stage 4: O proj -> residual add -> post-attn norm -> MoE
+        For each N in total_token_sizes, captures 3 graphs per layer:
+          - Stage 1:  RMSNorm -> QKV -> Q/K norm -> RoPE -> KV cache write
+          - Stage 4a: O proj -> residual -> norm -> router -> topk
+          - Stage 4b: fused_experts -> residual add
 
         Stages 2 & 3 (attention) run eagerly — single kernel each.
+        The split between 4a and 4b creates a CPU break where the offload
+        engine can inspect routing decisions and load missing experts.
 
         Args:
             total_token_sizes: List of total token counts to capture
@@ -1137,10 +1398,12 @@ class MoEEngine:
 
         # Optionally compile stage functions
         stage1_fn = self._layer_stage1_pre_attn
-        stage4_fn = self._layer_stage4_post_attn
+        stage4a_fn = self._layer_stage4a_router
+        stage4b_fn = self._layer_stage4b_moe
         if use_torch_compile:
             stage1_fn = torch.compile(stage1_fn, fullgraph=False)
-            stage4_fn = torch.compile(stage4_fn, fullgraph=False)
+            stage4a_fn = torch.compile(stage4a_fn, fullgraph=False)
+            stage4b_fn = torch.compile(stage4b_fn, fullgraph=False)
 
         for N in total_token_sizes:
             self.reset()
@@ -1158,6 +1421,17 @@ class MoEEngine:
                                        dtype=self.dtype, device=self.device)
             hidden_buf = torch.zeros(N, self.hidden_size,
                                      dtype=self.dtype, device=self.device)
+
+            # Buffers for split stage 4 (between stage4a and stage4b)
+            moe_input_buf = torch.zeros(N, self.hidden_size,
+                                        dtype=self.dtype, device=self.device)
+            moe_residual_buf = torch.zeros(N, self.hidden_size,
+                                           dtype=self.dtype, device=self.device)
+            topk_weights_buf = torch.zeros(N, self.top_k,
+                                           dtype=torch.float32,
+                                           device=self.device)
+            topk_ids_buf = torch.zeros(N, self.top_k, dtype=torch.int64,
+                                       device=self.device)
 
             # Static inputs (same for all layers within a step)
             static_positions = (torch.arange(N, dtype=torch.int32,
@@ -1180,12 +1454,21 @@ class MoEEngine:
                               q_buf, k_buf, v_buf, residual_buf)
                     # Fake attention output for warmup
                     attn_out_buf.copy_(q_buf.reshape(N, -1))
-                    stage4_fn(attn_out_buf, residual_buf, hidden_buf, layer)
+                    stage4a_fn(attn_out_buf, residual_buf, layer,
+                               moe_input_buf, moe_residual_buf,
+                               topk_weights_buf, topk_ids_buf)
+                    # Update expert_map for this layer (offloading)
+                    if self.experts_per_layer is not None:
+                        self.expert_map_buf.copy_(self.expert_map_abs[layer])
+                    stage4b_fn(moe_input_buf, moe_residual_buf,
+                               topk_weights_buf, topk_ids_buf,
+                               hidden_buf, layer)
             torch.cuda.synchronize()
 
             # ── Capture per-layer graphs ──
             stage1_graphs = []
-            stage4_graphs = []
+            stage4a_graphs = []
+            stage4b_graphs = []
 
             # Re-init hidden for capture
             hidden_buf.copy_(F.embedding(static_token_ids,
@@ -1203,22 +1486,40 @@ class MoEEngine:
                 # Simulate attention (write something into attn_out_buf)
                 attn_out_buf.copy_(q_buf.reshape(N, -1))
 
-                # Capture stage 4
-                g4 = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g4):
-                    stage4_fn(attn_out_buf, residual_buf, hidden_buf,
-                              layer)
-                stage4_graphs.append(g4)
+                # Capture stage 4a (router)
+                g4a = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g4a):
+                    stage4a_fn(attn_out_buf, residual_buf, layer,
+                               moe_input_buf, moe_residual_buf,
+                               topk_weights_buf, topk_ids_buf)
+                stage4a_graphs.append(g4a)
+
+                # Update expert_map for stage4b (offloading mode)
+                if self.experts_per_layer is not None:
+                    self.expert_map_buf.copy_(self.expert_map_abs[layer])
+
+                # Capture stage 4b (MoE)
+                g4b = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g4b):
+                    stage4b_fn(moe_input_buf, moe_residual_buf,
+                               topk_weights_buf, topk_ids_buf,
+                               hidden_buf, layer)
+                stage4b_graphs.append(g4b)
 
             self._piecewise_graphs[N] = {
                 'stage1_graphs': stage1_graphs,
-                'stage4_graphs': stage4_graphs,
+                'stage4a_graphs': stage4a_graphs,
+                'stage4b_graphs': stage4b_graphs,
                 'q_buf': q_buf,
                 'k_buf': k_buf,
                 'v_buf': v_buf,
                 'attn_out_buf': attn_out_buf,
                 'residual_buf': residual_buf,
                 'hidden_buf': hidden_buf,
+                'moe_input_buf': moe_input_buf,
+                'moe_residual_buf': moe_residual_buf,
+                'topk_weights_buf': topk_weights_buf,
+                'topk_ids_buf': topk_ids_buf,
                 'static_positions': static_positions,
                 'static_slot_mapping': static_slot_mapping,
                 'static_token_ids': static_token_ids,
@@ -1226,7 +1527,7 @@ class MoEEngine:
 
             compile_str = " + torch.compile" if use_torch_compile else ""
             print(f"  Piecewise CUDA graphs{compile_str} captured for "
-                  f"N={N} ({self.num_layers * 2} graphs)")
+                  f"N={N} ({self.num_layers * 3} graphs)")
 
     def _find_nearest_piecewise_graph(self, total_tokens):
         """Find smallest piecewise graph with N >= total_tokens, or None."""
@@ -1243,8 +1544,12 @@ class MoEEngine:
 
         Stage 1 & 4 are CUDA graphs (keyed by N_total).
         Stage 2 (FlashInfer decode) & Stage 3 (FA3 prefill) run eagerly.
+        Automatically advances the offload engine's step counter.
         """
         info = self._piecewise_graphs[graph_N]
+
+        if self.offload_engine:
+            self.offload_engine.begin_step()
         D = len(decode_seq_ids)
         prefill_lengths = [ids.shape[0] for ids in prefill_input_ids]
         N_actual = D + sum(prefill_lengths)
@@ -1354,8 +1659,24 @@ class MoEEngine:
             if N_actual < graph_N:
                 attn_out_buf[N_actual:].zero_()
 
-            # Stage 4: post-attention (CUDA graph)
-            info['stage4_graphs'][layer].replay()
+            # Stage 4a: router (CUDA graph)
+            info['stage4a_graphs'][layer].replay()
+
+            # ── CPU break: update expert_map + demand-load missing experts ──
+            # process_layer is the single call that guarantees all selected
+            # experts have valid weights before stage4b. It copies
+            # expert_map_abs[layer] → expert_map_buf, then loads any
+            # non-resident experts from CPU into the scratchpad.
+            if self.offload_engine:
+                self.offload_engine.process_layer(
+                    layer, info['topk_ids_buf'], N_actual)
+
+            # Stage 4b: MoE (CUDA graph)
+            info['stage4b_graphs'][layer].replay()
+
+            # Clean up demand-loaded experts after MoE computation
+            if self.offload_engine:
+                self.offload_engine.post_layer(layer)
 
         # ── 8. Final norm + lm_head (eager — single kernel each) ──
         hidden = info['hidden_buf']

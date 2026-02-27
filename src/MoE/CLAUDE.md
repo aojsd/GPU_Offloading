@@ -14,7 +14,7 @@ After reasonable checkpoints, or when finding a critical bug, summarize importan
 
 Aim to write most, if not all, code in Python/Pytorch or Pytorch-compatible packages.
 
-DO NOT commit or push using Git unless explicitly asked to do so.
+For PyTorch code, we are utterly uninterested in completely eager execution when it comes to real experiments or any test that is performance related.
 
 ---
 
@@ -83,13 +83,13 @@ for each layer:
 
 ## Implementation Phases
 
-1. **Core Compute Engine** (complete): Custom MoE engine with CUDA graph + torch.compile, validated against vLLM SOTA on OLMoE-1B-7B. See [decode.md](vLLM_comparison/decode.md) and [prefill.md](vLLM_comparison/prefill.md) for detailed performance data.
-2. **Mixed Batch Support** (complete): Mixed prefill+decode batches via `mixed_step()`, trace-and-replay benchmark vs vLLM. See [mixed_batch.md](vLLM_comparison/mixed_batch.md).
-   - **Piecewise CUDA Graphs** (merged into `moe_engine.py`): Per-layer 4-stage decomposition eliminates eager dispatch overhead on mixed batches. Correctness: bit-identical to eager (260/260 tokens, full logit match). Performance: mixed steps 2.03x faster than vLLM, overall staggered 1.19x (was 1.11x). Cross-engine correctness: **80.4% token match vs vLLM without torch.compile** (expected BF16 divergence). The 4% match with torch.compile is confirmed Inductor numerical noise (CUDA graphs add zero error). See [mixed_batch.md](vLLM_comparison/mixed_batch.md).
-3. **Expert Cache & Async Transfer** (not started): Double-buffered GPU expert slots, CPU pinned memory, three CUDA streams.
-4. **Trace Format & Replay Controller** (not started): Replay loop with data movement orchestration + timing.
-5. **Trace Collection** (not started): Hook router to record expert selections per layer per token.
-6. **Policy Simulation** (not started): LRU, Oracle/Belady, frequency-based, pre-gated policies.
+1. **Core Compute Engine** (complete): Custom MoE engine with CUDA graph + torch.compile, validated against vLLM on OLMoE-1B-7B and Mixtral-8x7B. See [decode.md](vLLM_comparison/decode.md) and [prefill.md](vLLM_comparison/prefill.md).
+2. **Mixed Batch Support** (complete): Mixed prefill+decode via `mixed_step()`, piecewise CUDA graphs (per-layer 4-stage decomposition). 80.4% token match vs vLLM without compile (expected BF16 divergence). See [mixed_batch.md](vLLM_comparison/mixed_batch.md).
+3. **Simulated Expert Offloading** (complete): Split stage 4 into 4a (router) + 4b (MoE) with CPU break. ExpertOffloadEngine demand-loads missing experts, records traces. Verified bit-identical + predicted latency = compute + IO. See [offload_1GPU.md](offload_1GPU.md).
+4. **Unified Expert Cache** (complete): Single `w1_buf[L*epl + scratchpad, 2*I, H]` buffer with per-layer views. Eliminated D2D copies (was 14.8 ms/step on 32L). Compute parity 36/36 checks passed. Latency model `wall = compute + IO` validated across 88 experiments (prefill, mixed batch, decode): Mixtral-20L +0.5%, Mixtral-32L +0.6%, OLMoE +8.7% (Python dispatch overhead with many small transfers). IO accounts for 90-96% of wall-clock time. See [offload_1GPU.md](offload_1GPU.md).
+5. **Async Transfer & Prefetch** (not started): Overlap CPU→GPU transfers with attention compute via multiple CUDA streams.
+6. **Trace Format & Replay Controller** (not started): Replay loop with data movement orchestration + timing.
+7. **Policy Simulation** (not started): LRU, Oracle/Belady, frequency-based, pre-gated policies.
 
 ---
 
@@ -245,31 +245,56 @@ See [decode.md](vLLM_comparison/decode.md) and [prefill.md](vLLM_comparison/pref
 
 | File | Purpose |
 |------|---------|
-| `moe_engine.py` | `MoEEngine` — model-agnostic engine with mixed batch support, piecewise + monolithic CUDA graphs, torch.compile |
+| `moe_engine.py` | `MoEEngine` — model-agnostic engine with mixed batch, piecewise CUDA graphs, torch.compile, unified expert cache |
+| `expert_offload_engine.py` | `ExpertOffloadEngine` — scratchpad demand loading into unified buffer, residency tracking, trace recording. Auto-created by MoEEngine when `experts_per_layer` is set. |
+| `offload_1GPU.md` | Expert offloading research notes, Phases 1-3 implementation docs + performance data |
 | `models/download.sh` | Download model weights (OLMoE, Mixtral) |
 | `models/truncate_model.py` | Truncate model to N layers (for fitting large models on single GPU) |
 | `vLLM_comparison/microbenchmark.py` | Consolidated benchmarks: decode, prefill, CUDA graph correctness, mixed smoke tests |
 | `vLLM_comparison/trace_replay.py` | Trace-and-replay benchmark: run vLLM, trace batches, replay on custom engine |
 | `vLLM_comparison/nsys_profiler.py` | Nsight Systems kernel profiling: Custom vs vLLM (decode + prefill) |
-| `vLLM_comparison/profiling/<model>/` | Per-seq-len kernel profiles (`decode_seq{N}.prof`, `prefill_seq{N}.prof`) |
 | `vLLM_comparison/decode.md` | Decode pipeline details, profiling data, challenges |
 | `vLLM_comparison/prefill.md` | Prefill pipeline details, profiling data, gap analysis, challenges |
 | `vLLM_comparison/mixed_batch.md` | Mixed prefill+decode batch support: design, piecewise CUDA graph plan |
+| `tests/README.md` | Index of all test/benchmark scripts with descriptions and quick start |
 
 Regenerate decode profiles: `python src/MoE/vLLM_comparison/nsys_profiler.py all`
 Regenerate prefill profiles: `python src/MoE/vLLM_comparison/nsys_profiler.py prefill`
 
 ---
 
-## Next: Expert Cache & Async Transfer (Phase 3)
+## Expert Offloading Infrastructure
 
-Engine now supports mixed prefill+decode batches and beats vLLM on realistic workloads.
-Next step: expert offloading infrastructure for Mixtral-8x7B.
+### Architecture: Unified Expert Cache (Phase 3 — Complete)
 
-Key questions:
-- Double-buffered GPU expert slots: how many slots needed? Which eviction policy?
-- Three CUDA streams: compute, prefetch, demand_load — synchronization model?
-- CPU pinned memory layout for 256 experts (~86 GB total)
-- PCIe transfer overlap with attention compute (expert prefetch during attention)
+Single GPU buffer holds all resident experts at fixed slots. No D2D copies — only a
+32-byte `expert_map_buf` copy per layer. Piecewise CUDA graphs (stage4a/4b split) allow
+CPU-side offloader intervention between router and MoE compute.
+
+```
+w1_buf = [L * epl + scratchpad_slots, 2*I, H]  # unified GPU buffer
+w2_buf = [L * epl + scratchpad_slots, H, I]
+
+Layer l residents:  slots [l*epl, ..., (l+1)*epl - 1]  (per-layer views = zero-copy)
+Scratchpad:         slots [L*epl, ..., L*epl + E - 1]  (demand-loaded non-residents)
+```
+
+Two expert maps per layer: `expert_map[l]` (relative indices for views) and
+`expert_map_abs[l]` (absolute buffer indices for piecewise stage4b).
+
+**ExpertOffloadEngine** (`expert_offload_engine.py`): Auto-created by MoEEngine when
+`experts_per_layer` is set. Reads routing decisions after stage4a, loads missing experts
+from CPU pinned memory into scratchpad, updates `expert_map_buf`, records trace of
+activations and transfer times. Step counting is automatic (`begin_step()` called by
+engine at the start of each piecewise decode step).
+
+**MoE kernel**: vLLM Triton `fused_experts` only. CUTLASS support was removed (Triton
+showed better consistency: 36/36 compute parity checks passed across 3 models).
+
+**IMPORTANT**: Eager mode is NOT used in real experiments. It exists only for sanity
+checks in test files. All benchmarking and offloading experiments MUST use CUDA graphs
+(piecewise for offloading, flat for non-offloading baselines).
+
+See [offload_1GPU.md](offload_1GPU.md) for full design, memory budget, and benchmarks.
 
 ---

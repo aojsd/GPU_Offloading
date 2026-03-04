@@ -289,6 +289,7 @@ class MoEEngine:
             self.offload_engine = ExpertOffloadEngine(self)
         else:
             self.offload_engine = None
+        self.replay_controller = None  # set to ReplayController for trace replay
 
         model_type = cfg.get("model_type", "unknown")
         budget_str = (f", experts_per_layer={self.experts_per_layer}"
@@ -1548,8 +1549,9 @@ class MoEEngine:
         """
         info = self._piecewise_graphs[graph_N]
 
-        if self.offload_engine:
-            self.offload_engine.begin_step()
+        _controller = self.replay_controller or self.offload_engine
+        if _controller:
+            _controller.begin_step()
         D = len(decode_seq_ids)
         prefill_lengths = [ids.shape[0] for ids in prefill_input_ids]
         N_actual = D + sum(prefill_lengths)
@@ -1629,6 +1631,10 @@ class MoEEngine:
         attn_out_buf = info['attn_out_buf']
 
         for layer in range(self.num_layers):
+            # Pre-attention prefetch: async transfers overlap stages 1-3
+            if self.replay_controller:
+                self.replay_controller.begin_layer_prefetch(layer)
+
             # Stage 1: pre-attention (CUDA graph)
             info['stage1_graphs'][layer].replay()
 
@@ -1662,21 +1668,20 @@ class MoEEngine:
             # Stage 4a: router (CUDA graph)
             info['stage4a_graphs'][layer].replay()
 
-            # ── CPU break: update expert_map + demand-load missing experts ──
-            # process_layer is the single call that guarantees all selected
-            # experts have valid weights before stage4b. It copies
-            # expert_map_abs[layer] → expert_map_buf, then loads any
-            # non-resident experts from CPU into the scratchpad.
-            if self.offload_engine:
+            # ── CPU break: update expert_map + load missing experts ──
+            if self.replay_controller:
+                self.replay_controller.process_layer_replay(
+                    layer, info['topk_ids_buf'], N_actual)
+            elif self.offload_engine:
                 self.offload_engine.process_layer(
                     layer, info['topk_ids_buf'], N_actual)
 
             # Stage 4b: MoE (CUDA graph)
             info['stage4b_graphs'][layer].replay()
 
-            # Clean up demand-loaded experts after MoE computation
-            if self.offload_engine:
-                self.offload_engine.post_layer(layer)
+            # Clean up after MoE computation
+            if _controller:
+                _controller.post_layer(layer)
 
         # ── 8. Final norm + lm_head (eager — single kernel each) ──
         hidden = info['hidden_buf']

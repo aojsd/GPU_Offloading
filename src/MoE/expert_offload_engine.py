@@ -104,6 +104,12 @@ class ExpertOffloadEngine:
         self._start_event = torch.cuda.Event(enable_timing=True)
         self._end_event = torch.cuda.Event(enable_timing=True)
 
+        # Phase 5: async transfer infrastructure
+        self._transfer_stream = torch.cuda.Stream(device=self.device)
+        self._pending_prefetches = {}   # (layer, eid) -> scratchpad slot
+        self._next_scratchpad_slot = 0
+        self._async_done_event = torch.cuda.Event()
+
     def _init_residency(self):
         """Initialize residency from current state."""
         if self.true_offloading:
@@ -309,6 +315,138 @@ class ExpertOffloadEngine:
                 'time_ms': elapsed_ms,
             })
             self.resident[layer].add(eid)
+
+    # ── Phase 5: Async Transfer & Prefetch ──────────────────────────
+
+    def prefetch_experts_async(self, layer, expert_ids):
+        """Issue async CPU→GPU transfers on the transfer stream.
+
+        Called at the start of a layer (before attention) to overlap
+        transfers with attention compute on the default stream. Only
+        transfers experts not already resident.
+
+        Args:
+            layer: layer index
+            expert_ids: list of expert IDs to prefetch
+        """
+        if not self.true_offloading or not expert_ids:
+            return
+
+        self._next_scratchpad_slot = 0
+        self._pending_prefetches.clear()
+
+        for eid in expert_ids:
+            if eid in self.resident[layer]:
+                continue
+            if (layer, eid) in self._pending_prefetches:
+                continue
+            slot = self.scratchpad_start + self._next_scratchpad_slot
+            self._next_scratchpad_slot += 1
+
+            with torch.cuda.stream(self._transfer_stream):
+                self._start_event.record()
+                self.w1_buf[slot].copy_(self.w1_cpu[layer][eid],
+                                         non_blocking=True)
+                self.w2_buf[slot].copy_(self.w2_cpu[layer][eid],
+                                         non_blocking=True)
+                self._end_event.record()
+
+            self._pending_prefetches[(layer, eid)] = slot
+            self._record_transfer(layer, eid)
+
+    def process_layer_async(self, layer, topk_ids_buf, n_tokens):
+        """Async-aware layer processing between stage4a and stage4b.
+
+        Replaces process_layer() when async mode is desired. Steps:
+        1. Copy expert_map_abs[layer] → expert_map_buf
+        2. Read routing decisions from GPU
+        3. Record trace
+        4. Issue post-routing async transfers for new misses
+        5. Wait for all async transfers to complete
+        6. Demand-load any remaining misses (blocking)
+        7. Update expert_map_buf with all slot assignments
+
+        Args:
+            layer: layer index
+            topk_ids_buf: [N_padded, top_k] int64 GPU tensor
+            n_tokens: actual number of tokens
+        """
+        # Step 1: set expert_map_buf to this layer's absolute map
+        if self.true_offloading:
+            self.expert_map_buf.copy_(self.expert_map_abs[layer])
+
+        # Step 2: read routing decisions (GPU → CPU)
+        topk_ids = topk_ids_buf[:n_tokens].cpu()
+        needed = set(topk_ids.flatten().unique().tolist())
+
+        # Step 3: record trace
+        self.trace.append({
+            'step': self._current_step,
+            'layer': layer,
+            'expert_ids': sorted(needed),
+        })
+
+        # Step 4: identify what's still missing after pre-attn prefetch
+        missing = needed - self.resident[layer]
+        already_prefetched = {eid for (l, eid) in self._pending_prefetches
+                              if l == layer}
+        new_misses = missing - already_prefetched
+
+        # Issue post-routing async transfers for new misses
+        if new_misses:
+            for eid in sorted(new_misses):
+                slot = self.scratchpad_start + self._next_scratchpad_slot
+                self._next_scratchpad_slot += 1
+
+                with torch.cuda.stream(self._transfer_stream):
+                    self._start_event.record()
+                    self.w1_buf[slot].copy_(self.w1_cpu[layer][eid],
+                                             non_blocking=True)
+                    self.w2_buf[slot].copy_(self.w2_cpu[layer][eid],
+                                             non_blocking=True)
+                    self._end_event.record()
+
+                self._pending_prefetches[(layer, eid)] = slot
+                self._record_transfer(layer, eid)
+
+        # Step 5: wait for all async transfers to complete
+        if self._pending_prefetches:
+            self._async_done_event.record(self._transfer_stream)
+            torch.cuda.current_stream().wait_event(self._async_done_event)
+
+        # Step 6: update expert_map_buf with scratchpad slot assignments
+        for (l, eid), slot in self._pending_prefetches.items():
+            if l == layer:
+                self.expert_map_buf[eid] = slot
+
+    def post_layer_async(self, layer):
+        """Called after stage4b. Clears async prefetch state."""
+        self._pending_prefetches.clear()
+        self._next_scratchpad_slot = 0
+
+        if not self.true_offloading:
+            # Simulated mode eviction
+            missing = self._pending_evict.get(layer, set())
+            if missing:
+                for eid in missing:
+                    self.resident[layer].discard(eid)
+                del self._pending_evict[layer]
+
+    def _record_transfer(self, layer, eid):
+        """Record a transfer entry (shared by sync and async paths)."""
+        transfer_bytes = (self.w1_cpu[layer][eid].numel() *
+                          self.w1_cpu[layer][eid].element_size() +
+                          self.w2_cpu[layer][eid].numel() *
+                          self.w2_cpu[layer][eid].element_size())
+        # For async, timing is approximate (events may not be sync'd yet)
+        # Best-effort: record after event synchronization when possible
+        self.transfers.append({
+            'step': self._current_step,
+            'layer': layer,
+            'expert_id': eid,
+            'bytes': transfer_bytes,
+            'time_ms': 0.0,  # filled by replay controller timing
+        })
 
     def save_trace(self, path):
         """Save expert activation trace and transfer log to JSON.

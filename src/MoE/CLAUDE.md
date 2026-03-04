@@ -87,9 +87,9 @@ for each layer:
 2. **Mixed Batch Support** (complete): Mixed prefill+decode via `mixed_step()`, piecewise CUDA graphs (per-layer 4-stage decomposition). 80.4% token match vs vLLM without compile (expected BF16 divergence). See [mixed_batch.md](vLLM_comparison/mixed_batch.md).
 3. **Simulated Expert Offloading** (complete): Split stage 4 into 4a (router) + 4b (MoE) with CPU break. ExpertOffloadEngine demand-loads missing experts, records traces. Verified bit-identical + predicted latency = compute + IO. See [offload_1GPU.md](offload_1GPU.md).
 4. **Unified Expert Cache** (complete): Single `w1_buf[L*epl + scratchpad, 2*I, H]` buffer with per-layer views. Eliminated D2D copies (was 14.8 ms/step on 32L). Compute parity 36/36 checks passed. Latency model `wall = compute + IO` validated across 88 experiments (prefill, mixed batch, decode): Mixtral-20L +0.5%, Mixtral-32L +0.6%, OLMoE +8.7% (Python dispatch overhead with many small transfers). IO accounts for 90-96% of wall-clock time. See [offload_1GPU.md](offload_1GPU.md).
-5. **Async Transfer & Prefetch** (not started): Overlap CPU→GPU transfers with attention compute via multiple CUDA streams.
-6. **Trace Format & Replay Controller** (not started): Replay loop with data movement orchestration + timing.
-7. **Policy Simulation** (not started): LRU, Oracle/Belady, frequency-based, pre-gated policies.
+5. **Async Transfer & Prefetch** (complete): Two-stream architecture — transfer stream overlaps CPU→GPU copies with attention on compute stream. CUDA events synchronize before MoE compute. See [replay.md](replay.md).
+6. **Trace Format & Replay Controller** (complete): `DataMovementTrace` format with validation, `ReplayController` replays traces with async prefetch + demand load orchestration. See [replay.md](replay.md).
+7. **Policy Simulation** (complete): LRU, Oracle/Belady (configurable lookahead), LFU (windowed), PreGated (1-layer-ahead prefetch wrapper). See [replay.md](replay.md).
 
 ---
 
@@ -256,6 +256,11 @@ See [decode.md](vLLM_comparison/decode.md) and [prefill.md](vLLM_comparison/pref
 | `vLLM_comparison/decode.md` | Decode pipeline details, profiling data, challenges |
 | `vLLM_comparison/prefill.md` | Prefill pipeline details, profiling data, gap analysis, challenges |
 | `vLLM_comparison/mixed_batch.md` | Mixed prefill+decode batch support: design, piecewise CUDA graph plan |
+| `data_movement_trace.py` | `DataMovementTrace`, `ActivationTrace`, `TransferEvent` — trace formats with JSON serialization and validation |
+| `policy_simulator.py` | Policy simulators: `LRUPolicy`, `OraclePolicy`, `FrequencyPolicy`, `PreGatedPolicy` — simulate caching/prefetch on activation traces |
+| `replay_controller.py` | `ReplayController` — replays `DataMovementTrace` on GPU with async prefetch streams and demand loading |
+| `replay.md` | Cache simulation & replay documentation: trace formats, policy simulators, replay controller architecture, prefetch/eviction timing |
+| `tests/test_replay_policy.py` | 26 unit tests covering trace serialization, validation, and all 4 policy simulators |
 | `tests/README.md` | Index of all test/benchmark scripts with descriptions and quick start |
 
 Regenerate decode profiles: `python src/MoE/vLLM_comparison/nsys_profiler.py all`

@@ -49,7 +49,7 @@ Key observations:
 
 ### Mixtral-8x7B-20L (20 layers, 8 experts top-2)
 
-Benchmarked with `trace_replay.py`. vLLM runs with default settings (chunked prefill enabled,
+Benchmarked with `batch_replay.py`. vLLM runs with default settings (chunked prefill enabled,
 prefix caching disabled). Custom engine uses piecewise CUDA graphs + torch.compile.
 
 #### Single Request (prompt=128, generate 50 tokens)
@@ -333,8 +333,8 @@ speedup improves from 1.11x to ~1.15x+.
 ### Verification Checklist
 
 1. `microbenchmark.py mixed` -- all 7 tests pass (exact match without torch.compile) ✓
-2. `trace_replay.py --load-trace` -- 260/260 piecewise vs eager match, full trace replay ✓
-3. `trace_replay.py --workload staggered` -- mixed steps use piecewise graphs ✓
+2. `batch_replay.py --load-trace` -- 260/260 piecewise vs eager match, full trace replay ✓
+3. `batch_replay.py --workload staggered` -- mixed steps use piecewise graphs ✓
 4. Step 10 (132 tokens): 8.41ms (target was ~8.8ms, actual is better) ✓
 5. Pure decode/prefill steps: no regression vs current CUDA graph performance ✓
 6. Overall staggered speedup: 1.19x (target was ~1.15x+) ✓

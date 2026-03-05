@@ -9,6 +9,6 @@ bin/*
 src/MoE/models/*
 !src/MoE/models/download.sh
 
-# Generated trace files (reproduced via trace_replay.py --trace)
+# Generated trace files (reproduced via batch_replay.py --trace)
 src/MoE/trace_*.json
 src/MoE/vLLM_comparison/trace_*.json

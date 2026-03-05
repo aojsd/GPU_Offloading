@@ -263,6 +263,8 @@ See [decode.md](vLLM_comparison/decode.md) and [prefill.md](vLLM_comparison/pref
 | `vLLM_comparison/decode.md` | Decode pipeline details, profiling data, challenges |
 | `vLLM_comparison/prefill.md` | Prefill pipeline details, profiling data, gap analysis, challenges |
 | `vLLM_comparison/mixed_batch.md` | Mixed prefill+decode batch support: design, piecewise CUDA graph plan |
+| `datasets/download.sh` | Download datasets (ShareGPT) to shared storage with symlinks |
+| `trace_construction/trace_construction.md` | Design doc: collect per-conversation activations (GPU), build batched traces via continuous batching sim (CPU) |
 | `data_movement_trace.py` | `DataMovementTrace`, `ActivationTrace`, `TransferEvent` — trace formats with JSON serialization and validation |
 | `policy_simulator.py` | Policy simulators: `LRUPolicy`, `OraclePolicy`, `FrequencyPolicy`, `StaticPolicy`, `PreGatedPolicy` — simulate caching/prefetch on activation traces |
 | `replay_controller.py` | `ReplayController` — replays `DataMovementTrace` on GPU with async prefetch streams and demand loading |

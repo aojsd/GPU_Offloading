@@ -19,8 +19,11 @@ Data flow:
 """
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Optional
+
+import numpy as np
 
 
 @dataclass
@@ -254,22 +257,31 @@ class ActivationTrace:
     ({step, layer, expert_ids} entries).
 
     Attributes:
-        num_layers:  Number of transformer layers.
-        num_experts: Number of experts per MoE layer.
-        steps:       steps[step_idx][layer_idx] = sorted list of expert_ids
-                     accessed at that (step, layer).
+        num_layers:      Number of transformer layers.
+        num_experts:     Number of experts per MoE layer.
+        steps:           steps[step_idx][layer_idx] = sorted list of expert_ids
+                         accessed at that (step, layer).
+        router_inputs:   Optional path to a companion .npz file containing
+                         router inputs (post-layernorm hidden states) keyed
+                         as 'step{s}_layer{l}' with shape [n_tokens, hidden_dim]
+                         in float16. None when not recorded.
     """
     num_layers: int
     num_experts: int
     steps: list[list[list[int]]]
+    router_inputs: Optional[str] = None
 
     @staticmethod
-    def from_flat_trace(trace_data: dict) -> 'ActivationTrace':
+    def from_flat_trace(trace_data: dict,
+                        router_inputs_path: Optional[str] = None
+                        ) -> 'ActivationTrace':
         """Convert ExpertOffloadEngine's flat trace format to structured.
 
         Args:
             trace_data: Dict with keys 'num_layers', 'num_experts', 'trace'
                 where trace is a list of {step, layer, expert_ids} dicts.
+            router_inputs_path: Optional path to companion .npz file with
+                router inputs.
 
         Returns:
             ActivationTrace with steps[step][layer] = [expert_ids].
@@ -279,7 +291,8 @@ class ActivationTrace:
         flat = trace_data['trace']
 
         if not flat:
-            return ActivationTrace(num_layers, num_experts, [])
+            return ActivationTrace(num_layers, num_experts, [],
+                                   router_inputs=router_inputs_path)
 
         max_step = max(entry['step'] for entry in flat)
         steps = [[[] for _ in range(num_layers)]
@@ -288,14 +301,23 @@ class ActivationTrace:
         for entry in flat:
             steps[entry['step']][entry['layer']] = entry['expert_ids']
 
-        return ActivationTrace(num_layers, num_experts, steps)
+        return ActivationTrace(num_layers, num_experts, steps,
+                               router_inputs=router_inputs_path)
 
     @staticmethod
     def load(path: str) -> 'ActivationTrace':
-        """Load from JSON file saved by ExpertOffloadEngine.save_trace()."""
+        """Load from JSON file saved by ExpertOffloadEngine.save_trace().
+
+        Automatically detects a companion router inputs file
+        (<basename>_router_inputs.npz) if present.
+        """
         with open(path) as f:
             data = json.load(f)
-        return ActivationTrace.from_flat_trace(data)
+        # Check for companion router inputs file
+        ri_path = os.path.splitext(path)[0] + '_router_inputs.npz'
+        ri_path = ri_path if os.path.exists(ri_path) else None
+        return ActivationTrace.from_flat_trace(data,
+                                               router_inputs_path=ri_path)
 
     def save(self, path: str):
         """Save in the flat format compatible with ExpertOffloadEngine."""
@@ -316,6 +338,30 @@ class ActivationTrace:
         }
         with open(path, 'w') as f:
             json.dump(data, f, indent=2)
+
+    def has_router_inputs(self) -> bool:
+        """Check if router inputs are available."""
+        return self.router_inputs is not None
+
+    def get_router_input(self, step: int, layer: int) -> Optional[np.ndarray]:
+        """Load a single router input array from the companion .npz file.
+
+        Args:
+            step: decode step index
+            layer: layer index
+
+        Returns:
+            float16 numpy array of shape [n_tokens, hidden_dim], or None
+            if router inputs are not available.
+        """
+        if self.router_inputs is None:
+            return None
+        # Use lazy loading to avoid reading entire file into memory
+        key = f"step{step}_layer{layer}"
+        with np.load(self.router_inputs) as npz:
+            if key in npz:
+                return npz[key]
+        return None
 
     def num_steps(self) -> int:
         return len(self.steps)

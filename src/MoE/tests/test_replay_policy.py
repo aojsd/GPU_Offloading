@@ -24,6 +24,7 @@ import os
 import sys
 import tempfile
 
+import numpy as np
 import pytest
 
 # Add parent dir to path for imports
@@ -298,6 +299,95 @@ class TestActivationTrace:
                 'transfers': []}
         at = ActivationTrace.from_flat_trace(flat)
         assert len(at.steps) == 0
+
+    def test_no_router_inputs_by_default(self):
+        """ActivationTrace without router inputs returns None."""
+        at = ActivationTrace(num_layers=2, num_experts=4,
+                             steps=[[[0, 1], [2, 3]]])
+        assert not at.has_router_inputs()
+        assert at.get_router_input(0, 0) is None
+
+    def test_router_inputs_round_trip(self, tmp_path):
+        """Save/load with companion .npz router inputs."""
+        # Create trace with router inputs
+        json_path = str(tmp_path / "trace.json")
+        npz_path = str(tmp_path / "trace_router_inputs.npz")
+
+        at = ActivationTrace(
+            num_layers=2, num_experts=4,
+            steps=[[[0, 1], [2, 3]], [[1, 2], [0, 3]]])
+        at.save(json_path)
+
+        # Write companion router inputs
+        hidden_dim = 8
+        arrays = {
+            'step0_layer0': np.ones((1, hidden_dim), dtype=np.float16) * 0.5,
+            'step0_layer1': np.ones((1, hidden_dim), dtype=np.float16) * 1.0,
+            'step1_layer0': np.ones((1, hidden_dim), dtype=np.float16) * 1.5,
+            'step1_layer1': np.ones((1, hidden_dim), dtype=np.float16) * 2.0,
+        }
+        np.savez_compressed(npz_path, **arrays)
+
+        # Load — should auto-detect .npz
+        at2 = ActivationTrace.load(json_path)
+        assert at2.has_router_inputs()
+        assert at2.steps == at.steps
+
+        # Check router input values
+        ri = at2.get_router_input(0, 0)
+        assert ri is not None
+        assert ri.shape == (1, hidden_dim)
+        assert ri.dtype == np.float16
+        np.testing.assert_allclose(ri, 0.5)
+
+        ri_last = at2.get_router_input(1, 1)
+        np.testing.assert_allclose(ri_last, 2.0)
+
+    def test_router_inputs_missing_key(self, tmp_path):
+        """get_router_input returns None for missing step/layer."""
+        json_path = str(tmp_path / "trace.json")
+        npz_path = str(tmp_path / "trace_router_inputs.npz")
+
+        at = ActivationTrace(num_layers=1, num_experts=2,
+                             steps=[[[0, 1]]])
+        at.save(json_path)
+        np.savez_compressed(npz_path,
+                            step0_layer0=np.zeros((1, 4), dtype=np.float16))
+
+        at2 = ActivationTrace.load(json_path)
+        assert at2.has_router_inputs()
+        assert at2.get_router_input(0, 0) is not None
+        assert at2.get_router_input(99, 99) is None
+
+    def test_load_without_npz(self, tmp_path):
+        """Load trace without companion .npz — has_router_inputs is False."""
+        json_path = str(tmp_path / "trace.json")
+        at = ActivationTrace(num_layers=2, num_experts=4,
+                             steps=[[[0, 1], [2, 3]]])
+        at.save(json_path)
+
+        at2 = ActivationTrace.load(json_path)
+        assert not at2.has_router_inputs()
+
+    def test_policies_work_with_router_inputs(self, tmp_path):
+        """Policies ignore router_inputs field and simulate normally."""
+        json_path = str(tmp_path / "trace.json")
+        npz_path = str(tmp_path / "trace_router_inputs.npz")
+
+        at = ActivationTrace(num_layers=1, num_experts=4,
+                             steps=[[[0, 1]], [[2, 3]], [[0, 2]]])
+        at.save(json_path)
+        np.savez_compressed(npz_path,
+                            step0_layer0=np.zeros((1, 4), dtype=np.float16))
+
+        at2 = ActivationTrace.load(json_path)
+        assert at2.has_router_inputs()
+
+        # All policies should work fine
+        for Policy in [LRUPolicy, OraclePolicy, FrequencyPolicy, StaticPolicy]:
+            dm = Policy().simulate(at2, cache_size=2)
+            errors = dm.validate()
+            assert errors == [], f"{Policy.__name__} failed: {errors}"
 
 
 # ── 4. LRU Policy ───────────────────────────────────────────────────

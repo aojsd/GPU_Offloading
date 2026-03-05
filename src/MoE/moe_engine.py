@@ -1722,7 +1722,8 @@ class MoEEngine:
                     layer, info['topk_ids_buf'], N_actual)
             elif self.offload_engine:
                 self.offload_engine.process_layer(
-                    layer, info['topk_ids_buf'], N_actual)
+                    layer, info['topk_ids_buf'], N_actual,
+                    router_input_buf=info['moe_input_buf'])
 
             # Stage 4b: MoE (CUDA graph)
             info['stage4b_graphs'][layer].replay()

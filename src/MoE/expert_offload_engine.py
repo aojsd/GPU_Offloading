@@ -18,7 +18,9 @@ Supports two modes depending on how MoEEngine was initialized:
 """
 
 import json
+import os
 
+import numpy as np
 import torch
 
 
@@ -99,6 +101,10 @@ class ExpertOffloadEngine:
         self.transfers = []
         self._current_step = -1  # first begin_step() gives 0
         self._pending_evict = {}  # layer -> set of experts to evict (simulated only)
+
+        # Optional router input recording (for predictive prefetchers)
+        self.record_router_inputs = False
+        self._router_inputs = []  # list of {step, layer, tensor} dicts
 
         # CUDA events for precise transfer timing
         self._start_event = torch.cuda.Event(enable_timing=True)
@@ -199,19 +205,24 @@ class ExpertOffloadEngine:
         """
         self._current_step += 1
 
-    def process_layer(self, layer, topk_ids_buf, n_tokens):
+    def process_layer(self, layer, topk_ids_buf, n_tokens,
+                       router_input_buf=None):
         """Prepare a layer for stage4b: update expert_map and load missing experts.
 
         This is the ONLY call needed between stage4a and stage4b. It:
         1. Copies expert_map_abs[layer] → expert_map_buf (for true offloading)
         2. Reads routing decisions from topk_ids_buf
-        3. Demand-loads any missing experts from CPU → GPU scratchpad
-        4. Updates expert_map_buf with scratchpad slot indices
+        3. Optionally records router input (post-layernorm hidden state)
+        4. Demand-loads any missing experts from CPU → GPU scratchpad
+        5. Updates expert_map_buf with scratchpad slot indices
 
         Args:
             layer: layer index
             topk_ids_buf: [N_padded, top_k] int64 tensor on GPU
             n_tokens: actual number of tokens (not padding)
+            router_input_buf: optional [N_padded, hidden_dim] tensor — the
+                post-layernorm hidden state fed to the router. Recorded to CPU
+                when self.record_router_inputs is True.
         """
         # Step 1: set expert_map_buf to this layer's absolute map
         if self.true_offloading:
@@ -227,6 +238,14 @@ class ExpertOffloadEngine:
             'layer': layer,
             'expert_ids': sorted(needed),
         })
+
+        # Record router input if enabled
+        if self.record_router_inputs and router_input_buf is not None:
+            self._router_inputs.append({
+                'step': self._current_step,
+                'layer': layer,
+                'hidden': router_input_buf[:n_tokens].half().cpu().numpy(),
+            })
 
         # Load missing experts (before stage4b graph replay)
         missing = needed - self.resident[layer]
@@ -354,13 +373,14 @@ class ExpertOffloadEngine:
             self._pending_prefetches[(layer, eid)] = slot
             self._record_transfer(layer, eid)
 
-    def process_layer_async(self, layer, topk_ids_buf, n_tokens):
+    def process_layer_async(self, layer, topk_ids_buf, n_tokens,
+                             router_input_buf=None):
         """Async-aware layer processing between stage4a and stage4b.
 
         Replaces process_layer() when async mode is desired. Steps:
         1. Copy expert_map_abs[layer] → expert_map_buf
         2. Read routing decisions from GPU
-        3. Record trace
+        3. Record trace (and optionally router input)
         4. Issue post-routing async transfers for new misses
         5. Wait for all async transfers to complete
         6. Demand-load any remaining misses (blocking)
@@ -370,6 +390,9 @@ class ExpertOffloadEngine:
             layer: layer index
             topk_ids_buf: [N_padded, top_k] int64 GPU tensor
             n_tokens: actual number of tokens
+            router_input_buf: optional [N_padded, hidden_dim] tensor —
+                post-layernorm hidden state. Recorded when
+                self.record_router_inputs is True.
         """
         # Step 1: set expert_map_buf to this layer's absolute map
         if self.true_offloading:
@@ -385,6 +408,14 @@ class ExpertOffloadEngine:
             'layer': layer,
             'expert_ids': sorted(needed),
         })
+
+        # Record router input if enabled
+        if self.record_router_inputs and router_input_buf is not None:
+            self._router_inputs.append({
+                'step': self._current_step,
+                'layer': layer,
+                'hidden': router_input_buf[:n_tokens].half().cpu().numpy(),
+            })
 
         # Step 4: identify what's still missing after pre-attn prefetch
         missing = needed - self.resident[layer]
@@ -451,8 +482,11 @@ class ExpertOffloadEngine:
     def save_trace(self, path):
         """Save expert activation trace and transfer log to JSON.
 
+        If record_router_inputs is enabled, also saves router inputs as a
+        companion .npz file alongside the JSON (same base name).
+
         Args:
-            path: output file path
+            path: output file path for JSON trace
         """
         data = {
             'num_layers': self.num_layers,
@@ -464,6 +498,27 @@ class ExpertOffloadEngine:
             json.dump(data, f, indent=2)
         print(f"ExpertOffloadEngine: saved trace ({len(self.trace)} entries, "
               f"{len(self.transfers)} transfers) to {path}")
+
+        if self._router_inputs:
+            self.save_router_inputs(
+                os.path.splitext(path)[0] + '_router_inputs.npz')
+
+    def save_router_inputs(self, path):
+        """Save recorded router inputs to a compressed .npz file.
+
+        Arrays are keyed as 'step{s}_layer{l}' with shape
+        [n_tokens, hidden_dim] in float16.
+
+        Args:
+            path: output .npz file path
+        """
+        arrays = {}
+        for entry in self._router_inputs:
+            key = f"step{entry['step']}_layer{entry['layer']}"
+            arrays[key] = entry['hidden']
+        np.savez_compressed(path, **arrays)
+        print(f"ExpertOffloadEngine: saved {len(arrays)} router inputs "
+              f"to {path}")
 
     def get_transfer_stats(self):
         """Compute summary statistics for expert transfers.
@@ -501,7 +556,8 @@ class ExpertOffloadEngine:
         }
 
     def reset_trace(self):
-        """Clear recorded trace and transfer data."""
+        """Clear recorded trace, transfer data, and router inputs."""
         self.trace.clear()
         self.transfers.clear()
+        self._router_inputs.clear()
         self._current_step = -1

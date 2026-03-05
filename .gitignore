@@ -9,6 +9,10 @@ bin/*
 src/MoE/models/*
 !src/MoE/models/download.sh
 
+# Datasets (downloaded via datasets/download.sh)
+src/MoE/datasets/*
+!src/MoE/datasets/download.sh
+
 # Generated trace files (reproduced via batch_replay.py --trace)
 src/MoE/trace_*.json
 src/MoE/vLLM_comparison/trace_*.json

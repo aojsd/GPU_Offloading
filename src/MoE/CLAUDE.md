@@ -46,37 +46,44 @@ A single expert cache miss (6.5ms) costs 24x more than the MoE compute for that 
 
 ### Data Movement Trace Format
 
+Uses a **unified expert cache** — a single pool of `cache_size` slots shared
+across all layers. Any slot can hold any `(layer, expert_id)`.
+
 ```
 DataMovementTrace:
-  initial_cache_state: list[(layer, expert)]   # experts on GPU at start
-  steps: list[StepTrace]                        # one per decode token
+  cache_size: int                               # total unified GPU cache slots
+  initial_cache_state: list[(layer, expert)]     # experts on GPU at start
+  steps: list[StepTrace]                         # one per decode token
 
 StepTrace:
-  layers: list[LayerTrace]                      # 32 layers
+  layers: list[LayerTrace]                       # 32 layers
 
 LayerTrace:
-  topk_ids: list[list[int]]                     # expert selections per token
+  topk_ids: list[list[int]]                      # expert selections per token
   topk_weights: list[list[float]]
-  prefetches: list[TransferEvent]               # start of layer (overlap with attn)
-  post_routing_prefetches: list[TransferEvent]  # after routing decided
-  demand_loads: list[TransferEvent]             # blocking (cache miss)
+  prefetches: list[TransferEvent]                # async transfers for this layer
+  demand_loads: list[TransferEvent]              # blocking (cache miss)
 
 TransferEvent:
   target: (layer, expert)
-  evict: (layer, expert) | None
+  evict: (layer, expert) | None                  # cross-layer eviction allowed
 ```
 
 ### Replay Loop (Per-Layer)
 
 ```
-for each layer:
-  1. Start prefetches (async, prefetch stream)
-  2. Run attention on compute stream (overlaps with prefetches)
-  3. Read expert selections from trace
-  4. Start post-routing prefetches
-  5. Execute demand loads (blocking wait for cache misses)
-  6. Run MoE compute (all needed experts now on GPU)
-  7. Trigger evictions
+Layer 0:
+  1. Issue layers[0].prefetches on transfer stream (async)
+  2. Run stages 1-4a on compute stream (overlaps with prefetches)
+  3. Sync prefetches, execute demand_loads (blocking)
+  4. Issue layers[1].prefetches on transfer stream (async)
+  5. Run stage 4b (MoE compute)
+
+Layer L (L > 0):
+  1. Run stages 1-4a (prefetches from L-1 running in background)
+  2. Sync prefetches, execute demand_loads (blocking)
+  3. Issue layers[L+1].prefetches on transfer stream (async)
+  4. Run stage 4b (MoE compute)
 ```
 
 ---
@@ -87,9 +94,9 @@ for each layer:
 2. **Mixed Batch Support** (complete): Mixed prefill+decode via `mixed_step()`, piecewise CUDA graphs (per-layer 4-stage decomposition). 80.4% token match vs vLLM without compile (expected BF16 divergence). See [mixed_batch.md](vLLM_comparison/mixed_batch.md).
 3. **Simulated Expert Offloading** (complete): Split stage 4 into 4a (router) + 4b (MoE) with CPU break. ExpertOffloadEngine demand-loads missing experts, records traces. Verified bit-identical + predicted latency = compute + IO. See [offload_1GPU.md](offload_1GPU.md).
 4. **Unified Expert Cache** (complete): Single `w1_buf[L*epl + scratchpad, 2*I, H]` buffer with per-layer views. Eliminated D2D copies (was 14.8 ms/step on 32L). Compute parity 36/36 checks passed. Latency model `wall = compute + IO` validated across 88 experiments (prefill, mixed batch, decode): Mixtral-20L +0.5%, Mixtral-32L +0.6%, OLMoE +8.7% (Python dispatch overhead with many small transfers). IO accounts for 90-96% of wall-clock time. See [offload_1GPU.md](offload_1GPU.md).
-5. **Async Transfer & Prefetch** (complete): Two-stream architecture — transfer stream overlaps CPU→GPU copies with attention on compute stream. CUDA events synchronize before MoE compute. See [replay.md](replay.md).
-6. **Trace Format & Replay Controller** (complete): `DataMovementTrace` format with validation, `ReplayController` replays traces with async prefetch + demand load orchestration. See [replay.md](replay.md).
-7. **Policy Simulation** (complete): LRU, Oracle/Belady (configurable lookahead), LFU (windowed), PreGated (1-layer-ahead prefetch wrapper). See [replay.md](replay.md).
+5. **Async Transfer & Prefetch** (complete): Two-stream architecture — transfer stream overlaps CPU→GPU copies with compute stream. Single CUDA event synchronization. See [replay.md](replay.md).
+6. **Trace Format & Replay Controller** (complete): `DataMovementTrace` with unified cache (`cache_size` slots shared across all layers), `ReplayController` with optimized prefetch timing (layer 0 before stage1, subsequent layers before stage4b of previous layer). See [replay.md](replay.md).
+7. **Policy Simulation** (complete): LRU, Oracle/Belady, LFU (windowed), Static (global frequency oracle), PreGated — all operating on unified cache with cross-layer eviction. See [replay.md](replay.md).
 
 ---
 
@@ -251,16 +258,16 @@ See [decode.md](vLLM_comparison/decode.md) and [prefill.md](vLLM_comparison/pref
 | `models/download.sh` | Download model weights (OLMoE, Mixtral) |
 | `models/truncate_model.py` | Truncate model to N layers (for fitting large models on single GPU) |
 | `vLLM_comparison/microbenchmark.py` | Consolidated benchmarks: decode, prefill, CUDA graph correctness, mixed smoke tests |
-| `vLLM_comparison/trace_replay.py` | Trace-and-replay benchmark: run vLLM, trace batches, replay on custom engine |
+| `vLLM_comparison/batch_replay.py` | Batch-replay benchmark: run vLLM, trace batches, replay on custom engine |
 | `vLLM_comparison/nsys_profiler.py` | Nsight Systems kernel profiling: Custom vs vLLM (decode + prefill) |
 | `vLLM_comparison/decode.md` | Decode pipeline details, profiling data, challenges |
 | `vLLM_comparison/prefill.md` | Prefill pipeline details, profiling data, gap analysis, challenges |
 | `vLLM_comparison/mixed_batch.md` | Mixed prefill+decode batch support: design, piecewise CUDA graph plan |
 | `data_movement_trace.py` | `DataMovementTrace`, `ActivationTrace`, `TransferEvent` — trace formats with JSON serialization and validation |
-| `policy_simulator.py` | Policy simulators: `LRUPolicy`, `OraclePolicy`, `FrequencyPolicy`, `PreGatedPolicy` — simulate caching/prefetch on activation traces |
+| `policy_simulator.py` | Policy simulators: `LRUPolicy`, `OraclePolicy`, `FrequencyPolicy`, `StaticPolicy`, `PreGatedPolicy` — simulate caching/prefetch on activation traces |
 | `replay_controller.py` | `ReplayController` — replays `DataMovementTrace` on GPU with async prefetch streams and demand loading |
 | `replay.md` | Cache simulation & replay documentation: trace formats, policy simulators, replay controller architecture, prefetch/eviction timing |
-| `tests/test_replay_policy.py` | 26 unit tests covering trace serialization, validation, and all 4 policy simulators |
+| `tests/test_replay_policy.py` | 39 unit tests covering trace serialization, validation, and all 4 policy simulators (unified cache) |
 | `tests/README.md` | Index of all test/benchmark scripts with descriptions and quick start |
 
 Regenerate decode profiles: `python src/MoE/vLLM_comparison/nsys_profiler.py all`
@@ -270,22 +277,28 @@ Regenerate prefill profiles: `python src/MoE/vLLM_comparison/nsys_profiler.py pr
 
 ## Expert Offloading Infrastructure
 
-### Architecture: Unified Expert Cache (Phase 3 — Complete)
+### Architecture: Expert Cache (Phase 3 — Complete)
 
-Single GPU buffer holds all resident experts at fixed slots. No D2D copies — only a
-32-byte `expert_map_buf` copy per layer. Piecewise CUDA graphs (stage4a/4b split) allow
-CPU-side offloader intervention between router and MoE compute.
+Two offloading modes, both using piecewise CUDA graphs (stage4a/4b split) for
+CPU-side intervention between router and MoE compute:
 
+**1. `experts_per_layer` mode** (ExpertOffloadEngine — trace recording):
 ```
-w1_buf = [L * epl + scratchpad_slots, 2*I, H]  # unified GPU buffer
+w1_buf = [L * epl + scratchpad_slots, 2*I, H]   # per-layer partitioned + scratchpad
 w2_buf = [L * epl + scratchpad_slots, H, I]
-
-Layer l residents:  slots [l*epl, ..., (l+1)*epl - 1]  (per-layer views = zero-copy)
-Scratchpad:         slots [L*epl, ..., L*epl + E - 1]  (demand-loaded non-residents)
 ```
+Per-layer views, two expert maps (`expert_map[l]` relative, `expert_map_abs[l]` absolute).
+Scratchpad for demand-loaded non-residents. Used for recording activation traces.
 
-Two expert maps per layer: `expert_map[l]` (relative indices for views) and
-`expert_map_abs[l]` (absolute buffer indices for piecewise stage4b).
+**2. `cache_size` mode** (ReplayController — trace replay):
+```
+w1_buf = [cache_size, 2*I, H]                    # flat unified buffer
+w2_buf = [cache_size, H, I]
+```
+Any slot holds any `(layer, expert_id)`. No per-layer partitioning, no scratchpad.
+Only `expert_map_abs[l]` is used (absolute slot or -1). Cross-layer eviction supported.
+
+Cannot set both `experts_per_layer` and `cache_size` simultaneously.
 
 **ExpertOffloadEngine** (`expert_offload_engine.py`): Auto-created by MoEEngine when
 `experts_per_layer` is set. Reads routing decisions after stage4a, loads missing experts

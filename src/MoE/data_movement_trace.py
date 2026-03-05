@@ -4,6 +4,10 @@ Defines the structured trace format that encodes prefetch, eviction, and
 demand-load decisions produced by cache policy simulators (Phase 7) and
 consumed by the ReplayController (Phase 6).
 
+Uses a unified expert cache shared across all layers (keyed by (layer, eid)
+pairs) with a single cache_size budget. Any expert can evict any other
+expert regardless of layer.
+
 Also defines ActivationTrace — a structured view of the flat expert access
 trace recorded by ExpertOffloadEngine.save_trace(), used as input to
 policy simulators.
@@ -26,10 +30,10 @@ class TransferEvent:
     Attributes:
         target: (layer, expert_id) — which expert to load onto GPU.
         evict:  (layer, expert_id) — which resident expert to evict to
-                free a persistent cache slot, or None to use a scratchpad
-                slot (ephemeral, only valid for current layer's stage4b).
-                When set, evict.layer must equal target.layer (each layer's
-                persistent slots occupy a disjoint address range).
+                free a cache slot, or None when the cache has a free slot
+                (no eviction needed). In the unified cache, evict can
+                target any (layer, expert_id) regardless of the target's
+                layer.
     """
     target: tuple[int, int]
     evict: Optional[tuple[int, int]] = None
@@ -54,17 +58,16 @@ class LayerTrace:
     Attributes:
         topk_ids:      Expert selections per token — [n_tokens][top_k].
         topk_weights:  Routing weights per token — [n_tokens][top_k].
-        prefetches:    Transfers issued at start of layer, before attention.
-                       Run async on transfer stream, overlap with stages 1–3.
-        post_routing_prefetches:  Transfers issued after stage4a (routing
-                       decisions known). Async on transfer stream.
-        demand_loads:  Transfers that block before stage4b. These are cache
-                       misses not covered by prefetches.
+        prefetches:    Async transfers that bring this layer's experts onto GPU.
+                       For layer 0: issued before stage1 (start of network).
+                       For layer L>0: issued before stage4b of layer L-1,
+                       overlapping with stage4b(L-1) + stages 1-4a(L).
+        demand_loads:  Blocking transfers before stage4b. Cache misses not
+                       covered by prefetches.
     """
     topk_ids: list[list[int]]
     topk_weights: list[list[float]]
     prefetches: list[TransferEvent] = field(default_factory=list)
-    post_routing_prefetches: list[TransferEvent] = field(default_factory=list)
     demand_loads: list[TransferEvent] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -72,8 +75,6 @@ class LayerTrace:
             'topk_ids': self.topk_ids,
             'topk_weights': self.topk_weights,
             'prefetches': [e.to_dict() for e in self.prefetches],
-            'post_routing_prefetches': [e.to_dict()
-                                        for e in self.post_routing_prefetches],
             'demand_loads': [e.to_dict() for e in self.demand_loads],
         }
 
@@ -83,8 +84,6 @@ class LayerTrace:
             topk_ids=d['topk_ids'],
             topk_weights=d['topk_weights'],
             prefetches=[TransferEvent.from_dict(e) for e in d['prefetches']],
-            post_routing_prefetches=[TransferEvent.from_dict(e)
-                                     for e in d['post_routing_prefetches']],
             demand_loads=[TransferEvent.from_dict(e)
                           for e in d['demand_loads']],
         )
@@ -116,16 +115,20 @@ class DataMovementTrace:
     (Phase 6). Encodes every prefetch, eviction, and demand-load decision
     needed to replay expert offloading on real GPU hardware.
 
+    Uses a unified expert cache shared across all layers. Any cache slot
+    can hold any (layer, expert_id) pair.
+
     Attributes:
         num_layers:          Number of transformer layers.
         num_experts:         Number of experts per MoE layer.
-        experts_per_layer:   GPU cache capacity (persistent slots per layer).
+        cache_size:          Total unified GPU cache capacity (number of
+                             expert slots shared across all layers).
         initial_cache_state: [(layer, expert_id)] experts on GPU at start.
         steps:               One StepTrace per decode token.
     """
     num_layers: int
     num_experts: int
-    experts_per_layer: int
+    cache_size: int
     initial_cache_state: list[tuple[int, int]]
     steps: list[StepTrace]
 
@@ -134,7 +137,7 @@ class DataMovementTrace:
         data = {
             'num_layers': self.num_layers,
             'num_experts': self.num_experts,
-            'experts_per_layer': self.experts_per_layer,
+            'cache_size': self.cache_size,
             'initial_cache_state': [list(t) for t in self.initial_cache_state],
             'steps': [s.to_dict() for s in self.steps],
         }
@@ -151,7 +154,7 @@ class DataMovementTrace:
         trace = DataMovementTrace(
             num_layers=data['num_layers'],
             num_experts=data['num_experts'],
-            experts_per_layer=data['experts_per_layer'],
+            cache_size=data['cache_size'],
             initial_cache_state=[tuple(t)
                                  for t in data['initial_cache_state']],
             steps=[StepTrace.from_dict(s) for s in data['steps']],
@@ -161,33 +164,28 @@ class DataMovementTrace:
         return trace
 
     def validate(self) -> list[str]:
-        """Check internal consistency.
+        """Check internal consistency of the unified cache trace.
 
-        Verifies that every expert needed by topk_ids is either already
-        resident (from initial_cache_state + prior evictions/loads) or
-        loaded by a prefetch/post_routing_prefetch/demand_load in that
-        layer. Also checks cache capacity is never exceeded and that
-        evict.layer == target.layer.
+        Verifies that every expert needed by topk_ids is resident in the
+        unified cache (from initial_cache_state + prior transfers) or
+        loaded by a prefetch/demand_load in that layer. Also checks that
+        total cache occupancy never exceeds cache_size.
 
         Returns:
             List of error strings (empty = valid).
         """
         errors = []
 
-        # Build initial residency: resident[layer] = set of expert_ids
-        resident = [set() for _ in range(self.num_layers)]
-        initial_by_layer = [[] for _ in range(self.num_layers)]
+        # Build initial residency: unified set of (layer, eid)
+        resident = set()
         for (layer, eid) in self.initial_cache_state:
-            initial_by_layer[layer].append(eid)
-            resident[layer].add(eid)
+            resident.add((layer, eid))
 
         # Check initial capacity
-        for l in range(self.num_layers):
-            if len(initial_by_layer[l]) > self.experts_per_layer:
-                errors.append(
-                    f"Initial state: layer {l} has "
-                    f"{len(initial_by_layer[l])} experts but capacity is "
-                    f"{self.experts_per_layer}")
+        if len(resident) > self.cache_size:
+            errors.append(
+                f"Initial state: {len(resident)} experts but "
+                f"cache_size is {self.cache_size}")
 
         for step_idx, step in enumerate(self.steps):
             if len(step.layers) != self.num_layers:
@@ -197,37 +195,20 @@ class DataMovementTrace:
                 continue
 
             for layer_idx, lt in enumerate(step.layers):
-                # Collect all transfers for this layer
-                all_transfers = (lt.prefetches +
-                                 lt.post_routing_prefetches +
-                                 lt.demand_loads)
+                all_transfers = lt.prefetches + lt.demand_loads
 
-                # Check evict.layer == target.layer constraint
-                for te in all_transfers:
-                    if te.evict is not None and te.evict[0] != te.target[0]:
-                        errors.append(
-                            f"Step {step_idx}, layer {layer_idx}: "
-                            f"evict layer {te.evict[0]} != target layer "
-                            f"{te.target[0]}")
-
-                # Simulate transfers: apply evictions then additions
-                loaded_this_layer = set()
+                # Apply transfers to unified cache
                 for te in all_transfers:
                     if te.evict is not None:
-                        evict_layer, evict_eid = te.evict
-                        resident[evict_layer].discard(evict_eid)
-                    target_layer, target_eid = te.target
-                    if te.evict is not None:
-                        # Persistent replacement
-                        resident[target_layer].add(target_eid)
-                    loaded_this_layer.add((target_layer, target_eid))
+                        resident.discard(tuple(te.evict))
+                    resident.add(tuple(te.target))
 
-                # Check capacity after all transfers
-                if len(resident[layer_idx]) > self.experts_per_layer:
+                # Check total capacity after transfers
+                if len(resident) > self.cache_size:
                     errors.append(
                         f"Step {step_idx}, layer {layer_idx}: "
-                        f"cache has {len(resident[layer_idx])} experts, "
-                        f"capacity is {self.experts_per_layer}")
+                        f"cache has {len(resident)} experts, "
+                        f"cache_size is {self.cache_size}")
 
                 # Check coverage: every needed expert is available
                 needed = set()
@@ -235,9 +216,7 @@ class DataMovementTrace:
                     needed.update(token_experts)
 
                 for eid in needed:
-                    in_cache = eid in resident[layer_idx]
-                    in_loaded = (layer_idx, eid) in loaded_this_layer
-                    if not in_cache and not in_loaded:
+                    if (layer_idx, eid) not in resident:
                         errors.append(
                             f"Step {step_idx}, layer {layer_idx}: "
                             f"expert {eid} needed but not resident or "
@@ -248,25 +227,20 @@ class DataMovementTrace:
     def summary(self) -> dict:
         """Compute summary statistics."""
         total_prefetches = 0
-        total_post_routing = 0
         total_demand_loads = 0
         total_evictions = 0
         for step in self.steps:
             for lt in step.layers:
                 total_prefetches += len(lt.prefetches)
-                total_post_routing += len(lt.post_routing_prefetches)
                 total_demand_loads += len(lt.demand_loads)
-                for te in (lt.prefetches + lt.post_routing_prefetches +
-                           lt.demand_loads):
+                for te in (lt.prefetches + lt.demand_loads):
                     if te.evict is not None:
                         total_evictions += 1
-        total_transfers = (total_prefetches + total_post_routing +
-                           total_demand_loads)
+        total_transfers = total_prefetches + total_demand_loads
         return {
             'steps': len(self.steps),
             'total_transfers': total_transfers,
             'prefetches': total_prefetches,
-            'post_routing_prefetches': total_post_routing,
             'demand_loads': total_demand_loads,
             'evictions': total_evictions,
         }

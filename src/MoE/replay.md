@@ -54,11 +54,18 @@ trace = ActivationTrace.from_flat_trace(trace_data)
 Complete schedule of every prefetch, eviction, and demand load for an entire
 decode sequence. Produced by policy simulators, consumed by `ReplayController`.
 
+Uses a **unified expert cache** shared across all layers. Any cache slot can
+hold any `(layer, expert_id)` pair. The single `cache_size` parameter controls
+the total number of expert slots on GPU — there is no per-layer partitioning.
+This allows arbitrarily different numbers of experts per layer (e.g., 8 in
+layer 0, 0 in layer 5, 3 in layer 10) as long as the total does not exceed
+`cache_size`.
+
 ```
 DataMovementTrace:
     num_layers:          int
     num_experts:         int
-    experts_per_layer:   int                         # GPU cache capacity per layer
+    cache_size:          int                         # total unified GPU cache slots
     initial_cache_state: list[(layer, expert_id)]    # experts on GPU at start
     steps:               list[StepTrace]             # one per decode token
 
@@ -66,11 +73,10 @@ StepTrace:
     layers: list[LayerTrace]                         # one per transformer layer
 
 LayerTrace:
-    topk_ids:                   list[list[int]]      # expert selections per token
-    topk_weights:               list[list[float]]
-    prefetches:                 list[TransferEvent]   # async, before attention
-    post_routing_prefetches:    list[TransferEvent]   # async, after stage4a
-    demand_loads:               list[TransferEvent]   # blocking, before stage4b
+    topk_ids:       list[list[int]]      # expert selections per token
+    topk_weights:   list[list[float]]
+    prefetches:     list[TransferEvent]  # async transfers targeting this layer
+    demand_loads:   list[TransferEvent]  # blocking, before stage4b
 ```
 
 ### TransferEvent
@@ -85,14 +91,14 @@ TransferEvent:
 
 The `evict` field determines the transfer's cache semantics:
 
-| `evict` | Semantics | Persistence | Slot |
-|---------|-----------|-------------|------|
-| `None` | **Scratchpad load** — expert loaded into ephemeral scratchpad | Discarded after stage4b of this layer | `scratchpad_start + next_slot` |
-| `(l, e)` | **Persistent replacement** — evict resident `e` from layer `l`, load target into freed slot | Survives across layers and steps | Evicted expert's former slot |
+| `evict` | Semantics | Slot |
+|---------|-----------|------|
+| `None` | **Free slot load** — cache has unused capacity, no eviction needed | Taken from free pool |
+| `(l, e)` | **Replacement** — evict resident `(l, e)`, load target into freed slot | Evicted expert's former slot |
 
-**Constraint**: `evict.layer` must equal `target.layer`. Each layer's persistent
-cache slots occupy a disjoint address range in the unified buffer, so evictions
-can only free slots within the same layer.
+In the unified cache, `evict` can target **any** `(layer, expert_id)` regardless
+of the target's layer. There is no same-layer constraint — cross-layer eviction
+is fully supported.
 
 ### Serialization
 
@@ -106,44 +112,44 @@ trace = DataMovementTrace.load("lru_movement.json")
 `DataMovementTrace.validate()` simulates the residency state machine and returns
 a list of error strings (empty = valid). It checks:
 
-1. **Initial capacity**: no layer starts with more than `experts_per_layer` experts.
-2. **Cross-layer eviction**: `evict.layer == target.layer` for every transfer.
-3. **Capacity maintenance**: persistent cache never exceeds capacity after transfers.
-4. **Expert coverage**: every expert in `topk_ids` is either already resident
-   (persistent cache) or loaded by a transfer in that layer (prefetch,
-   post-routing prefetch, or demand load).
+1. **Initial capacity**: `len(initial_cache_state) <= cache_size`.
+2. **Capacity maintenance**: unified cache never exceeds `cache_size` after transfers.
+3. **Expert coverage**: every expert in `topk_ids` is either already resident
+   or loaded by a prefetch/demand load in that layer.
 
-Residency tracking rules in validation:
-
-- **Persistent replacements** (`evict != None`): the evicted expert is removed
-  from `resident[layer]`, and the target expert is added. This state persists
-  across layers and steps.
-- **Scratchpad loads** (`evict == None`): tracked in a per-layer `loaded_this_layer`
-  set but *not* added to the persistent `resident` state. They are ephemeral and
-  only valid for the current layer's stage4b.
+Residency tracking uses a single `resident: set[(layer, eid)]`. Each transfer
+with `evict != None` removes the evicted expert and adds the target. Transfers
+with `evict == None` add the target using a free slot (capacity increases by 1).
+State persists across layers and steps.
 
 ---
 
 ## Policy Simulators
 
 All policies live in `policy_simulator.py` and inherit from `EvictionPolicy`.
-Each takes an `ActivationTrace` and `experts_per_layer` budget and returns a
-validated `DataMovementTrace`.
+Each takes an `ActivationTrace` and `cache_size` budget and returns a validated
+`DataMovementTrace`. The cache is **unified across all layers** — a single pool
+of slots keyed by `(layer, expert_id)`.
 
 ```python
 trace = ActivationTrace.load("expert_trace.json")
 policy = LRUPolicy()
-dm_trace = policy.simulate(trace, experts_per_layer=2)
+dm_trace = policy.simulate(trace, cache_size=64)
 errors = dm_trace.validate()
 assert not errors
 dm_trace.save("lru_movement.json")
 ```
 
+All policies accept an optional `initial_cache: list[(layer, eid)]` parameter.
+If not provided, `_default_initial_cache(cache_size, num_layers, num_experts)`
+fills uniformly: expert 0 across all layers, then expert 1, etc., until
+`cache_size` slots are filled.
+
 ### LRUPolicy — Least Recently Used
 
-Per-layer LRU cache using `OrderedDict`. On cache miss:
-- If cache has capacity: scratchpad load (no eviction).
-- If cache is full: evict LRU (first item in OrderedDict), load into freed slot.
+Unified LRU cache using `OrderedDict` keyed by `(layer, eid)`. On cache miss:
+- If cache has free slots: load into free slot (no eviction).
+- If cache is full: evict the globally LRU expert, load into freed slot.
 
 All loads are **demand loads only** — no prefetching. This is the simplest
 baseline and represents a reactive system with no prediction.
@@ -159,22 +165,23 @@ future access positions as a sorted list. Position is a global ordering:
 **Pass 2 — Simulate forward**: At each `(step, layer)`:
 
 1. **Demand loads for current layer**: For each needed expert not in cache,
-   evict the resident whose next use is farthest in the future (Belady's MIN).
-   This is the theoretical minimum number of cache misses.
+   evict the resident whose next use is farthest in the future (Belady's MIN),
+   searching **globally across all (layer, eid)** entries. This is the
+   theoretical minimum number of cache misses.
 
 2. **Lookahead prefetch for next layer**: At layer `L`, look ahead to layer
-   `L+1` (same step). If `L+1` needs a non-resident expert, issue a prefetch
-   targeting layer `L+1`'s cache. This prefetch is recorded in layer `L`'s
-   `prefetches` list so the replay controller can overlap it with layer `L`'s
-   attention compute.
+   `L+1` (same step). If `L+1` needs a non-resident expert, issue a prefetch.
+   The prefetch is stored in `layers[L+1].prefetches` (associated with the
+   target layer) so the replay controller issues it at the right time — before
+   stage4b of layer `L`, overlapping with stage4b(L) + stages 1-4a(L+1).
 
    ```
-   Layer L prefetches:    [{target: (L+1, eid), evict: (L+1, victim)}]
-   Layer L demand_loads:  [{target: (L, eid), evict: (L, victim)}]
+   Layer L+1 prefetches:  [{target: (L+1, eid), evict: (any_layer, victim)}]
+   Layer L demand_loads:  [{target: (L, eid), evict: (any_layer, victim)}]
    ```
 
-   The prefetch targets layer `L+1` and therefore evicts from layer `L+1`'s
-   cache — maintaining the constraint `evict.layer == target.layer`.
+   Eviction victims can come from **any layer** — the unified cache has no
+   same-layer constraint.
 
 Belady victim selection avoids evicting experts that are needed in the current
 operation (protected set). Ties are broken by the first candidate found in
@@ -182,12 +189,30 @@ iteration order.
 
 ### FrequencyPolicy — Least Frequently Used (LFU)
 
-Per-layer frequency counters. On eviction, removes the expert with the lowest
-access count (ties broken by lowest expert ID). All loads are demand loads.
+Global frequency counters keyed by `(layer, eid)`. On eviction, removes the
+expert with the lowest access count (ties broken by smallest `(layer, eid)`
+tuple). All loads are demand loads.
 
 Supports optional **windowed mode**: reset all frequency counts every
 `window_size` steps. This prevents stale frequency data from dominating in
 non-stationary workloads.
+
+### StaticPolicy — Global Frequency Ranking (Oracle)
+
+Pre-computes access frequencies over the **entire** trace (including future
+steps), then:
+
+1. **Initial cache**: the top `cache_size` experts by global frequency.
+2. **On miss**: evict the resident with the lowest global frequency.
+
+Since frequencies are fixed and pre-computed, the top `(cache_size - E)`
+experts (where `E = num_experts`) are effectively **pinned** and never
+evicted. Only the bottom `E` slots cycle through demand-loaded experts.
+This policy requires oracle knowledge (full trace) and represents the best
+possible static caching strategy — it answers: "how well can you do if you
+simply keep the most popular experts?"
+
+All loads are demand loads (no prefetching).
 
 ### PreGatedPolicy — Lookahead Prefetch Wrapper
 
@@ -196,12 +221,16 @@ prefetching (same mechanism as OraclePolicy's lookahead). At layer `L`,
 examines layer `L+1`'s needed experts (from the trace) and issues prefetches
 for non-resident ones.
 
+Prefetches are stored in `layers[L+1].prefetches` (associated with the target
+layer), matching the replay controller's expectation.
+
 In a real system, this corresponds to running the router's gate network early
 (before attention) to predict next-layer expert selections. Since we simulate
 on recorded traces, we simply look ahead in the trace data.
 
 Cache eviction decisions for both demand loads and prefetches are delegated to
-the base policy's logic (LRU ordering or LFU counts).
+the base policy's logic (LRU ordering or LFU counts). Eviction victims can
+come from any layer.
 
 ### Policy Comparison
 
@@ -209,7 +238,8 @@ the base policy's logic (LRU ordering or LFU counts).
 |--------|-------------|------------|-------------------|----------|
 | LRU | Yes | No | Least recently used | No |
 | Oracle | Yes | 1-layer lookahead | Belady's MIN (farthest future use) | Yes (eviction) |
-| Frequency | Yes | No | Least frequently used | No |
+| Frequency | Yes | No | Least frequently used (running) | No |
+| Static | Yes | No | Least frequently used (global/oracle) | Best static |
 | PreGated(LRU) | Yes | 1-layer lookahead | Least recently used | No |
 | PreGated(Freq) | Yes | 1-layer lookahead | Least frequently used | No |
 
@@ -231,131 +261,129 @@ Default stream (compute):   CUDA graphs for stages 1, 4a, 4b
                             Eager FlashAttention prefill (stage 3)
                             Demand loads (blocking)
 
-Transfer stream:            Async prefetches (before attention)
-                            Async post-routing prefetches (after stage4a)
+Transfer stream:            Async prefetches (overlaps with previous layer's
+                            stage4b + current layer's stages 1-4a)
 ```
 
-Two CUDA events serve as synchronization barriers between the streams:
+One CUDA event serves as the synchronization barrier:
 
-- `_prefetch_done_event`: Recorded on transfer stream after pre-attention prefetches complete.
-- `_post_routing_done_event`: Recorded on transfer stream after post-routing prefetches complete.
+- `_prefetch_done_event`: Recorded on transfer stream after prefetches complete.
+  The compute stream waits on this in `process_layer_replay()` before demand loads.
 
 ### GPU Buffer Layout
 
 The replay controller shares the MoEEngine's unified expert buffer:
 
 ```
-w1_buf = [L * experts_per_layer + scratchpad_slots, 2*I, H]
-w2_buf = [L * experts_per_layer + scratchpad_slots, H, I]
-
-Persistent cache:  slots [l*epl, ..., (l+1)*epl - 1]    per layer l
-Scratchpad:        slots [L*epl, ..., L*epl + E - 1]    shared, ephemeral
+w1_buf = [cache_size, 2*I, H]     # flat, no per-layer partitioning
+w2_buf = [cache_size, H, I]
 ```
 
-Two expert maps index into this buffer:
-- `expert_map[l][eid]`: Relative slot within layer `l`'s view (for per-layer CUDA graphs).
-- `expert_map_abs[l][eid]`: Absolute slot in the full buffer (for stage4b graphs operating on the entire buffer).
-- `expert_map_buf[eid]`: Single-layer working copy, updated before each stage4b. 32 bytes per layer (8 experts × 4 bytes).
+Any slot can hold any `(layer, expert_id)`. The controller tracks residency
+via `_resident: dict[(layer, eid) → slot]` and `_free_slots: set[int]`.
+
+Expert map indexing:
+- `expert_map_abs[l][eid]`: Absolute slot in the flat buffer (or -1 if not resident).
+- `expert_map_buf[eid]`: Single-layer working copy, updated before each stage4b.
 
 ### Per-Layer Execution Timeline
 
 For each layer during `_mixed_step_piecewise`, the MoEEngine calls into the
-replay controller at four hook points:
+replay controller at specific hook points. The key design: **only layer 0
+prefetches at the start of the network**. For all subsequent layers, prefetches
+are issued inside `process_layer_replay(L-1)` right before stage4b of L-1.
 
 ```
-┌─────────────────────── Transfer Stream ──────────────────────────┐
-│                                                                  │
-│  ① begin_layer_prefetch(layer)                                   │
-│     Issue prefetches for experts needed by layer+1               │
-│     w1_buf[slot].copy_(w1_cpu[...], non_blocking=True)          │
-│     w2_buf[slot].copy_(w2_cpu[...], non_blocking=True)          │
-│     Record _prefetch_done_event                                  │
-│              │                                                   │
-│              │ (async, overlaps with stages 1-3)                 │
-│              ↓                                                   │
-│  ③ process_layer_replay(layer) — post-routing transfers          │
-│     Issue post_routing_prefetches (async)                        │
-│     Record _post_routing_done_event                              │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
+┌─ Layer 0 ─────────────────────────────────────────────────────────┐
+│                                                                   │
+│  Transfer:  ① begin_layer_prefetch(0)                             │
+│                Issue layers[0].prefetches on transfer stream      │
+│                Record _prefetch_done_event                        │
+│                     │ (async, overlaps with stages 1-4a)          │
+│                     ↓                                             │
+│  Compute:   Stage 1 → Stage 2 → Stage 3 → Stage 4a               │
+│                     ↓                                             │
+│             ② process_layer_replay(0):                            │
+│                a. Copy expert_map_abs[0] → expert_map_buf         │
+│                b. wait_event(_prefetch_done_event)   ← SYNC ①    │
+│                c. Execute demand_loads (blocking)                 │
+│                d. Re-copy expert_map_abs → expert_map_buf         │
+│                e. Issue layers[1].prefetches on transfer stream   │
+│                   Record _prefetch_done_event                     │
+│                     ↓                                             │
+│             Stage 4b graph (MoE GEMM)                             │
+│             post_layer(0) — no-op                                 │
+│                                                                   │
+└───────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────── Default Stream (compute) ─────────────────┐
-│                                                                  │
-│  Stage 1 graph   RMSNorm → QKV proj → Q/K norm → RoPE → KV write│
-│       ↓                                                          │
-│  Stage 2 eager   FlashInfer BatchDecodeWithPagedKVCache          │
-│       ↓                                                          │
-│  Stage 3 eager   FlashAttention varlen prefill (if mixed batch)  │
-│       ↓                                                          │
-│  Stage 4a graph  O_proj → residual → post-attn norm → router    │
-│       ↓                                                          │
-│  ③ process_layer_replay(layer):                                  │
-│     a. Copy expert_map_abs[layer] → expert_map_buf               │
-│     b. Issue post_routing_prefetches on transfer stream           │
-│     c. wait_event(_prefetch_done_event)       ← SYNC ①          │
-│     d. wait_event(_post_routing_done_event)   ← SYNC ③          │
-│     e. Execute demand_loads (blocking, default stream)           │
-│     f. Re-copy expert_map_abs → expert_map_buf                   │
-│        Overlay scratchpad assignments                            │
-│       ↓                                                          │
-│  Stage 4b graph  fused_experts (Triton GEMM) → residual add     │
-│       ↓                                                          │
-│  ④ post_layer(layer):                                            │
-│     Clear scratchpad assignments (ephemeral)                     │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
+┌─ Layer L (L > 0) ────────────────────────────────────────────────┐
+│                                                                   │
+│  Transfer:  (prefetches for layer L already issued in step ②      │
+│              of layer L-1, running async during stage4b(L-1)      │
+│              + stages 1-4a(L))                                    │
+│                                                                   │
+│  Compute:   Stage 1 → Stage 2 → Stage 3 → Stage 4a               │
+│                     ↓                                             │
+│             ② process_layer_replay(L):                            │
+│                a. Copy expert_map_abs[L] → expert_map_buf         │
+│                b. wait_event(_prefetch_done_event)   ← SYNC      │
+│                c. Execute demand_loads (blocking)                 │
+│                d. Re-copy expert_map_abs → expert_map_buf         │
+│                e. Issue layers[L+1].prefetches (if L+1 < N)      │
+│                   Record _prefetch_done_event                     │
+│                     ↓                                             │
+│             Stage 4b graph (MoE GEMM)                             │
+│             post_layer(L) — no-op                                 │
+│                                                                   │
+└───────────────────────────────────────────────────────────────────┘
 ```
+
+The overlap window for prefetches targeting layer L is:
+- **Layer 0**: stages 1-4a of layer 0 only.
+- **Layer L>0**: stage4b of layer L-1 + stages 1-4a of layer L.
 
 ### Prefetch and Eviction Timing — Detailed
 
-#### Pre-Attention Prefetches (`begin_layer_prefetch`)
+#### Layer 0 Prefetches (`begin_layer_prefetch`)
 
-Called **before stage 1** of each layer. These transfers run on the transfer
-stream and overlap with the full compute pipeline (stages 1–3 + stage 4a):
+Called **before stage 1**, only for layer 0. These transfers run on the transfer
+stream and overlap with the full compute pipeline (stages 1–4a) of layer 0:
 
-- **When issued**: Before any compute for this layer begins.
-- **What they transfer**: Experts specified by `LayerTrace.prefetches`. These
-  typically target the *next* layer's cache (e.g., Oracle/PreGated policies set
-  `target = (layer+1, eid)`).
-- **Overlap window**: Stages 1–3 provide ~1.1 ms of compute on Mixtral-8x7B
+- **When issued**: Before any compute for layer 0 begins.
+- **What they transfer**: Experts specified by `layers[0].prefetches`.
+- **Overlap window**: Stages 1–4a provide ~1.1 ms of compute on Mixtral-8x7B
   (0.3 ms stage1 + 0.5 ms FlashInfer decode + 0.2 ms FA3 prefill + 0.1 ms
   stage4a). A single expert transfer at ~50 GB/s PCIe takes ~6.5 ms for a
   336 MB Mixtral expert, so **one expert can be partially overlapped** and
   **small experts (e.g., OLMoE at ~4 MB) can be fully hidden**.
-- **Synchronization**: The transfer stream records `_prefetch_done_event` after
-  all pre-attention prefetches. The compute stream waits on this event in
-  `process_layer_replay()`, after stage 4a but before stage 4b.
+- **Synchronization**: The transfer stream records `_prefetch_done_event`.
+  The compute stream waits on this event in `process_layer_replay(0)`.
 
-For persistent replacements, the evicted expert's slot is immediately reclaimed
-and repurposed for the incoming expert. The `expert_map` and `expert_map_abs`
-are updated synchronously (CPU-side) during `_execute_transfer`, so they are
-consistent before stage 4b's CUDA graph replays.
+#### Next-Layer Prefetches (`process_layer_replay`, step e)
 
-#### Post-Routing Prefetches (`process_layer_replay`, step b)
+Issued inside `process_layer_replay(L)` right before returning (before stage4b
+of layer L). These prefetch experts for layer L+1:
 
-Called **after stage 4a** — the router has selected experts, so the exact
-demand is known:
+- **When issued**: After demand loads for layer L are complete, before stage4b.
+- **What they transfer**: Experts specified by `layers[L+1].prefetches`.
+- **Overlap window**: stage4b of layer L (~0.27 ms Mixtral) + stages 1-4a of
+  layer L+1 (~1.1 ms). Total ~1.4 ms overlap — more than the layer-0-only
+  window, enabling better hiding of larger transfers.
+- **Synchronization**: The transfer stream records `_prefetch_done_event`.
+  The compute stream waits on this in `process_layer_replay(L+1)`.
 
-- **When issued**: Immediately after stage 4a completes on the compute stream.
-- **What they transfer**: Experts specified by `LayerTrace.post_routing_prefetches`.
-  These target the current layer's cache (policy knew from the trace which
-  experts would be selected but chose to defer transfer until routing confirmed).
-- **Overlap window**: Minimal — these run concurrently with the synchronization
-  logic in `process_layer_replay()` but must complete before stage 4b.
-- **Synchronization**: The transfer stream records `_post_routing_done_event`.
-  The compute stream waits on this event immediately after (step d).
-
-#### Demand Loads (`process_layer_replay`, step e)
+#### Demand Loads (`process_layer_replay`, step c)
 
 **Blocking** transfers on the default (compute) stream. These represent true
 cache misses — experts that no prefetch covered:
 
-- **When issued**: After all async transfers are synchronized (steps c, d).
+- **When issued**: After async prefetches are synchronized.
 - **Impact**: Each demand load adds ~6.5 ms (Mixtral) or ~0.08 ms (OLMoE) of
   blocking latency before stage 4b can execute. Multiple demand loads are
   sequential.
-- **Slot assignment**: Demand loads may use persistent replacement (evict a
-  resident) or scratchpad (ephemeral).
+- **Slot assignment**: Demand loads with `evict != None` reuse the evicted
+  expert's slot. Demand loads with `evict == None` take a slot from the free
+  pool.
 
 #### Eviction Timing
 
@@ -363,13 +391,15 @@ Evictions are **immediate and coupled to the transfer that triggers them**.
 There is no separate eviction phase:
 
 - When `_execute_transfer(event)` processes an event with `evict != None`:
-  1. The evicted expert is removed from `_resident[layer]` and both expert maps.
+  1. The evicted expert is removed from `_resident` and `expert_map_abs`.
   2. The freed slot's GPU memory is overwritten by the incoming expert's
      `copy_()` (non-blocking when on transfer stream, blocking on compute stream).
-  3. The new expert is added to `_resident[layer]` and both expert maps.
+  3. The new expert is added to `_resident` and `expert_map_abs`.
 
 - The eviction is a **logical operation** (map update + slot reuse). There is
   no explicit "free" or "invalidate" — the slot is simply overwritten.
+- Cross-layer eviction is fully supported: evicting `(layer=3, eid=5)` to
+  load `(layer=7, eid=2)` is valid.
 
 #### Expert Map Update Sequence
 
@@ -377,21 +407,16 @@ Before stage 4b, the expert map buffer must reflect the correct slot for every
 expert the MoE kernel will access:
 
 ```python
-# 1. Start with persistent cache state
+# 1. Start with current cache state
 expert_map_buf.copy_(expert_map_abs[layer])
 
-# 2. Persistent replacements from prefetches/post-routing/demand loads
-#    already updated expert_map_abs during _execute_transfer(), so re-copy:
+# 2. All transfers (prefetches + demand loads) update expert_map_abs
+#    via _execute_transfer(), so re-copy after transfers:
 expert_map_buf.copy_(expert_map_abs[layer])
-
-# 3. Overlay scratchpad assignments (ephemeral, not in expert_map_abs)
-for eid, slot in _scratchpad_assignments.items():
-    expert_map_buf[eid] = slot
 ```
 
-This ensures the Triton `fused_experts` kernel in stage 4b reads the correct
-weight slice for every selected expert, whether it was persistently cached,
-persistently replaced, or loaded into the scratchpad.
+No scratchpad overlay is needed — all experts live in the unified cache and
+are tracked in `expert_map_abs`.
 
 ### Latency Model
 
@@ -409,7 +434,7 @@ Where:
 **Best case** (all needed experts prefetched or resident): `wall ≈ compute_time`.
 
 **Worst case** (all experts are demand loads, no prefetching): For Mixtral with
-`experts_per_layer=2` and top-2 selection, up to 2 experts may miss per layer,
+a small `cache_size` and top-2 selection, up to 2 experts may miss per layer,
 adding ~13 ms of blocking IO to the ~1.4 ms of compute. This matches the
 validated latency model from Phase 4: IO accounts for 90–96% of wall-clock
 time in demand-load-only configurations.
@@ -419,11 +444,12 @@ time in demand-load-only configurations.
 | Aspect | ReplayController | ExpertOffloadEngine |
 |--------|-----------------|---------------------|
 | **Decision source** | Pre-computed `DataMovementTrace` | Reactive (reads routing at runtime) |
-| **Prefetching** | Scheduled per trace (3 transfer categories) | Optional via `prefetch_experts_async()` |
+| **Cache model** | Unified `cache_size` slots across all layers | Per-layer `experts_per_layer` + scratchpad |
+| **Prefetching** | Scheduled per trace (2 categories: prefetch + demand) | None (pure demand loading) |
 | **Eviction policy** | Encoded in trace (any policy) | Simple demand load (no policy) |
-| **Async transfers** | Full: prefetch stream + sync events | Partial: blocking `synchronize()` per expert |
+| **Async transfers** | Transfer stream + CUDA event sync | Blocking `synchronize()` per expert |
 | **Use case** | Evaluating policy performance | Recording activation traces + baseline timing |
-| **Hook points** | `begin_layer_prefetch` + `process_layer_replay` + `post_layer` | `process_layer` (blocking) |
+| **Hook points** | `begin_layer_prefetch` (layer 0 only) + `process_layer_replay` + `post_layer` (no-op) | `process_layer` (blocking) |
 
 ---
 
@@ -434,6 +460,7 @@ time in demand-load-only configurations.
 ```python
 from moe_engine import MoEEngine
 
+# Use experts_per_layer for trace recording (ExpertOffloadEngine mode)
 engine = MoEEngine("models/Mixtral-8x7B", experts_per_layer=2)
 engine.capture_prefill_cuda_graph(total_token_sizes=[128])
 engine.capture_mixed_cuda_graphs(total_token_sizes=[128])
@@ -457,7 +484,8 @@ from policy_simulator import OraclePolicy
 
 activation_trace = ActivationTrace.load("expert_trace.json")
 policy = OraclePolicy()
-dm_trace = policy.simulate(activation_trace, experts_per_layer=4)
+# cache_size = total unified GPU slots (e.g., 4 experts per layer * 32 layers = 128)
+dm_trace = policy.simulate(activation_trace, cache_size=128)
 
 # Validate and inspect
 errors = dm_trace.validate()
@@ -468,7 +496,7 @@ print(f"Demand loads: {stats['demand_loads']}, "
       f"Prefetches: {stats['prefetches']}, "
       f"Evictions: {stats['evictions']}")
 
-dm_trace.save("oracle_epl4_movement.json")
+dm_trace.save("oracle_cs128_movement.json")
 ```
 
 ### Step 3: Replay on GPU Hardware
@@ -477,9 +505,11 @@ dm_trace.save("oracle_epl4_movement.json")
 from data_movement_trace import DataMovementTrace
 from replay_controller import ReplayController
 
-dm_trace = DataMovementTrace.load("oracle_epl4_movement.json")
+dm_trace = DataMovementTrace.load("oracle_cs128_movement.json")
+# For replay, use cache_size mode (unified cache)
+engine = MoEEngine("models/Mixtral-8x7B", cache_size=128)
 controller = ReplayController(engine, dm_trace)
-controller.setup()  # Load initial cache state into GPU buffer
+controller.setup()  # Load initial cache state into unified GPU buffer
 
 # Attach to engine and run the same inference
 engine.replay_controller = controller
@@ -506,7 +536,7 @@ policies = {
 }
 
 for name, policy in policies.items():
-    dm = policy.simulate(activation_trace, experts_per_layer=4)
+    dm = policy.simulate(activation_trace, cache_size=128)
     errors = dm.validate()
     assert not errors
     s = dm.summary()
@@ -518,17 +548,19 @@ for name, policy in policies.items():
 
 ## Tests
 
-`tests/test_replay_policy.py` covers all of the above with 26 tests:
+`tests/test_replay_policy.py` covers all of the above with 39 tests:
 
 | Category | Tests | What's verified |
 |----------|-------|-----------------|
-| Serialization | 3 | TransferEvent round-trip, DataMovementTrace save/load |
-| Validation | 4 | Valid trace passes, missing expert, cross-layer eviction, overcapacity |
+| Serialization | 4 | TransferEvent round-trip, cross-layer evict, DataMovementTrace save/load |
+| Validation | 4 | Valid trace passes, missing expert, overcapacity, free slot addition |
 | ActivationTrace | 3 | from_flat_trace, save/load round-trip, empty trace |
-| LRU | 4 | No misses when all fit, eviction order, validate passes, no prefetches |
-| Oracle | 3 | Fewer misses than LRU, generates prefetches, validate passes |
+| LRU | 5 | No misses when all fit, eviction order, validate passes, no prefetches, cross-layer eviction |
+| Oracle | 4 | Fewer misses than LRU, generates prefetches, validate passes, prefetches stored in target layer |
 | Frequency | 3 | Evicts least frequent, windowed reset, validate passes |
-| PreGated | 4 | Generates prefetches, reduces demands vs LRU, both base types validate |
+| Static | 5 | Initial cache has most frequent, evicts least frequent globally, high-freq pinning, validate, no prefetches |
+| PreGated | 5 | Generates prefetches, reduces demands vs LRU, both base types validate, prefetches in target layer |
+| Integration | 4 | Variable experts per layer, zero-experts layer, cache pressure across layers, summary counts |
 | Summary | 2 | Counts correct, Oracle prefetches in summary |
 
 Run: `cd GPU_Offloading/src/MoE && python -m pytest tests/test_replay_policy.py -v`
@@ -543,4 +575,4 @@ Run: `cd GPU_Offloading/src/MoE && python -m pytest tests/test_replay_policy.py 
 | `policy_simulator.py` | `LRUPolicy`, `OraclePolicy`, `FrequencyPolicy`, `PreGatedPolicy` — pure-Python policy simulators |
 | `replay_controller.py` | `ReplayController` — GPU replay with async CUDA streams |
 | `expert_offload_engine.py` | `ExpertOffloadEngine` — reactive demand loading, trace recording |
-| `tests/test_replay_policy.py` | 26 unit tests for trace format + all policies |
+| `tests/test_replay_policy.py` | 34 unit tests for trace format + all policies (unified cache) |

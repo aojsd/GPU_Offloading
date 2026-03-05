@@ -178,6 +178,7 @@ class MoEEngine:
         use_torch_compile: bool = True,
         gpu_expert_budget: int = None,
         experts_per_layer: int = None,
+        cache_size: int = None,
     ):
         self.device = device
         self.dtype = dtype
@@ -194,6 +195,14 @@ class MoEEngine:
         else:
             self.experts_per_layer = None
         self.gpu_expert_budget = self.experts_per_layer  # alias for compat
+
+        # Unified cache mode: single shared cache across all layers
+        self.cache_size = cache_size
+        if self.experts_per_layer is not None and self.cache_size is not None:
+            raise ValueError(
+                "Cannot set both experts_per_layer and cache_size")
+        self.offloading = (self.experts_per_layer is not None or
+                           self.cache_size is not None)
 
         # Load config
         with open(Path(model_path) / "config.json") as f:
@@ -272,18 +281,19 @@ class MoEEngine:
         # No prefill wrapper needed — FA3 (flash_attn_varlen_func) is stateless
 
         # Guard: check model fits on GPU (skip in offloading mode — experts on CPU)
-        if self.experts_per_layer is None:
+        if not self.offloading:
             mem_gb = torch.cuda.memory_allocated() / 1024**3
             gpu_total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
             if mem_gb > gpu_total_gb * 0.95:
                 raise RuntimeError(
                     f"Model requires {mem_gb:.1f} GB but GPU has "
-                    f"{gpu_total_gb:.0f} GB. Use experts_per_layer=K to enable "
-                    f"expert offloading (K expert cache slots per layer).")
+                    f"{gpu_total_gb:.0f} GB. Use experts_per_layer=K or "
+                    f"cache_size=N to enable expert offloading.")
 
         # Expert offload engine — auto-created when experts_per_layer is set.
         # Handles demand loading of non-resident experts between stage4a
         # (routing) and stage4b (MoE compute) in piecewise CUDA graph replay.
+        # Not created for cache_size mode (ReplayController handles that).
         if self.experts_per_layer is not None:
             from expert_offload_engine import ExpertOffloadEngine
             self.offload_engine = ExpertOffloadEngine(self)
@@ -292,8 +302,12 @@ class MoEEngine:
         self.replay_controller = None  # set to ReplayController for trace replay
 
         model_type = cfg.get("model_type", "unknown")
-        budget_str = (f", experts_per_layer={self.experts_per_layer}"
-                      if self.experts_per_layer is not None else "")
+        if self.experts_per_layer is not None:
+            budget_str = f", experts_per_layer={self.experts_per_layer}"
+        elif self.cache_size is not None:
+            budget_str = f", cache_size={self.cache_size}"
+        else:
+            budget_str = ""
         print(f"MoEEngine ready ({model_type}): {self.num_layers}L, "
               f"{self.num_experts}E (top-{self.top_k}), "
               f"hidden={self.hidden_size}, heads={self.num_heads}, "
@@ -328,7 +342,7 @@ class MoEEngine:
 
     def _load_weights(self, model_path: str):
         model_path = Path(model_path)
-        offloading = self.experts_per_layer is not None
+        offloading = self.offloading
 
         # When offloading, load to CPU first to avoid GPU OOM on large models.
         # Non-expert weights (~3 GB) move to GPU; expert weights stay on CPU.
@@ -361,47 +375,62 @@ class MoEEngine:
 
         # Expert weight storage depends on mode
         if offloading:
-            experts_per_layer = self.experts_per_layer
             I = self.intermediate_size
             H = self.hidden_size
             E = self.num_experts
-            # Scratchpad must hold all experts that could be non-resident in
-            # a single layer. With batch_size=B and top_k=K, up to min(E, B*K)
-            # unique experts per layer could be needed. Use E to cover all cases.
-            scratchpad = E
-            total_slots = self.num_layers * experts_per_layer + scratchpad
+
+            if self.cache_size is not None:
+                # Unified cache mode: flat buffer, no per-layer partitioning
+                total_slots = self.cache_size
+                scratchpad = 0
+            else:
+                # Per-layer mode: L partitions + scratchpad
+                experts_per_layer = self.experts_per_layer
+                scratchpad = E
+                total_slots = self.num_layers * experts_per_layer + scratchpad
 
             # CPU pinned storage for all experts
             self.w1_cpu = []
             self.w2_cpu = []
 
-            # Unified GPU buffer: all layers' residents + scratchpad
+            # GPU buffer for cached experts
             self.w1_buf = torch.zeros(total_slots, 2 * I, H, dtype=self.dtype,
                                       device=self.device)
             self.w2_buf = torch.zeros(total_slots, H, I, dtype=self.dtype,
                                       device=self.device)
 
-            # Expert maps
-            self.expert_map = []      # relative (for per-layer views)
-            self.expert_map_abs = []  # absolute (for full buffer in stage4b)
+            # Expert maps (absolute: maps expert_id -> buffer slot per layer)
+            self.expert_map_abs = []
             self.expert_map_buf = torch.full((E,), -1, dtype=torch.int32,
                                              device=self.device)
 
-            # Per-layer views (zero-copy into unified buffer)
-            self.w1 = []
-            self.w2 = []
-
-            self.scratchpad_start = self.num_layers * experts_per_layer
-            self.scratchpad_slots = scratchpad
+            if self.experts_per_layer is not None:
+                # Per-layer mode needs relative maps + per-layer views
+                self.expert_map = []
+                self.w1 = []
+                self.w2 = []
+                self.scratchpad_start = (self.num_layers *
+                                         self.experts_per_layer)
+                self.scratchpad_slots = scratchpad
+            else:
+                self.scratchpad_start = self.cache_size
+                self.scratchpad_slots = 0
 
             buf_bytes = (self.w1_buf.numel() * self.w1_buf.element_size() +
                          self.w2_buf.numel() * self.w2_buf.element_size())
-            print(f"  Unified buffer: {total_slots} slots "
-                  f"({self.num_layers}L x {experts_per_layer} experts_per_layer"
-                  f" + {scratchpad} scratchpad), "
-                  f"w1_buf {list(self.w1_buf.shape)}, "
-                  f"w2_buf {list(self.w2_buf.shape)} "
-                  f"({buf_bytes / 1e9:.2f} GB)")
+            if self.cache_size is not None:
+                print(f"  Unified cache: {total_slots} slots "
+                      f"(cache_size={self.cache_size}), "
+                      f"w1_buf {list(self.w1_buf.shape)}, "
+                      f"w2_buf {list(self.w2_buf.shape)} "
+                      f"({buf_bytes / 1e9:.2f} GB)")
+            else:
+                print(f"  Unified buffer: {total_slots} slots "
+                      f"({self.num_layers}L x {experts_per_layer}"
+                      f" experts_per_layer + {scratchpad} scratchpad), "
+                      f"w1_buf {list(self.w1_buf.shape)}, "
+                      f"w2_buf {list(self.w2_buf.shape)} "
+                      f"({buf_bytes / 1e9:.2f} GB)")
         else:
             self.w1 = []
             self.w2 = []
@@ -459,34 +488,46 @@ class MoEEngine:
                 self.w1_cpu.append(w1_full)
                 self.w2_cpu.append(w2_full)
 
-                # Populate unified buffer: first experts_per_layer experts
-                base = l * experts_per_layer
-                copy_n = min(experts_per_layer, E)
-                for slot in range(copy_n):
-                    self.w1_buf[base + slot].copy_(w1_full[slot])
-                    self.w2_buf[base + slot].copy_(w2_full[slot])
+                if self.experts_per_layer is not None:
+                    # Per-layer mode: populate buffer with initial experts
+                    base = l * experts_per_layer
+                    copy_n = min(experts_per_layer, E)
+                    for slot in range(copy_n):
+                        self.w1_buf[base + slot].copy_(w1_full[slot])
+                        self.w2_buf[base + slot].copy_(w2_full[slot])
 
-                # Per-layer views (zero-copy into unified buffer)
-                self.w1.append(self.w1_buf[base : base + experts_per_layer])
-                self.w2.append(self.w2_buf[base : base + experts_per_layer])
+                    # Per-layer views (zero-copy into unified buffer)
+                    self.w1.append(
+                        self.w1_buf[base : base + experts_per_layer])
+                    self.w2.append(
+                        self.w2_buf[base : base + experts_per_layer])
 
-                # Relative expert_map: first experts_per_layer → 0..N-1
-                emap_rel = torch.full((E,), -1, dtype=torch.int32,
-                                      device=self.device)
-                for slot in range(copy_n):
-                    emap_rel[slot] = slot
-                self.expert_map.append(emap_rel)
+                    # Relative expert_map: first experts_per_layer → 0..N-1
+                    emap_rel = torch.full((E,), -1, dtype=torch.int32,
+                                          device=self.device)
+                    for slot in range(copy_n):
+                        emap_rel[slot] = slot
+                    self.expert_map.append(emap_rel)
 
-                # Absolute expert_map: first experts_per_layer → base..base+N-1
-                emap_abs = torch.full((E,), -1, dtype=torch.int32,
-                                      device=self.device)
-                for slot in range(copy_n):
-                    emap_abs[slot] = base + slot
-                self.expert_map_abs.append(emap_abs)
+                    # Absolute expert_map
+                    emap_abs = torch.full((E,), -1, dtype=torch.int32,
+                                          device=self.device)
+                    for slot in range(copy_n):
+                        emap_abs[slot] = base + slot
+                    self.expert_map_abs.append(emap_abs)
 
-                print(f"  Layer {l}: w1_cpu {w1_full.shape}, "
-                      f"view [{base}:{base+experts_per_layer}] in unified "
-                      f"buffer, expert_map [{copy_n} resident / {E} total]")
+                    print(f"  Layer {l}: w1_cpu {w1_full.shape}, "
+                          f"view [{base}:{base+experts_per_layer}] in "
+                          f"unified buffer, expert_map "
+                          f"[{copy_n} resident / {E} total]")
+                else:
+                    # Unified cache mode: don't pre-load experts.
+                    # ReplayController.setup() populates the buffer.
+                    emap_abs = torch.full((E,), -1, dtype=torch.int32,
+                                          device=self.device)
+                    self.expert_map_abs.append(emap_abs)
+                    print(f"  Layer {l}: w1_cpu {w1_full.shape} "
+                          f"(unified cache, no pre-load)")
             else:
                 self.w1.append(torch.stack(w1_list))
                 self.w2.append(torch.stack(w2_list))
@@ -504,10 +545,13 @@ class MoEEngine:
         assert self.embed_tokens.shape == (self.vocab_size, self.hidden_size)
         assert self.lm_head.shape == (self.vocab_size, self.hidden_size)
         if offloading:
-            experts_per_layer = self.experts_per_layer
-            assert self.w1[0].shape == (experts_per_layer, 2 * self.intermediate_size, self.hidden_size)
-            assert self.w2[0].shape == (experts_per_layer, self.hidden_size, self.intermediate_size)
-            assert self.w1_buf.shape[0] == self.num_layers * experts_per_layer + self.scratchpad_slots
+            if self.experts_per_layer is not None:
+                experts_per_layer = self.experts_per_layer
+                assert self.w1[0].shape == (experts_per_layer, 2 * self.intermediate_size, self.hidden_size)
+                assert self.w2[0].shape == (experts_per_layer, self.hidden_size, self.intermediate_size)
+                assert self.w1_buf.shape[0] == self.num_layers * experts_per_layer + self.scratchpad_slots
+            else:
+                assert self.w1_buf.shape[0] == self.cache_size
             assert self.w1_cpu[0].shape == (self.num_experts, 2 * self.intermediate_size, self.hidden_size)
         else:
             assert self.w1[0].shape == (self.num_experts, 2 * self.intermediate_size, self.hidden_size)
@@ -1234,11 +1278,12 @@ class MoEEngine:
         Reads routing decisions and post-norm hidden states from buffers,
         runs MoE, writes output into hidden_out for next layer.
 
-        When experts_per_layer is set (offloading mode), reads from the unified
-        buffer (w1_buf/w2_buf/expert_map_buf). The caller must update
-        expert_map_buf with this layer's absolute map before calling this.
+        In offloading mode (experts_per_layer or cache_size set), reads
+        from the unified buffer (w1_buf/w2_buf/expert_map_buf). The caller
+        must update expert_map_buf with this layer's absolute map before
+        calling this.
         """
-        if self.experts_per_layer is not None:
+        if self.offloading:
             w1, w2 = self.w1_buf, self.w2_buf
             expert_map = self.expert_map_buf
         else:
@@ -1459,7 +1504,7 @@ class MoEEngine:
                                moe_input_buf, moe_residual_buf,
                                topk_weights_buf, topk_ids_buf)
                     # Update expert_map for this layer (offloading)
-                    if self.experts_per_layer is not None:
+                    if self.offloading:
                         self.expert_map_buf.copy_(self.expert_map_abs[layer])
                     stage4b_fn(moe_input_buf, moe_residual_buf,
                                topk_weights_buf, topk_ids_buf,
@@ -1496,7 +1541,7 @@ class MoEEngine:
                 stage4a_graphs.append(g4a)
 
                 # Update expert_map for stage4b (offloading mode)
-                if self.experts_per_layer is not None:
+                if self.offloading:
                     self.expert_map_buf.copy_(self.expert_map_abs[layer])
 
                 # Capture stage 4b (MoE)
@@ -1631,9 +1676,12 @@ class MoEEngine:
         attn_out_buf = info['attn_out_buf']
 
         for layer in range(self.num_layers):
-            # Pre-attention prefetch: async transfers overlap stages 1-3
-            if self.replay_controller:
-                self.replay_controller.begin_layer_prefetch(layer)
+            # Pre-attention prefetch: only for layer 0 (start of network).
+            # For subsequent layers, prefetches are issued inside
+            # process_layer_replay() of the previous layer, right before
+            # stage4b, giving overlap with stage4b(L-1) + stages 1-4a(L).
+            if layer == 0 and self.replay_controller:
+                self.replay_controller.begin_layer_prefetch(0)
 
             # Stage 1: pre-attention (CUDA graph)
             info['stage1_graphs'][layer].replay()

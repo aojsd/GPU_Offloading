@@ -4,16 +4,21 @@ Pure-Python simulators that consume an ActivationTrace (recorded expert
 access patterns) and produce a DataMovementTrace (prefetch/eviction/
 demand-load schedule) for replay on real GPU hardware.
 
+All policies use a unified expert cache shared across all layers, keyed
+by (layer, expert_id) pairs. The cache_size parameter is the total number
+of expert slots (not per-layer).
+
 Policies:
     LRUPolicy       — Least Recently Used eviction, demand-load only.
     OraclePolicy    — Belady's optimal (MIN) with lookahead prefetching.
     FrequencyPolicy — Least Frequently Used (static or windowed).
+    StaticPolicy    — Global frequency ranking (oracle); pins top experts.
     PreGatedPolicy  — Wraps any base policy, adds 1-layer-ahead prefetch.
 
 Usage:
     trace = ActivationTrace.load("expert_trace.json")
     policy = LRUPolicy()
-    dm_trace = policy.simulate(trace, experts_per_layer=2)
+    dm_trace = policy.simulate(trace, cache_size=6)
     errors = dm_trace.validate()
     assert not errors
     dm_trace.save("lru_movement.json")
@@ -37,16 +42,17 @@ class EvictionPolicy(ABC):
 
     @abstractmethod
     def simulate(self, activation_trace: ActivationTrace,
-                 experts_per_layer: int,
-                 initial_experts: Optional[list[int]] = None
+                 cache_size: int,
+                 initial_cache: Optional[list[tuple[int, int]]] = None
                  ) -> DataMovementTrace:
         """Run the policy simulation on an activation trace.
 
         Args:
             activation_trace: Expert access pattern from real inference.
-            experts_per_layer: GPU cache capacity per layer.
-            initial_experts: Which experts to pre-load per layer at start.
-                Defaults to [0, 1, ..., experts_per_layer - 1].
+            cache_size: Total unified cache capacity (expert slots shared
+                across all layers).
+            initial_cache: List of (layer, expert_id) pairs to pre-load.
+                Defaults to filling uniformly across layers.
 
         Returns:
             DataMovementTrace ready for replay.
@@ -54,49 +60,63 @@ class EvictionPolicy(ABC):
         ...
 
 
-def _default_initial_experts(experts_per_layer: int,
-                             num_experts: int) -> list[int]:
-    """Default initial cache: first experts_per_layer experts."""
-    return list(range(min(experts_per_layer, num_experts)))
+def _default_initial_cache(cache_size: int, num_layers: int,
+                           num_experts: int) -> list[tuple[int, int]]:
+    """Default initial cache: fill uniformly across layers.
+
+    Iterates expert 0 for all layers, then expert 1 for all layers, etc.,
+    stopping when cache_size entries have been added.
+    """
+    initial = []
+    for eid in range(num_experts):
+        for layer in range(num_layers):
+            if len(initial) >= cache_size:
+                return initial
+            initial.append((layer, eid))
+    return initial
 
 
-def _build_initial_state(num_layers: int,
-                         initial_experts: list[int]
-                         ) -> list[tuple[int, int]]:
-    """Build initial_cache_state list from per-layer initial experts."""
-    return [(l, eid) for l in range(num_layers) for eid in initial_experts]
+def _make_layer_trace(needed: list[int],
+                      prefetches: list[TransferEvent],
+                      demand_loads: list[TransferEvent]) -> LayerTrace:
+    """Build a LayerTrace with uniform weights."""
+    n = len(needed)
+    weights = [1.0 / n] * n if n > 0 else []
+    return LayerTrace(
+        topk_ids=[needed],
+        topk_weights=[weights],
+        prefetches=prefetches,
+        demand_loads=demand_loads,
+    )
 
 
 class LRUPolicy(EvictionPolicy):
-    """Least Recently Used eviction.
+    """Least Recently Used eviction with unified cache.
 
-    Per-layer LRU cache. On cache miss:
-      - If cache not full: load without eviction (scratchpad).
-      - If cache full: evict LRU expert, load into freed persistent slot.
+    Single LRU cache keyed by (layer, expert_id). On cache miss:
+      - If cache not full: load into free slot (evict=None).
+      - If cache full: evict globally-LRU expert.
 
     All loads are demand loads (no prefetching).
     """
 
     def simulate(self, activation_trace: ActivationTrace,
-                 experts_per_layer: int,
-                 initial_experts: Optional[list[int]] = None
+                 cache_size: int,
+                 initial_cache: Optional[list[tuple[int, int]]] = None
                  ) -> DataMovementTrace:
         num_layers = activation_trace.num_layers
         num_experts = activation_trace.num_experts
 
-        if initial_experts is None:
-            initial_experts = _default_initial_experts(
-                experts_per_layer, num_experts)
+        if initial_cache is None:
+            initial_cache = _default_initial_cache(
+                cache_size, num_layers, num_experts)
 
-        # Per-layer LRU: OrderedDict preserves insertion/access order
-        cache = [OrderedDict() for _ in range(num_layers)]
-        for l in range(num_layers):
-            for eid in initial_experts:
-                cache[l][eid] = True
+        # Unified LRU: OrderedDict keyed by (layer, eid)
+        cache = OrderedDict()
+        for key in initial_cache:
+            cache[tuple(key)] = True
 
-        initial_state = _build_initial_state(num_layers, initial_experts)
         steps = []
-
         for step_idx, step_experts in enumerate(activation_trace.steps):
             layer_traces = []
             for layer in range(num_layers):
@@ -104,35 +124,27 @@ class LRUPolicy(EvictionPolicy):
                 demand_loads = []
 
                 for eid in needed:
-                    if eid in cache[layer]:
-                        # Cache hit — move to end (most recently used)
-                        cache[layer].move_to_end(eid)
+                    key = (layer, eid)
+                    if key in cache:
+                        cache.move_to_end(key)
                     else:
-                        # Cache miss — demand load
                         evict = None
-                        if len(cache[layer]) >= experts_per_layer:
-                            # Evict LRU (first item in OrderedDict)
-                            evict_eid, _ = cache[layer].popitem(last=False)
-                            evict = (layer, evict_eid)
-                        cache[layer][eid] = True
+                        if len(cache) >= cache_size:
+                            evict_key, _ = cache.popitem(last=False)
+                            evict = evict_key
+                        cache[key] = True
                         demand_loads.append(TransferEvent(
                             target=(layer, eid), evict=evict))
 
-                layer_traces.append(LayerTrace(
-                    topk_ids=[needed],
-                    topk_weights=[[1.0 / len(needed)] * len(needed)
-                                  if needed else []],
-                    prefetches=[],
-                    post_routing_prefetches=[],
-                    demand_loads=demand_loads,
-                ))
+                layer_traces.append(_make_layer_trace(
+                    needed, prefetches=[], demand_loads=demand_loads))
             steps.append(StepTrace(layers=layer_traces))
 
         return DataMovementTrace(
             num_layers=num_layers,
             num_experts=num_experts,
-            experts_per_layer=experts_per_layer,
-            initial_cache_state=initial_state,
+            cache_size=cache_size,
+            initial_cache_state=list(initial_cache),
             steps=steps,
         )
 
@@ -140,29 +152,31 @@ class LRUPolicy(EvictionPolicy):
 class OraclePolicy(EvictionPolicy):
     """Belady's optimal (MIN) algorithm with lookahead prefetching.
 
-    Evicts the resident expert whose next use is farthest in the future.
-    Requires full trace knowledge (offline/oracle). This is the theoretical
-    lower bound on cache misses.
+    Unified cache: evicts the resident (layer, expert_id) whose next use
+    is farthest in the future, across all layers. Requires full trace
+    knowledge (offline/oracle). This is the theoretical lower bound on
+    cache misses.
 
     Prefetching: at layer L, look ahead to layer L+1 (same step). If
-    L+1 needs a non-resident expert, issue it as a prefetch at layer L
-    so it overlaps with attention compute.
+    L+1 needs a non-resident expert, issue it as a prefetch stored in
+    layers[L+1].prefetches, so the replay controller can overlap it
+    with stage4b(L) + stages 1-4a(L+1).
     """
 
     def simulate(self, activation_trace: ActivationTrace,
-                 experts_per_layer: int,
-                 initial_experts: Optional[list[int]] = None
+                 cache_size: int,
+                 initial_cache: Optional[list[tuple[int, int]]] = None
                  ) -> DataMovementTrace:
         num_layers = activation_trace.num_layers
         num_experts = activation_trace.num_experts
 
-        if initial_experts is None:
-            initial_experts = _default_initial_experts(
-                experts_per_layer, num_experts)
+        if initial_cache is None:
+            initial_cache = _default_initial_cache(
+                cache_size, num_layers, num_experts)
 
         # ── Pass 1: Build next-use index ──
-        # next_use[layer][expert_id] = sorted list of (step_idx, position)
-        # where position = step_idx * num_layers + layer (global order)
+        # next_use[layer][expert_id] = sorted list of global positions
+        # where position = step_idx * num_layers + layer
         next_use = [[[] for _ in range(num_experts)]
                     for _ in range(num_layers)]
         for step_idx, step_experts in enumerate(activation_trace.steps):
@@ -171,15 +185,13 @@ class OraclePolicy(EvictionPolicy):
                     pos = step_idx * num_layers + layer
                     next_use[layer][eid].append(pos)
 
-        # For each (layer, expert), build an iterator over future uses
-        # We'll track a pointer per (layer, expert)
+        # Per (layer, expert) pointer into next_use
         use_ptr = [[0] * num_experts for _ in range(num_layers)]
 
         def get_next_use(layer: int, eid: int, current_pos: int) -> int:
             """Return the next use position after current_pos, or inf."""
             ptr = use_ptr[layer][eid]
             uses = next_use[layer][eid]
-            # Advance pointer past current_pos
             while ptr < len(uses) and uses[ptr] <= current_pos:
                 ptr += 1
             use_ptr[layer][eid] = ptr
@@ -188,112 +200,116 @@ class OraclePolicy(EvictionPolicy):
             return float('inf')
 
         # ── Pass 2: Simulate forward ──
-        cache = [OrderedDict() for _ in range(num_layers)]
-        for l in range(num_layers):
-            for eid in initial_experts:
-                cache[l][eid] = True
+        cache = OrderedDict()
+        for key in initial_cache:
+            cache[tuple(key)] = True
 
-        initial_state = _build_initial_state(num_layers, initial_experts)
         steps = []
-
         for step_idx, step_experts in enumerate(activation_trace.steps):
             layer_traces = []
+            # Collect prefetches for each layer (filled by previous layer)
+            pending_prefetches = [[] for _ in range(num_layers)]
+
             for layer in range(num_layers):
                 current_pos = step_idx * num_layers + layer
                 needed = step_experts[layer]
 
-                # Determine misses for current layer
+                # Protected: experts this layer needs (don't evict them)
+                protected = {(layer, eid) for eid in needed}
+
+                # Demand loads for current layer
                 demand_loads = []
                 for eid in needed:
-                    if eid not in cache[layer]:
+                    key = (layer, eid)
+                    if key not in cache:
                         evict = None
-                        if len(cache[layer]) >= experts_per_layer:
-                            evict_eid = self._belady_victim(
-                                cache[layer], layer, current_pos,
-                                get_next_use, needed)
-                            del cache[layer][evict_eid]
-                            evict = (layer, evict_eid)
-                        cache[layer][eid] = True
+                        if len(cache) >= cache_size:
+                            evict_key = self._belady_victim(
+                                cache, current_pos, get_next_use,
+                                protected)
+                            del cache[evict_key]
+                            evict = evict_key
+                        cache[key] = True
                         demand_loads.append(TransferEvent(
                             target=(layer, eid), evict=evict))
 
-                # Lookahead prefetch: check layer+1 (same step)
-                prefetches = []
+                # Lookahead prefetch for layer+1
                 if layer + 1 < num_layers:
-                    next_layer_needed = step_experts[layer + 1]
-                    for eid in next_layer_needed:
-                        if eid not in cache[layer + 1]:
-                            # Check if cache has room or find victim
+                    next_needed = step_experts[layer + 1]
+                    # Protect both current and next layer's needs
+                    pf_protected = (protected |
+                                    {(layer + 1, e) for e in next_needed})
+                    for eid in next_needed:
+                        key = (layer + 1, eid)
+                        if key not in cache:
                             evict = None
-                            if len(cache[layer + 1]) >= experts_per_layer:
-                                next_pos = (step_idx * num_layers +
-                                            layer + 1)
-                                evict_eid = self._belady_victim(
-                                    cache[layer + 1], layer + 1, next_pos,
-                                    get_next_use, next_layer_needed)
-                                del cache[layer + 1][evict_eid]
-                                evict = (layer + 1, evict_eid)
-                            cache[layer + 1][eid] = True
-                            prefetches.append(TransferEvent(
-                                target=(layer + 1, eid), evict=evict))
+                            if len(cache) >= cache_size:
+                                evict_key = self._belady_victim(
+                                    cache,
+                                    step_idx * num_layers + layer + 1,
+                                    get_next_use, pf_protected)
+                                del cache[evict_key]
+                                evict = evict_key
+                            cache[key] = True
+                            pending_prefetches[layer + 1].append(
+                                TransferEvent(
+                                    target=(layer + 1, eid), evict=evict))
 
-                layer_traces.append(LayerTrace(
-                    topk_ids=[needed],
-                    topk_weights=[[1.0 / len(needed)] * len(needed)
-                                  if needed else []],
-                    prefetches=prefetches,
-                    post_routing_prefetches=[],
-                    demand_loads=demand_loads,
-                ))
+                layer_traces.append(_make_layer_trace(
+                    needed,
+                    prefetches=pending_prefetches[layer],
+                    demand_loads=demand_loads))
             steps.append(StepTrace(layers=layer_traces))
 
         return DataMovementTrace(
             num_layers=num_layers,
             num_experts=num_experts,
-            experts_per_layer=experts_per_layer,
-            initial_cache_state=initial_state,
+            cache_size=cache_size,
+            initial_cache_state=list(initial_cache),
             steps=steps,
         )
 
     @staticmethod
-    def _belady_victim(cache: OrderedDict, layer: int,
-                       current_pos: int, get_next_use, protected) -> int:
+    def _belady_victim(cache: OrderedDict, current_pos: int,
+                       get_next_use, protected: set) -> tuple:
         """Find the cache resident whose next use is farthest away.
 
         Args:
-            cache: Current cache contents (OrderedDict).
-            layer: Layer index.
+            cache: Current unified cache (OrderedDict keyed by (layer, eid)).
             current_pos: Current global position (step*L + layer).
             get_next_use: Function(layer, eid, pos) -> next use position.
-            protected: Set/list of expert IDs needed now (don't evict).
+            protected: Set of (layer, eid) keys not to evict.
 
         Returns:
-            Expert ID to evict.
+            (layer, eid) key to evict.
         """
-        best_eid = None
+        best_key = None
         best_dist = -1
-        for eid in cache:
-            if eid in protected:
+        for key in cache:
+            if key in protected:
                 continue
+            layer, eid = key
             dist = get_next_use(layer, eid, current_pos)
             if dist > best_dist:
                 best_dist = dist
-                best_eid = eid
-        if best_eid is None:
-            # All residents are protected — evict the one with farthest use
-            for eid in cache:
+                best_key = key
+        if best_key is None:
+            # All residents are protected — evict farthest anyway
+            for key in cache:
+                layer, eid = key
                 dist = get_next_use(layer, eid, current_pos)
                 if dist > best_dist:
                     best_dist = dist
-                    best_eid = eid
-        return best_eid
+                    best_key = key
+        return best_key
 
 
 class FrequencyPolicy(EvictionPolicy):
-    """Frequency-based (LFU) eviction.
+    """Frequency-based (LFU) eviction with unified cache.
 
-    Tracks per-layer expert access frequency. On eviction, removes the
-    least frequently used expert. Ties broken by expert_id (lowest evicted).
+    Tracks per-(layer, expert) access frequency. On eviction, removes
+    the least frequently used expert globally. Ties broken by key order
+    (lowest layer first, then lowest expert_id).
 
     Attributes:
         window_size: If set, reset frequency counts every window_size steps.
@@ -304,28 +320,31 @@ class FrequencyPolicy(EvictionPolicy):
         self.window_size = window_size
 
     def simulate(self, activation_trace: ActivationTrace,
-                 experts_per_layer: int,
-                 initial_experts: Optional[list[int]] = None
+                 cache_size: int,
+                 initial_cache: Optional[list[tuple[int, int]]] = None
                  ) -> DataMovementTrace:
         num_layers = activation_trace.num_layers
         num_experts = activation_trace.num_experts
 
-        if initial_experts is None:
-            initial_experts = _default_initial_experts(
-                experts_per_layer, num_experts)
+        if initial_cache is None:
+            initial_cache = _default_initial_cache(
+                cache_size, num_layers, num_experts)
 
-        # Per-layer frequency counts and cache
-        freq = [[0] * num_experts for _ in range(num_layers)]
-        cache = [set(initial_experts) for _ in range(num_layers)]
+        # Unified frequency counts and cache
+        freq = {}  # (layer, eid) -> count
+        cache = set()
+        for key in initial_cache:
+            key = tuple(key)
+            cache.add(key)
+            freq[key] = 0
 
-        initial_state = _build_initial_state(num_layers, initial_experts)
         steps = []
-
         for step_idx, step_experts in enumerate(activation_trace.steps):
             # Windowed reset
             if (self.window_size is not None and step_idx > 0 and
                     step_idx % self.window_size == 0):
-                freq = [[0] * num_experts for _ in range(num_layers)]
+                for k in freq:
+                    freq[k] = 0
 
             layer_traces = []
             for layer in range(num_layers):
@@ -334,81 +353,182 @@ class FrequencyPolicy(EvictionPolicy):
 
                 # Update frequency for accessed experts
                 for eid in needed:
-                    freq[layer][eid] += 1
+                    key = (layer, eid)
+                    freq[key] = freq.get(key, 0) + 1
 
                 for eid in needed:
-                    if eid not in cache[layer]:
+                    key = (layer, eid)
+                    if key not in cache:
                         evict = None
-                        if len(cache[layer]) >= experts_per_layer:
-                            evict_eid = self._lfu_victim(
-                                cache[layer], freq[layer], needed)
-                            cache[layer].discard(evict_eid)
-                            evict = (layer, evict_eid)
-                        cache[layer].add(eid)
+                        if len(cache) >= cache_size:
+                            protected = {(layer, e) for e in needed}
+                            evict_key = self._lfu_victim(
+                                cache, freq, protected)
+                            cache.discard(evict_key)
+                            evict = evict_key
+                        cache.add(key)
+                        if key not in freq:
+                            freq[key] = 1
                         demand_loads.append(TransferEvent(
                             target=(layer, eid), evict=evict))
 
-                layer_traces.append(LayerTrace(
-                    topk_ids=[needed],
-                    topk_weights=[[1.0 / len(needed)] * len(needed)
-                                  if needed else []],
-                    prefetches=[],
-                    post_routing_prefetches=[],
-                    demand_loads=demand_loads,
-                ))
+                layer_traces.append(_make_layer_trace(
+                    needed, prefetches=[], demand_loads=demand_loads))
             steps.append(StepTrace(layers=layer_traces))
 
         return DataMovementTrace(
             num_layers=num_layers,
             num_experts=num_experts,
-            experts_per_layer=experts_per_layer,
-            initial_cache_state=initial_state,
+            cache_size=cache_size,
+            initial_cache_state=list(initial_cache),
             steps=steps,
         )
 
     @staticmethod
-    def _lfu_victim(cache: set, freq: list[int],
-                    protected: list[int]) -> int:
-        """Find the least frequently used expert in cache.
+    def _lfu_victim(cache: set, freq: dict,
+                    protected: set) -> tuple:
+        """Find the least frequently used expert in the unified cache.
 
-        Protected experts (needed now) are avoided if possible.
-        Ties broken by lowest expert_id.
+        Protected experts are avoided if possible.
+        Ties broken by (layer, eid) sort order.
         """
-        best_eid = None
+        best_key = None
         best_freq = float('inf')
-        for eid in sorted(cache):
-            if eid in protected:
+        for key in sorted(cache):
+            if key in protected:
                 continue
-            if freq[eid] < best_freq:
-                best_freq = freq[eid]
-                best_eid = eid
-        if best_eid is None:
+            f = freq.get(key, 0)
+            if f < best_freq:
+                best_freq = f
+                best_key = key
+        if best_key is None:
             # All residents are protected
-            for eid in sorted(cache):
-                if freq[eid] < best_freq:
-                    best_freq = freq[eid]
-                    best_eid = eid
-        return best_eid
+            for key in sorted(cache):
+                f = freq.get(key, 0)
+                if f < best_freq:
+                    best_freq = f
+                    best_key = key
+        return best_key
+
+
+class StaticPolicy(EvictionPolicy):
+    """Static frequency-based policy with unified cache.
+
+    Pre-computes global access frequencies over the ENTIRE trace (including
+    future steps), then:
+      1. Initializes the cache with the top-`cache_size` experts by frequency.
+      2. On cache miss, always evicts the resident with the lowest global
+         frequency (ties broken by (layer, eid) order).
+
+    Because frequencies are fixed, the top (cache_size - num_experts) experts
+    are effectively pinned and never evicted. Only the bottom num_experts
+    slots cycle through demand-loaded experts.
+
+    All loads are demand loads (no prefetching).
+    """
+
+    def simulate(self, activation_trace: ActivationTrace,
+                 cache_size: int,
+                 initial_cache: Optional[list[tuple[int, int]]] = None
+                 ) -> DataMovementTrace:
+        num_layers = activation_trace.num_layers
+        num_experts = activation_trace.num_experts
+
+        # ── Pre-compute global frequencies over entire trace ──
+        global_freq = {}  # (layer, eid) -> total access count
+        for step_experts in activation_trace.steps:
+            for layer in range(num_layers):
+                for eid in step_experts[layer]:
+                    key = (layer, eid)
+                    global_freq[key] = global_freq.get(key, 0) + 1
+
+        # ── Initial cache: top cache_size by frequency ──
+        if initial_cache is None:
+            # All possible (layer, eid) pairs, sorted by descending frequency
+            all_experts = [(layer, eid)
+                           for layer in range(num_layers)
+                           for eid in range(num_experts)]
+            all_experts.sort(key=lambda k: (-global_freq.get(k, 0), k))
+            initial_cache = all_experts[:cache_size]
+
+        cache = set()
+        for key in initial_cache:
+            cache.add(tuple(key))
+
+        # ── Simulate forward ──
+        steps = []
+        for step_idx, step_experts in enumerate(activation_trace.steps):
+            layer_traces = []
+            for layer in range(num_layers):
+                needed = step_experts[layer]
+                demand_loads = []
+
+                for eid in needed:
+                    key = (layer, eid)
+                    if key not in cache:
+                        evict = None
+                        if len(cache) >= cache_size:
+                            protected = {(layer, e) for e in needed}
+                            evict_key = self._min_freq_victim(
+                                cache, global_freq, protected)
+                            cache.discard(evict_key)
+                            evict = evict_key
+                        cache.add(key)
+                        demand_loads.append(TransferEvent(
+                            target=(layer, eid), evict=evict))
+
+                layer_traces.append(_make_layer_trace(
+                    needed, prefetches=[], demand_loads=demand_loads))
+            steps.append(StepTrace(layers=layer_traces))
+
+        return DataMovementTrace(
+            num_layers=num_layers,
+            num_experts=num_experts,
+            cache_size=cache_size,
+            initial_cache_state=list(initial_cache),
+            steps=steps,
+        )
+
+    @staticmethod
+    def _min_freq_victim(cache: set, global_freq: dict,
+                         protected: set) -> tuple:
+        """Find the resident with the lowest global frequency.
+
+        Protected experts are avoided if possible.
+        Ties broken by (layer, eid) sort order.
+        """
+        best_key = None
+        best_freq = float('inf')
+        for key in sorted(cache):
+            if key in protected:
+                continue
+            f = global_freq.get(key, 0)
+            if f < best_freq:
+                best_freq = f
+                best_key = key
+        if best_key is None:
+            for key in sorted(cache):
+                f = global_freq.get(key, 0)
+                if f < best_freq:
+                    best_freq = f
+                    best_key = key
+        return best_key
 
 
 class PreGatedPolicy(EvictionPolicy):
-    """Pre-gated prefetching policy.
+    """Pre-gated prefetching policy with unified cache.
 
     Wraps a base eviction policy and adds 1-layer-ahead prefetching.
     At layer L, looks ahead to layer L+1's needed experts (same step)
-    and issues pre-attention prefetches for non-resident ones.
-
-    In a real system, this corresponds to running the router's gate
-    network early (before attention) to predict which experts the next
-    layer will need. Since we're simulating on recorded traces, we
-    simply look ahead in the trace data.
+    and issues prefetches for non-resident ones. These prefetches are
+    stored in layers[L+1].prefetches so the replay controller issues
+    them before stage4b of layer L.
 
     Eviction and demand-load decisions are delegated to the base policy's
     cache management logic.
 
     Attributes:
-        base_policy_type: 'lru' or 'frequency' — which policy to use for
-            cache eviction decisions.
+        base_policy_type: 'lru' or 'frequency' — which policy to use.
         window_size: Passed to FrequencyPolicy if base is 'frequency'.
     """
 
@@ -418,114 +538,121 @@ class PreGatedPolicy(EvictionPolicy):
         self.window_size = window_size
 
     def simulate(self, activation_trace: ActivationTrace,
-                 experts_per_layer: int,
-                 initial_experts: Optional[list[int]] = None
+                 cache_size: int,
+                 initial_cache: Optional[list[tuple[int, int]]] = None
                  ) -> DataMovementTrace:
         num_layers = activation_trace.num_layers
         num_experts = activation_trace.num_experts
 
-        if initial_experts is None:
-            initial_experts = _default_initial_experts(
-                experts_per_layer, num_experts)
+        if initial_cache is None:
+            initial_cache = _default_initial_cache(
+                cache_size, num_layers, num_experts)
 
-        # Set up per-layer cache state based on base policy type
+        # Set up unified cache based on base policy type
         if self.base_policy_type == 'lru':
-            cache = [OrderedDict() for _ in range(num_layers)]
-            for l in range(num_layers):
-                for eid in initial_experts:
-                    cache[l][eid] = True
+            cache = OrderedDict()
+            for key in initial_cache:
+                cache[tuple(key)] = True
         else:
-            cache = [set(initial_experts) for _ in range(num_layers)]
-            freq = [[0] * num_experts for _ in range(num_layers)]
+            cache = set()
+            freq = {}
+            for key in initial_cache:
+                key = tuple(key)
+                cache.add(key)
+                freq[key] = 0
 
-        initial_state = _build_initial_state(num_layers, initial_experts)
         steps = []
-
         for step_idx, step_experts in enumerate(activation_trace.steps):
             # Windowed frequency reset
             if (self.base_policy_type == 'frequency' and
                     self.window_size is not None and step_idx > 0 and
                     step_idx % self.window_size == 0):
-                freq = [[0] * num_experts for _ in range(num_layers)]
+                for k in freq:
+                    freq[k] = 0
 
             layer_traces = []
+            pending_prefetches = [[] for _ in range(num_layers)]
+
             for layer in range(num_layers):
                 needed = step_experts[layer]
 
                 # Update frequency counts if applicable
                 if self.base_policy_type == 'frequency':
                     for eid in needed:
-                        freq[layer][eid] += 1
+                        key = (layer, eid)
+                        freq[key] = freq.get(key, 0) + 1
 
                 # ── Demand loads for current layer ──
                 demand_loads = []
                 for eid in needed:
+                    key = (layer, eid)
                     if self.base_policy_type == 'lru':
-                        if eid in cache[layer]:
-                            cache[layer].move_to_end(eid)
+                        if key in cache:
+                            cache.move_to_end(key)
                         else:
                             evict = None
-                            if len(cache[layer]) >= experts_per_layer:
-                                evict_eid, _ = cache[layer].popitem(
-                                    last=False)
-                                evict = (layer, evict_eid)
-                            cache[layer][eid] = True
+                            if len(cache) >= cache_size:
+                                evict_key, _ = cache.popitem(last=False)
+                                evict = evict_key
+                            cache[key] = True
                             demand_loads.append(TransferEvent(
                                 target=(layer, eid), evict=evict))
                     else:
-                        if eid not in cache[layer]:
+                        if key not in cache:
                             evict = None
-                            if len(cache[layer]) >= experts_per_layer:
-                                evict_eid = FrequencyPolicy._lfu_victim(
-                                    cache[layer], freq[layer], needed)
-                                cache[layer].discard(evict_eid)
-                                evict = (layer, evict_eid)
-                            cache[layer].add(eid)
+                            if len(cache) >= cache_size:
+                                protected = {(layer, e) for e in needed}
+                                evict_key = FrequencyPolicy._lfu_victim(
+                                    cache, freq, protected)
+                                cache.discard(evict_key)
+                                evict = evict_key
+                            cache.add(key)
+                            if key not in freq:
+                                freq[key] = 1
                             demand_loads.append(TransferEvent(
                                 target=(layer, eid), evict=evict))
 
                 # ── Lookahead prefetch for layer+1 ──
-                prefetches = []
                 if layer + 1 < num_layers:
                     next_needed = step_experts[layer + 1]
-                    next_cache = cache[layer + 1]
 
                     for eid in next_needed:
-                        is_resident = (eid in next_cache)
+                        key = (layer + 1, eid)
+                        is_resident = (key in cache)
                         if not is_resident:
                             evict = None
                             if self.base_policy_type == 'lru':
-                                if len(next_cache) >= experts_per_layer:
-                                    evict_eid, _ = next_cache.popitem(
+                                if len(cache) >= cache_size:
+                                    evict_key, _ = cache.popitem(
                                         last=False)
-                                    evict = (layer + 1, evict_eid)
-                                next_cache[eid] = True
+                                    evict = evict_key
+                                cache[key] = True
                             else:
-                                if len(next_cache) >= experts_per_layer:
-                                    evict_eid = (
+                                if len(cache) >= cache_size:
+                                    protected = (
+                                        {(layer, e) for e in needed} |
+                                        {(layer + 1, e)
+                                         for e in next_needed})
+                                    evict_key = (
                                         FrequencyPolicy._lfu_victim(
-                                            next_cache, freq[layer + 1],
-                                            next_needed))
-                                    next_cache.discard(evict_eid)
-                                    evict = (layer + 1, evict_eid)
-                                next_cache.add(eid)
-                            prefetches.append(TransferEvent(
-                                target=(layer + 1, eid), evict=evict))
+                                            cache, freq, protected))
+                                    cache.discard(evict_key)
+                                    evict = evict_key
+                                cache.add(key)
+                            pending_prefetches[layer + 1].append(
+                                TransferEvent(
+                                    target=(layer + 1, eid), evict=evict))
 
-                layer_traces.append(LayerTrace(
-                    topk_ids=[needed],
-                    topk_weights=[[1.0 / len(needed)] * len(needed)
-                                  if needed else []],
-                    prefetches=prefetches,
-                    post_routing_prefetches=[],
-                    demand_loads=demand_loads,
-                ))
+                layer_traces.append(_make_layer_trace(
+                    needed,
+                    prefetches=pending_prefetches[layer],
+                    demand_loads=demand_loads))
             steps.append(StepTrace(layers=layer_traces))
 
         return DataMovementTrace(
             num_layers=num_layers,
             num_experts=num_experts,
-            experts_per_layer=experts_per_layer,
-            initial_cache_state=initial_state,
+            cache_size=cache_size,
+            initial_cache_state=list(initial_cache),
             steps=steps,
         )

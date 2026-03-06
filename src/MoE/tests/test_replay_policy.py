@@ -9,10 +9,10 @@ Test categories:
   1. DataMovementTrace serialization round-trip
   2. DataMovementTrace.validate() correctness
   3. ActivationTrace.from_flat_trace() conversion
-  4. LRU policy: eviction order, miss counts
-  5. Oracle policy: optimality vs LRU
-  6. Frequency policy: LFU eviction
-  7. PreGated policy: prefetch generation
+  4. LRU-None: eviction order, miss counts
+  5. Belady-Oracle: optimality vs LRU, prefetch generation
+  6. LFU-None: frequency eviction
+  7. Static-None: frequency-ranked initial cache, eviction
   8. All policies: validate() passes on output
 
 Run:
@@ -38,11 +38,13 @@ from data_movement_trace import (
     TransferEvent,
 )
 from policy_simulator import (
-    FrequencyPolicy,
-    LRUPolicy,
-    OraclePolicy,
-    PreGatedPolicy,
-    StaticPolicy,
+    LRU,
+    Belady,
+    LFU,
+    StaticFreq,
+    NoPrefetch,
+    OraclePrefetch,
+    simulate,
 )
 
 
@@ -309,7 +311,6 @@ class TestActivationTrace:
 
     def test_router_inputs_round_trip(self, tmp_path):
         """Save/load with companion .npz router inputs."""
-        # Create trace with router inputs
         json_path = str(tmp_path / "trace.json")
         npz_path = str(tmp_path / "trace_router_inputs.npz")
 
@@ -383,23 +384,28 @@ class TestActivationTrace:
         at2 = ActivationTrace.load(json_path)
         assert at2.has_router_inputs()
 
-        # All policies should work fine
-        for Policy in [LRUPolicy, OraclePolicy, FrequencyPolicy, StaticPolicy]:
-            dm = Policy().simulate(at2, cache_size=2)
+        # All cache+prefetch combos should work fine
+        combos = [
+            (LRU(), NoPrefetch()),
+            (Belady(), OraclePrefetch()),
+            (LFU(), NoPrefetch()),
+            (StaticFreq(), NoPrefetch()),
+        ]
+        for cache_pol, pf_pol in combos:
+            dm = simulate(cache_pol, pf_pol, at2, cache_size=2)
             errors = dm.validate()
-            assert errors == [], f"{Policy.__name__} failed: {errors}"
+            assert errors == [], \
+                f"{cache_pol.__class__.__name__} failed: {errors}"
 
 
-# ── 4. LRU Policy ───────────────────────────────────────────────────
+# ── 4. LRU-None ──────────────────────────────────────────────────────
 
-class TestLRUPolicy:
+class TestLRU:
 
     def test_no_misses_when_all_resident(self):
         """If cache fits all experts for all layers, no demand loads."""
         at = make_simple_activation_trace()
-        # 3 layers * 4 experts = 12 total, cache_size=12 fits all
-        policy = LRUPolicy()
-        dm = policy.simulate(at, cache_size=12)
+        dm = simulate(LRU(), NoPrefetch(), at, cache_size=12)
         for step in dm.steps:
             for lt in step.layers:
                 assert lt.demand_loads == []
@@ -413,8 +419,7 @@ class TestLRUPolicy:
                 [[2, 3]],   # miss both; evict (0,0) LRU, then (0,1)
                 [[0, 1]],   # miss both; evict (0,2) LRU, then (0,3)
             ])
-        policy = LRUPolicy()
-        dm = policy.simulate(at, cache_size=2)
+        dm = simulate(LRU(), NoPrefetch(), at, cache_size=2)
 
         # Step 0: no misses (0,1 are initial)
         assert dm.steps[0].layers[0].demand_loads == []
@@ -445,11 +450,9 @@ class TestLRUPolicy:
             ])
         # cache_size=3: only 3 of 4 (layer, eid) pairs fit
         # Default initial: (0,0), (1,0), (0,1) — fills 3 slots
-        policy = LRUPolicy()
-        dm = policy.simulate(at, cache_size=3)
+        dm = simulate(LRU(), NoPrefetch(), at, cache_size=3)
 
         # Step 0 layer 1: needs (1,1) which wasn't initially cached
-        # Must evict someone from unified cache
         loads = dm.steps[0].layers[1].demand_loads
         assert len(loads) == 1
         assert loads[0].target == (1, 1)
@@ -457,68 +460,59 @@ class TestLRUPolicy:
 
     def test_validate_passes(self):
         at = make_simple_activation_trace()
-        policy = LRUPolicy()
-        dm = policy.simulate(at, cache_size=6)
+        dm = simulate(LRU(), NoPrefetch(), at, cache_size=6)
         errors = dm.validate()
         assert errors == [], f"Validation errors: {errors}"
 
     def test_no_prefetches(self):
-        """LRU should never generate prefetches."""
+        """LRU-None should never generate prefetches."""
         at = make_simple_activation_trace()
-        dm = LRUPolicy().simulate(at, cache_size=6)
+        dm = simulate(LRU(), NoPrefetch(), at, cache_size=6)
         for step in dm.steps:
             for lt in step.layers:
                 assert lt.prefetches == []
 
 
-# ── 5. Oracle Policy ────────────────────────────────────────────────
+# ── 5. Belady-Oracle ─────────────────────────────────────────────────
 
-class TestOraclePolicy:
+class TestBeladyOracle:
 
     def test_fewer_misses_than_lru(self):
-        """Oracle should have <= misses than LRU on non-trivial traces."""
+        """Belady should have <= total transfers than LRU."""
         at = make_simple_activation_trace()
-        lru_dm = LRUPolicy().simulate(at, cache_size=6)
-        oracle_dm = OraclePolicy().simulate(at, cache_size=6)
+        lru_dm = simulate(LRU(), NoPrefetch(), at, cache_size=6)
+        oracle_dm = simulate(Belady(), OraclePrefetch(), at, cache_size=6)
 
-        lru_misses = sum(
-            len(lt.demand_loads)
-            for step in lru_dm.steps for lt in step.layers)
-        oracle_misses = sum(
-            len(lt.demand_loads)
-            for step in oracle_dm.steps for lt in step.layers)
+        lru_transfers = lru_dm.summary()['total_transfers']
+        oracle_transfers = oracle_dm.summary()['total_transfers']
 
-        assert oracle_misses <= lru_misses, \
-            f"Oracle ({oracle_misses}) should not have more misses " \
-            f"than LRU ({lru_misses})"
+        assert oracle_transfers <= lru_transfers, \
+            f"Belady ({oracle_transfers}) should not have more transfers " \
+            f"than LRU ({lru_transfers})"
 
     def test_generates_prefetches(self):
-        """Oracle should generate lookahead prefetches for next layer."""
+        """Belady-Oracle should generate lookahead prefetches."""
         at = ActivationTrace(
             num_layers=3, num_experts=4,
             steps=[
                 [[0, 1], [2, 3], [0, 2]],
             ])
-        dm = OraclePolicy().simulate(at, cache_size=6)
+        dm = simulate(Belady(), OraclePrefetch(), at, cache_size=6)
 
-        # Should have prefetches in layers[1] or layers[2]
-        # (from lookahead at layer 0 for layer 1, etc.)
         has_prefetches = any(
             len(lt.prefetches) > 0
             for step in dm.steps for lt in step.layers)
-        assert has_prefetches, "Oracle should generate prefetches"
+        assert has_prefetches, "Belady-Oracle should generate prefetches"
 
     def test_prefetches_stored_in_target_layer(self):
         """Prefetches for layer L should be in layers[L].prefetches."""
         at = ActivationTrace(
             num_layers=2, num_experts=4,
             steps=[
-                [[0, 1], [2, 3]],  # layer 0 looks ahead to layer 1
+                [[0, 1], [2, 3]],
             ])
-        dm = OraclePolicy().simulate(at, cache_size=4)
+        dm = simulate(Belady(), OraclePrefetch(), at, cache_size=4)
 
-        # Layer 0 generates prefetches targeting layer 1.
-        # These should be stored in layers[1].prefetches.
         lt1 = dm.steps[0].layers[1]
         for pf in lt1.prefetches:
             assert pf.target[0] == 1, \
@@ -527,14 +521,14 @@ class TestOraclePolicy:
 
     def test_validate_passes(self):
         at = make_simple_activation_trace()
-        dm = OraclePolicy().simulate(at, cache_size=6)
+        dm = simulate(Belady(), OraclePrefetch(), at, cache_size=6)
         errors = dm.validate()
         assert errors == [], f"Validation errors: {errors}"
 
 
-# ── 6. Frequency Policy ─────────────────────────────────────────────
+# ── 6. LFU-None ──────────────────────────────────────────────────────
 
-class TestFrequencyPolicy:
+class TestLFU:
 
     def test_evicts_least_frequent(self):
         """Expert with fewest accesses should be evicted."""
@@ -544,7 +538,7 @@ class TestFrequencyPolicy:
                 [[0, 1]],   # both accessed once
                 [[0, 2]],   # 0 accessed again, need 2 -> evict (0,1) freq=1
             ])
-        dm = FrequencyPolicy().simulate(at, cache_size=2)
+        dm = simulate(LFU(), NoPrefetch(), at, cache_size=2)
 
         loads = dm.steps[1].layers[0].demand_loads
         assert len(loads) == 1
@@ -560,97 +554,23 @@ class TestFrequencyPolicy:
                 [[0, 1]],   # freq: (0,0)->2, (0,1)->2
                 [[0, 2]],   # window reset; freq: (0,0)->1, (0,2)->1
             ])
-        dm = FrequencyPolicy(window_size=2).simulate(at, cache_size=2)
+        dm = simulate(LFU(window_size=2), NoPrefetch(), at, cache_size=2)
         errors = dm.validate()
         assert errors == [], f"Validation errors: {errors}"
 
     def test_validate_passes(self):
         at = make_simple_activation_trace()
-        dm = FrequencyPolicy().simulate(at, cache_size=6)
+        dm = simulate(LFU(), NoPrefetch(), at, cache_size=6)
         errors = dm.validate()
         assert errors == [], f"Validation errors: {errors}"
 
 
-# ── 7. PreGated Policy ──────────────────────────────────────────────
+# ── 7. Static-None ───────────────────────────────────────────────────
 
-class TestPreGatedPolicy:
-
-    def test_generates_prefetches(self):
-        """PreGated should produce prefetches for next layer's needs."""
-        at = ActivationTrace(
-            num_layers=3, num_experts=4,
-            steps=[
-                [[0, 1], [2, 3], [0, 2]],
-            ])
-        dm = PreGatedPolicy(base_policy_type='lru').simulate(
-            at, cache_size=6)
-
-        total_prefetches = sum(
-            len(lt.prefetches)
-            for step in dm.steps for lt in step.layers)
-        assert total_prefetches > 0, \
-            "PreGated should generate prefetches"
-
-    def test_prefetches_in_target_layer(self):
-        """PreGated prefetches should be stored in the target layer."""
-        at = ActivationTrace(
-            num_layers=2, num_experts=4,
-            steps=[
-                [[0, 1], [2, 3]],
-            ])
-        dm = PreGatedPolicy(base_policy_type='lru').simulate(
-            at, cache_size=4)
-
-        # Check that any prefetches in layers[L] target layer L
-        for step in dm.steps:
-            for layer_idx, lt in enumerate(step.layers):
-                for pf in lt.prefetches:
-                    assert pf.target[0] == layer_idx, \
-                        f"Prefetch in layers[{layer_idx}] should target " \
-                        f"layer {layer_idx}, got {pf.target}"
-
-    def test_reduces_demand_loads_vs_lru(self):
-        """PreGated(LRU) should have same or fewer demand loads than LRU."""
-        at = make_simple_activation_trace()
-        lru_dm = LRUPolicy().simulate(at, cache_size=6)
-        pg_dm = PreGatedPolicy(base_policy_type='lru').simulate(
-            at, cache_size=6)
-
-        lru_demands = sum(
-            len(lt.demand_loads)
-            for step in lru_dm.steps for lt in step.layers)
-        pg_demands = sum(
-            len(lt.demand_loads)
-            for step in pg_dm.steps for lt in step.layers)
-
-        assert pg_demands <= lru_demands, \
-            f"PreGated demands ({pg_demands}) should be <= " \
-            f"LRU demands ({lru_demands})"
-
-    def test_validate_passes(self):
-        at = make_simple_activation_trace()
-        dm = PreGatedPolicy(base_policy_type='lru').simulate(
-            at, cache_size=6)
-        errors = dm.validate()
-        assert errors == [], f"Validation errors: {errors}"
-
-    def test_frequency_base(self):
-        """PreGated with frequency base should also validate."""
-        at = make_simple_activation_trace()
-        dm = PreGatedPolicy(base_policy_type='frequency').simulate(
-            at, cache_size=6)
-        errors = dm.validate()
-        assert errors == [], f"Validation errors: {errors}"
-
-
-# ── 8. Static Policy ───────────────────────────────────────────────────
-
-class TestStaticPolicy:
+class TestStaticFreq:
 
     def test_initial_cache_has_most_frequent(self):
         """Initial cache should contain the highest-frequency experts."""
-        # Layer 0: expert 0 accessed 3 times, expert 1 accessed 1 time
-        # Layer 0: expert 2 accessed 2 times
         at = ActivationTrace(
             num_layers=1, num_experts=4,
             steps=[
@@ -658,19 +578,13 @@ class TestStaticPolicy:
                 [[0, 2]],   # freq: 0->2, 2->1
                 [[0, 2]],   # freq: 0->3, 2->2
             ])
-        dm = StaticPolicy().simulate(at, cache_size=2)
-        # Most frequent: (0,0) with freq=3, (0,2) with freq=2
+        dm = simulate(StaticFreq(), NoPrefetch(), at, cache_size=2)
         initial = set(dm.initial_cache_state)
         assert (0, 0) in initial
         assert (0, 2) in initial
 
     def test_evicts_least_frequent_globally(self):
         """On miss, should evict the resident with lowest global frequency."""
-        # 1 layer, 4 experts, cache=2
-        # Expert 0: accessed 3 times (steps 0,1,2)
-        # Expert 1: accessed 1 time (step 0)
-        # Expert 2: accessed 2 times (steps 1,2)
-        # Expert 3: accessed 1 time (step 3) — not initially cached
         at = ActivationTrace(
             num_layers=1, num_experts=4,
             steps=[
@@ -679,36 +593,29 @@ class TestStaticPolicy:
                 [[0, 2]],
                 [[0, 3]],   # miss on 3 -> evict lowest freq resident
             ])
-        dm = StaticPolicy().simulate(at, cache_size=2)
+        dm = simulate(StaticFreq(), NoPrefetch(), at, cache_size=2)
 
-        # Step 3 needs expert 3, must evict someone
-        # After step 2, cache should have (0,0) and (0,2) (the top-2 by freq)
-        # Expert 3 has freq=1, forces eviction.
-        # Between (0,0) freq=3 and (0,2) freq=2, evict (0,2)
         loads = dm.steps[3].layers[0].demand_loads
         assert len(loads) == 1
         assert loads[0].target == (0, 3)
-        assert loads[0].evict == (0, 2)  # (0,2) has lower global freq than (0,0)
+        assert loads[0].evict == (0, 2)
 
     def test_high_freq_experts_never_evicted(self):
         """Top experts by frequency should stay pinned."""
-        # 2 layers, 4 experts, cache_size=4
-        # Make (0,0) and (1,0) very frequent
         at = ActivationTrace(
             num_layers=2, num_experts=4,
             steps=[
-                [[0], [0]],   # (0,0) and (1,0) accessed
+                [[0], [0]],
                 [[0], [0]],
                 [[0], [0]],
                 [[0], [0]],
                 [[0], [0]],   # 5 accesses each for (0,0) and (1,0)
-                [[1, 2], [1, 2]],  # need 1,2 — will evict low freq
+                [[1, 2], [1, 2]],
             ])
-        dm = StaticPolicy().simulate(at, cache_size=4)
+        dm = simulate(StaticFreq(), NoPrefetch(), at, cache_size=4)
         errors = dm.validate()
         assert errors == [], f"Validation errors: {errors}"
 
-        # (0,0) and (1,0) should never appear as eviction targets
         for step in dm.steps:
             for lt in step.layers:
                 for dl in lt.demand_loads:
@@ -720,17 +627,73 @@ class TestStaticPolicy:
 
     def test_validate_passes(self):
         at = make_simple_activation_trace()
-        dm = StaticPolicy().simulate(at, cache_size=6)
+        dm = simulate(StaticFreq(), NoPrefetch(), at, cache_size=6)
         errors = dm.validate()
         assert errors == [], f"Validation errors: {errors}"
 
-    def test_no_prefetches(self):
-        """Static policy should never generate prefetches."""
+    def test_no_prefetches_with_noprefetch(self):
+        """Static-None should never generate prefetches."""
         at = make_simple_activation_trace()
-        dm = StaticPolicy().simulate(at, cache_size=6)
+        dm = simulate(StaticFreq(), NoPrefetch(), at, cache_size=6)
         for step in dm.steps:
             for lt in step.layers:
                 assert lt.prefetches == []
+
+
+# ── 8. Mix-and-match combos ──────────────────────────────────────────
+
+class TestMixAndMatch:
+
+    def test_static_oracle_has_prefetches(self):
+        """Static-Oracle should produce prefetches."""
+        at = ActivationTrace(
+            num_layers=3, num_experts=4,
+            steps=[
+                [[0, 1], [2, 3], [0, 2]],
+            ])
+        # cache_size=4 so not all 6 unique experts fit → forces misses/prefetches
+        dm = simulate(StaticFreq(), OraclePrefetch(), at, cache_size=4)
+        has_pf = any(len(lt.prefetches) > 0
+                     for step in dm.steps for lt in step.layers)
+        assert has_pf, "Static-Oracle should generate prefetches"
+        errors = dm.validate()
+        assert errors == [], f"Validation errors: {errors}"
+
+    def test_lru_oracle_has_prefetches(self):
+        """LRU-Oracle should produce prefetches."""
+        at = ActivationTrace(
+            num_layers=3, num_experts=4,
+            steps=[
+                [[0, 1], [2, 3], [0, 2]],
+            ])
+        dm = simulate(LRU(), OraclePrefetch(), at, cache_size=6)
+        has_pf = any(len(lt.prefetches) > 0
+                     for step in dm.steps for lt in step.layers)
+        assert has_pf, "LRU-Oracle should generate prefetches"
+        errors = dm.validate()
+        assert errors == [], f"Validation errors: {errors}"
+
+    def test_belady_none_no_prefetches(self):
+        """Belady-None should not produce prefetches."""
+        at = make_simple_activation_trace()
+        dm = simulate(Belady(), NoPrefetch(), at, cache_size=6)
+        for step in dm.steps:
+            for lt in step.layers:
+                assert lt.prefetches == []
+        errors = dm.validate()
+        assert errors == [], f"Validation errors: {errors}"
+
+    def test_all_combos_validate(self):
+        """Every cache x prefetch combo should produce valid traces."""
+        at = make_simple_activation_trace()
+        caches = [LRU(), Belady(), LFU(), StaticFreq()]
+        prefetches = [NoPrefetch(), OraclePrefetch()]
+        for cp in caches:
+            for pp in prefetches:
+                dm = simulate(cp, pp, at, cache_size=6)
+                errors = dm.validate()
+                assert errors == [], \
+                    f"{cp.__class__.__name__}-{pp.__class__.__name__}: {errors}"
 
 
 # ── 9. Summary statistics ────────────────────────────────────────────
@@ -739,7 +702,7 @@ class TestSummary:
 
     def test_summary_counts(self):
         at = make_simple_activation_trace()
-        dm = LRUPolicy().simulate(at, cache_size=6)
+        dm = simulate(LRU(), NoPrefetch(), at, cache_size=6)
         s = dm.summary()
         assert s['steps'] == 5
         assert s['total_transfers'] == s['demand_loads']
@@ -751,26 +714,24 @@ class TestSummary:
             steps=[
                 [[0, 1], [2, 3], [0, 2]],
             ])
-        dm = OraclePolicy().simulate(at, cache_size=6)
+        dm = simulate(Belady(), OraclePrefetch(), at, cache_size=6)
         s = dm.summary()
         assert s['total_transfers'] > 0
 
 
-# ── 9. Unified cache specific ────────────────────────────────────────
+# ── 10. Unified cache specific ───────────────────────────────────────
 
 class TestUnifiedCache:
 
     def test_variable_experts_per_layer(self):
         """Different layers can have different numbers of experts cached."""
-        # 2 layers, 4 experts, cache_size=3
-        # Layer 0 needs 2 experts, layer 1 needs 1 expert
         at = ActivationTrace(
             num_layers=2, num_experts=4,
             steps=[
-                [[0, 1], [2]],  # layer 0: 2 experts, layer 1: 1 expert
-                [[0, 1], [3]],  # layer 0: same, layer 1: different
+                [[0, 1], [2]],
+                [[0, 1], [3]],
             ])
-        dm = LRUPolicy().simulate(at, cache_size=3)
+        dm = simulate(LRU(), NoPrefetch(), at, cache_size=3)
         errors = dm.validate()
         assert errors == [], f"Validation errors: {errors}"
 
@@ -779,30 +740,26 @@ class TestUnifiedCache:
         at = ActivationTrace(
             num_layers=2, num_experts=4,
             steps=[
-                [[0, 1, 2, 3], []],  # layer 0: all experts, layer 1: none
+                [[0, 1, 2, 3], []],
             ])
-        dm = LRUPolicy().simulate(at, cache_size=4)
+        dm = simulate(LRU(), NoPrefetch(), at, cache_size=4)
         errors = dm.validate()
         assert errors == [], f"Validation errors: {errors}"
-        # Layer 1 should have no transfers
         lt1 = dm.steps[0].layers[1]
         assert lt1.demand_loads == []
 
     def test_cache_pressure_across_layers(self):
         """Cache pressure from one layer affects another."""
-        # 2 layers, 4 experts each, cache_size=4
-        # Both layers need different experts, forcing evictions
         at = ActivationTrace(
             num_layers=2, num_experts=4,
             steps=[
-                [[0, 1], [2, 3]],  # needs 4 total, cache fits exactly
-                [[2, 3], [0, 1]],  # swap: all 4 need replacing
+                [[0, 1], [2, 3]],
+                [[2, 3], [0, 1]],
             ])
-        dm = LRUPolicy().simulate(at, cache_size=4)
+        dm = simulate(LRU(), NoPrefetch(), at, cache_size=4)
         errors = dm.validate()
         assert errors == [], f"Validation errors: {errors}"
 
-        # Step 1 should have demand loads since cache contents swapped
         total_loads = sum(
             len(lt.demand_loads) for lt in dm.steps[1].layers)
         assert total_loads > 0, "Should have demand loads on step 1"

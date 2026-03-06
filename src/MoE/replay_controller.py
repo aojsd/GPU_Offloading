@@ -33,7 +33,7 @@ Usage:
 
 import torch
 
-from data_movement_trace import DataMovementTrace, TransferEvent
+from data_movement_trace import DataMovementTrace, StepScheduling, TransferEvent
 
 
 class ReplayController:
@@ -215,6 +215,63 @@ class ReplayController:
         # Update unified cache state
         self._resident[(target_layer, target_eid)] = slot
         self.expert_map_abs[target_layer][target_eid] = slot
+
+    def get_step_scheduling(self, step: int = None) -> 'StepScheduling | None':
+        """Get scheduling metadata for a step.
+
+        Args:
+            step: Step index. If None, uses the current step.
+
+        Returns:
+            StepScheduling or None if no scheduling data is available.
+        """
+        if step is None:
+            step = self._current_step
+        if step < 0 or step >= len(self.trace.steps):
+            return None
+        return self.trace.steps[step].scheduling
+
+    def get_preempted_seq_ids(self, step: int = None) -> list[int]:
+        """Get request_ids that should be preempted after this step.
+
+        Reads from the scheduling metadata attached to the trace.
+        The caller (replay loop) should call engine.free_seq() for each.
+
+        Returns:
+            List of request_ids to preempt, or empty list.
+        """
+        sched = self.get_step_scheduling(step)
+        if sched is None:
+            return []
+        return [evt['request_id'] for evt in sched.events
+                if evt['event'] == 'preempt']
+
+    def get_readmitted_seq_ids(self, step: int = None) -> list[int]:
+        """Get request_ids readmitted at this step (need re-prefill).
+
+        Reads from the scheduling metadata attached to the trace.
+        The caller should re-prefill these sequences before the step.
+
+        Returns:
+            List of request_ids readmitted, or empty list.
+        """
+        sched = self.get_step_scheduling(step)
+        if sched is None:
+            return []
+        return [evt['request_id'] for evt in sched.events
+                if evt['event'] in ('readmit', 'force_readmit')]
+
+    def get_newly_admitted_seq_ids(self, step: int = None) -> list[int]:
+        """Get request_ids newly admitted at this step (need initial prefill).
+
+        Returns:
+            List of request_ids admitted, or empty list.
+        """
+        sched = self.get_step_scheduling(step)
+        if sched is None:
+            return []
+        return [evt['request_id'] for evt in sched.events
+                if evt['event'] in ('admit', 'force_admit')]
 
     def get_replay_stats(self) -> dict:
         """Compute summary statistics from the trace being replayed."""

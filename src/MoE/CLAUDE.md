@@ -9,7 +9,7 @@ We want to create a sort of sandbox environment for experimenting with expert of
 
 Note that in order for this sandbox to be useful, we need to accurately capture both the behavior (expert selection) and compute performance of state-of-the-art serving systems. Ideally, we'd implement this using a framework like vLLM or SGLang, but I'm not sure if their APIs are enough to build this trace-based sandbox. If we instead build our implementation from scratch, we need to ensure that step 3 uses existing state-of-the-art kernels and compilation frameworks to maximize potential performance to provide useful insights. We'd also need to make sure our trace collection is accurate.
 
-Meta-Instructions:
+IMPORTANT Meta-Instructions:
 After reasonable checkpoints, or when finding a critical bug, summarize important ideas and changes and append them to the end of this CLAUDE.md file, or the relevant .md file pointed to within this CLAUDE.md file. Alternatively, do this whenever you have been working for a long time and may soon exceed the 200k context limit. When a major progression is finished (e.g., completing a long task given by user prompt), refactor the CLAUDE.md file to remove the intermediate checkpoint information.
 
 Aim to write most, if not all, code in Python/Pytorch or Pytorch-compatible packages.
@@ -57,6 +57,7 @@ DataMovementTrace:
 
 StepTrace:
   layers: list[LayerTrace]                       # 32 layers
+  scheduling: StepScheduling | None              # batch composition + events
 
 LayerTrace:
   topk_ids: list[list[int]]                      # expert selections per token
@@ -96,7 +97,7 @@ Layer L (L > 0):
 4. **Unified Expert Cache** (complete): Single `w1_buf[L*epl + scratchpad, 2*I, H]` buffer with per-layer views. Eliminated D2D copies (was 14.8 ms/step on 32L). Compute parity 36/36 checks passed. Latency model `wall = compute + IO` validated across 88 experiments (prefill, mixed batch, decode): Mixtral-20L +0.5%, Mixtral-32L +0.6%, OLMoE +8.7% (Python dispatch overhead with many small transfers). IO accounts for 90-96% of wall-clock time. See [offload_1GPU.md](offload_1GPU.md).
 5. **Async Transfer & Prefetch** (complete): Two-stream architecture — transfer stream overlaps CPU→GPU copies with compute stream. Single CUDA event synchronization. See [replay.md](replay.md).
 6. **Trace Format & Replay Controller** (complete): `DataMovementTrace` with unified cache (`cache_size` slots shared across all layers), `ReplayController` with optimized prefetch timing (layer 0 before stage1, subsequent layers before stage4b of previous layer). See [replay.md](replay.md).
-7. **Policy Simulation** (complete): LRU, Oracle/Belady, LFU (windowed), Static (global frequency oracle), PreGated — all operating on unified cache with cross-layer eviction. See [replay.md](replay.md).
+7. **Policy Simulation** (complete): Orthogonal `CachePolicy` × `PrefetchPolicy` decomposition. Cache policies: LRU, Belady (MIN), LFU (windowed), StaticFreq (global oracle). Prefetch policies: NoPrefetch, OraclePrefetch (layer-0 + 1-layer lookahead). All 8 combinations validated. See [replay.md](replay.md).
 
 ---
 
@@ -265,11 +266,15 @@ See [decode.md](vLLM_comparison/decode.md) and [prefill.md](vLLM_comparison/pref
 | `vLLM_comparison/mixed_batch.md` | Mixed prefill+decode batch support: design, piecewise CUDA graph plan |
 | `datasets/download.sh` | Download datasets (ShareGPT) to shared storage with symlinks |
 | `trace_construction/trace_construction.md` | Design doc: collect per-conversation activations (GPU), build batched traces via continuous batching sim (CPU) |
-| `data_movement_trace.py` | `DataMovementTrace`, `ActivationTrace`, `TransferEvent` — trace formats with JSON serialization and validation |
-| `policy_simulator.py` | Policy simulators: `LRUPolicy`, `OraclePolicy`, `FrequencyPolicy`, `StaticPolicy`, `PreGatedPolicy` — simulate caching/prefetch on activation traces |
+| `trace_construction/collect_traces.py` | Phase 1: collect per-conversation expert traces from ShareGPT conversations (GPU) |
+| `trace_construction/build_trace.py` | Phase 2: continuous batching simulator with LIFO preemption → batched ActivationTrace with per-step scheduling metadata (CPU-only) |
+| `trace_construction/recollect_traces.py` | Targeted re-collection of specific conversations with different parameters |
+| `data_movement_trace.py` | `DataMovementTrace`, `ActivationTrace`, `TransferEvent`, `StepScheduling`, `RequestScheduling` — trace formats with scheduling metadata, JSON serialization and validation |
+| `policy_simulator.py` | `CachePolicy` (LRU, Belady, LFU, StaticFreq) × `PrefetchPolicy` (NoPrefetch, OraclePrefetch) + `simulate()` — orthogonal policy simulators |
 | `replay_controller.py` | `ReplayController` — replays `DataMovementTrace` on GPU with async prefetch streams and demand loading |
 | `replay.md` | Cache simulation & replay documentation: trace formats, policy simulators, replay controller architecture, prefetch/eviction timing |
-| `tests/test_replay_policy.py` | 39 unit tests covering trace serialization, validation, and all 4 policy simulators (unified cache) |
+| `tests/test_replay_policy.py` | 43 unit tests covering trace serialization, validation, and all policy combos (unified cache) |
+| `tests/test_trace_construction.py` | 23 unit tests for continuous batching simulator (page accounting, LIFO preemption, memory budget) |
 | `tests/README.md` | Index of all test/benchmark scripts with descriptions and quick start |
 
 Regenerate decode profiles: `python src/MoE/vLLM_comparison/nsys_profiler.py all`

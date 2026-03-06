@@ -33,7 +33,10 @@ and end-to-end usage.
 | [pipeline_parallelism.md](pipeline_parallelism.md) | PP=2 performance analysis, per-layer breakdown, optimization targets |
 | [replay.md](replay.md) | Cache simulation & replay: trace formats, policy simulators, replay controller, prefetch/eviction timing |
 | [vLLM_comparison/README.md](vLLM_comparison/README.md) | Decode, prefill, mixed batch benchmarks vs vLLM; profiling data |
-| [tests/README.md](tests/README.md) | Index of all test/benchmark scripts |
+| [tests/README.md](tests/README.md) | Unit and correctness tests (pytest) |
+| [benchmarks/README.md](benchmarks/README.md) | Performance benchmarks: kernel timing, e2e latency |
+| [profiling/README.md](profiling/README.md) | Nsight Systems and per-phase kernel profiling |
+| [scripts/README.md](scripts/README.md) | Experiment runners (policy sweeps) |
 | [trace_construction/README.md](trace_construction/README.md) | Trace collection pipeline: per-conversation GPU traces, batched CPU simulator |
 
 ### For Subagents
@@ -43,7 +46,9 @@ and end-to-end usage.
 - **Offloading design & memory analysis**: Read [offload_1GPU.md](offload_1GPU.md)
 - **Replay/policy simulation**: Read [replay.md](replay.md)
 - **Trace collection & batching**: Read [trace_construction/README.md](trace_construction/README.md)
-- **Tests & benchmarks**: Read [tests/README.md](tests/README.md)
+- **Tests**: Read [tests/README.md](tests/README.md)
+- **Benchmarks & profiling**: Read [benchmarks/README.md](benchmarks/README.md) and [profiling/README.md](profiling/README.md)
+- **Experiment scripts**: Read [scripts/README.md](scripts/README.md)
 - **Pipeline parallelism**: Read [pipeline_parallelism.md](pipeline_parallelism.md)
 
 ---

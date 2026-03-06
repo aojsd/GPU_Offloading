@@ -359,7 +359,10 @@ See [replay.md](replay.md) for detailed replay controller architecture and polic
 | Directory | README | Covers |
 |-----------|--------|--------|
 | [vLLM_comparison/](vLLM_comparison/) | [README.md](vLLM_comparison/README.md) | Decode, prefill, mixed batch benchmarks vs vLLM; profiling data; comparison methodology |
-| [tests/](tests/) | [README.md](tests/README.md) | Index of all test/benchmark scripts with descriptions and quick start |
+| [tests/](tests/) | [README.md](tests/README.md) | Unit and correctness tests (pytest) |
+| [benchmarks/](benchmarks/) | [README.md](benchmarks/README.md) | Performance benchmarks: per-layer kernel timing, e2e prefill/mixed latency |
+| [profiling/](profiling/) | [README.md](profiling/README.md) | Nsight Systems and per-phase kernel profiling harnesses |
+| [scripts/](scripts/) | [README.md](scripts/README.md) | Experiment runners (policy sweeps) |
 | [trace_construction/](trace_construction/) | [README.md](trace_construction/README.md) | Trace collection pipeline: per-conversation GPU traces → batched CPU simulator → policy simulation |
 
 ### Utility Commands

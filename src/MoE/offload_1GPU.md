@@ -682,8 +682,8 @@ All checks use 15% tolerance. "vs base" compares offloading (epl < E) to all-res
 |------|---------|
 | `moe_engine.py` | Unified buffer with per-layer views, `expert_map_abs`, D2D copies eliminated in 6 locations, `experts_per_layer` param, `offloading_active` property, auto-creates `ExpertOffloadEngine` |
 | `expert_offload_engine.py` | Rewritten for unified buffer: scratchpad at `scratchpad_start + i`, absolute slot indexing, `configure()` loads into `l * epl + slot` |
-| `tests/bench_comprehensive.py` | Full sweep benchmark: 3 models × multiple epl × batch 1/16/32, per-layer stage4b timing with demand loading |
-| `tests/bench_offload_prefill_mixed.py` | Prefill and mixed batch e2e latency with budget sweeps |
+| `benchmarks/bench_comprehensive.py` | Full sweep benchmark: 3 models × multiple epl × batch 1/16/32, per-layer stage4b timing with demand loading |
+| `benchmarks/bench_offload_prefill_mixed.py` | Prefill and mixed batch e2e latency with budget sweeps |
 | `tests/verify_unified_cache.py` | Smoke test (32L epl=4) + correctness test (20L epl=8 vs no-epl) |
 | vLLM fused_moe configs | Copied E=8/E=64 configs to cover all (E=total_slots, N) combinations |
 

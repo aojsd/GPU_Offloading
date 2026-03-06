@@ -46,7 +46,7 @@ When loaded from a batched trace (via `ActivationTrace.from_flat_trace()` or
 `ActivationTrace.load()`), the `scheduling` field contains per-step metadata
 including batch composition (`active_requests`) and scheduling events
 (`admit`, `complete`, `preempt`, `readmit`). See
-[trace_construction.md](trace_construction/trace_construction.md) for details.
+[trace_construction/README.md](trace_construction/README.md) for details.
 
 Load from a saved trace:
 

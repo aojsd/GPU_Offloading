@@ -19,3 +19,6 @@ src/MoE/vLLM_comparison/trace_*.json
 
 # Personal CLAUDE.md
 CLAUDE.md
+
+# Figures
+*.pdf

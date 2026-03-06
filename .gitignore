@@ -16,3 +16,6 @@ src/MoE/datasets/*
 # Generated trace files (reproduced via batch_replay.py --trace)
 src/MoE/trace_*.json
 src/MoE/vLLM_comparison/trace_*.json
+
+# Personal CLAUDE.md
+CLAUDE.md

@@ -14,6 +14,7 @@ import os
 import sys
 import subprocess
 import sqlite3
+import tempfile
 import textwrap
 from pathlib import Path
 from collections import defaultdict
@@ -329,8 +330,9 @@ def run_nsys(driver_path, rep_prefix, mode):
 
 
 def export_sqlite(rep_path):
-    """Export .nsys-rep to .sqlite."""
-    sqlite_path = rep_path.replace(".nsys-rep", ".sqlite")
+    """Export .nsys-rep to .sqlite in /tmp."""
+    sqlite_path = os.path.join(tempfile.gettempdir(),
+                               Path(rep_path).stem + ".sqlite")
     cmd = [NSYS, "export", "--type", "sqlite",
            "--output", sqlite_path, rep_path, "--force-overwrite=true"]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -422,17 +424,19 @@ def profile_one(mode, seq_len, model_dir=DEFAULT_MODEL_DIR):
     """Profile one (mode, seq_len) combination. Returns parsed data dict.
 
     mode: "custom", "vllm" (decode), "custom_prefill", "vllm_prefill"
+    All intermediate files (driver scripts, .nsys-rep, .sqlite) are created
+    in /tmp and cleaned up after parsing.
     """
     is_prefill = "prefill" in mode
     engine = "custom" if mode.startswith("custom") else "vllm"
 
-    prof_dir = _profile_dir(model_dir)
-    prof_dir.mkdir(parents=True, exist_ok=True)
     name = f"{mode}_seq{seq_len}"
-    rep_prefix = str(prof_dir / name)
+    # All intermediates go to /tmp
+    tmpdir = tempfile.gettempdir()
+    rep_prefix = os.path.join(tmpdir, name)
 
-    # Write driver
-    driver_path = prof_dir / f"_driver_{name}.py"
+    # Write driver to /tmp
+    driver_path = Path(tmpdir) / f"_driver_{name}.py"
     drivers = {
         "custom": write_custom_driver,
         "vllm": write_vllm_driver,

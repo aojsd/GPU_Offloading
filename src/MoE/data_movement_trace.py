@@ -55,6 +55,77 @@ class TransferEvent:
 
 
 @dataclass
+class RequestScheduling:
+    """Per-request metadata within a scheduling step."""
+    request_id: int
+    conversation_id: str
+    seq_len: int
+    is_prefill: bool
+
+    def to_dict(self) -> dict:
+        return {
+            'request_id': self.request_id,
+            'conversation_id': self.conversation_id,
+            'seq_len': self.seq_len,
+            'is_prefill': self.is_prefill,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> 'RequestScheduling':
+        return RequestScheduling(
+            request_id=d['request_id'],
+            conversation_id=d['conversation_id'],
+            seq_len=d['seq_len'],
+            is_prefill=d['is_prefill'],
+        )
+
+
+@dataclass
+class StepScheduling:
+    """Per-step scheduling metadata from the continuous batching simulator.
+
+    Captures batch composition and scheduling events (admissions, completions,
+    preemptions, readmissions) for each step. Used by the replay loop to
+    manage KV cache and batch composition during trace replay.
+
+    Events happen in this order within a step:
+      1. 'complete' — requests that finished in the previous step are removed
+      2. 'readmit' / 'force_readmit' — swapped requests restored
+      3. 'admit' / 'force_admit' — new requests from waiting queue
+      4. [computation happens with active_requests]
+      5. 'preempt' — requests evicted after this step's computation
+
+    Attributes:
+        step:             Global step index.
+        batch_size:       Number of active requests in this step.
+        active_requests:  Per-request metadata (id, seq_len, prefill status).
+        events:           Scheduling events for this step.
+    """
+    step: int
+    batch_size: int
+    active_requests: list[RequestScheduling]
+    events: list[dict]
+
+    def to_dict(self) -> dict:
+        return {
+            'step': self.step,
+            'batch_size': self.batch_size,
+            'active_requests': [r.to_dict() for r in self.active_requests],
+            'events': self.events,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> 'StepScheduling':
+        return StepScheduling(
+            step=d['step'],
+            batch_size=d['batch_size'],
+            active_requests=[RequestScheduling.from_dict(r)
+                             for r in d['active_requests']],
+            events=d.get('events', []),
+        )
+
+
+@dataclass
 class LayerTrace:
     """Per-layer data movement schedule for one decode step.
 
@@ -97,17 +168,26 @@ class StepTrace:
     """Per-step (per-decode-token) data movement schedule.
 
     Attributes:
-        layers: One LayerTrace per transformer layer (e.g. 32 for Mixtral).
+        layers:     One LayerTrace per transformer layer (e.g. 32 for Mixtral).
+        scheduling: Optional scheduling metadata from batch simulator.
     """
     layers: list[LayerTrace]
+    scheduling: Optional[StepScheduling] = None
 
     def to_dict(self) -> dict:
-        return {'layers': [lt.to_dict() for lt in self.layers]}
+        d = {'layers': [lt.to_dict() for lt in self.layers]}
+        if self.scheduling is not None:
+            d['scheduling'] = self.scheduling.to_dict()
+        return d
 
     @staticmethod
     def from_dict(d: dict) -> 'StepTrace':
+        scheduling = None
+        if 'scheduling' in d:
+            scheduling = StepScheduling.from_dict(d['scheduling'])
         return StepTrace(
-            layers=[LayerTrace.from_dict(lt) for lt in d['layers']])
+            layers=[LayerTrace.from_dict(lt) for lt in d['layers']],
+            scheduling=scheduling)
 
 
 @dataclass
@@ -265,11 +345,14 @@ class ActivationTrace:
                          router inputs (post-layernorm hidden states) keyed
                          as 'step{s}_layer{l}' with shape [n_tokens, hidden_dim]
                          in float16. None when not recorded.
+        scheduling:      Optional per-step scheduling metadata from
+                         build_trace.py's continuous batching simulator.
     """
     num_layers: int
     num_experts: int
     steps: list[list[list[int]]]
     router_inputs: Optional[str] = None
+    scheduling: Optional[list[StepScheduling]] = None
 
     @staticmethod
     def from_flat_trace(trace_data: dict,
@@ -280,6 +363,7 @@ class ActivationTrace:
         Args:
             trace_data: Dict with keys 'num_layers', 'num_experts', 'trace'
                 where trace is a list of {step, layer, expert_ids} dicts.
+                Optionally includes 'step_scheduling' from build_trace.py.
             router_inputs_path: Optional path to companion .npz file with
                 router inputs.
 
@@ -301,8 +385,15 @@ class ActivationTrace:
         for entry in flat:
             steps[entry['step']][entry['layer']] = entry['expert_ids']
 
+        # Parse scheduling metadata if present
+        scheduling = None
+        if 'step_scheduling' in trace_data:
+            scheduling = [StepScheduling.from_dict(s)
+                          for s in trace_data['step_scheduling']]
+
         return ActivationTrace(num_layers, num_experts, steps,
-                               router_inputs=router_inputs_path)
+                               router_inputs=router_inputs_path,
+                               scheduling=scheduling)
 
     @staticmethod
     def load(path: str) -> 'ActivationTrace':
@@ -336,6 +427,8 @@ class ActivationTrace:
             'trace': flat_trace,
             'transfers': [],
         }
+        if self.scheduling is not None:
+            data['step_scheduling'] = [s.to_dict() for s in self.scheduling]
         with open(path, 'w') as f:
             json.dump(data, f, indent=2)
 

@@ -7,6 +7,24 @@ real GPU hardware.
 
 ## Overview
 
+The replay is **trace-driven**: each request runs exactly `len(trace.steps)` steps
+as determined during trace collection. EOS tokens from the model are ignored.
+Generated tokens should be identical to those traced (same model, same kernels,
+greedy decoding), so expert routing matches the trace exactly. The purpose is to
+measure data movement timing under realistic compute, not to produce correct text.
+
+**Replay fidelity requirement:** For timing results to be meaningful, GPU replay
+MUST faithfully recreate the batch compositions from the continuous batching
+simulator (Phase 2). Each step must dispatch the exact mix of decode sequences,
+prefill chunks, and continuation chunks at their traced token counts. Batch size
+directly determines (a) compute kernel duration (attention + MoE), (b) the overlap
+window available to hide async prefetches, and (c) PCIe contention from concurrent
+transfers. Single-sequence replay produces correct expert cache transfer counts but
+**invalid timing data** — all compute/IO ratios are wrong because BS=1 decode
+completes in ~9ms while real batches of 30+ sequences take much longer, providing
+far more overlap opportunity for prefetches. Only `scripts/batched_replay.py`
+performs faithful multi-sequence replay.
+
 The sandbox separates *what* data movement to perform (policy simulation) from
 *how* to perform it (GPU replay). This enables offline evaluation of arbitrary
 caching and prefetching strategies against real hardware timing:
@@ -14,7 +32,7 @@ caching and prefetching strategies against real hardware timing:
 ```
 1. Record expert activations:  ExpertOffloadEngine.save_trace()
                                    ↓
-2. Simulate cache policy:      simulate(cache, prefetch, trace)  →  DataMovementTrace
+2. Simulate cache policy:      simulate(cache, prefetch, trace)  →  GPUReplayTrace
                                    ↓
 3. Replay on GPU hardware:     ReplayController(engine, trace)  →  wall-clock timing
 ```
@@ -27,7 +45,7 @@ reflects production-grade kernel performance.
 
 ## Data Movement Trace Format
 
-All data structures live in `data_movement_trace.py`.
+All data structures live in `gpu_replay_trace.py`.
 
 ### ActivationTrace — Policy Input
 
@@ -44,8 +62,9 @@ ActivationTrace:
 
 When loaded from a batched trace (via `ActivationTrace.from_flat_trace()` or
 `ActivationTrace.load()`), the `scheduling` field contains per-step metadata
-including batch composition (`active_requests`) and scheduling events
-(`admit`, `complete`, `preempt`, `readmit`). See
+including batch composition (`active_requests` with chunked prefill fields)
+and scheduling events (`admit`, `complete`). With the no-preemption policy,
+`preempt` and `readmit` events never occur. See
 [trace_construction/README.md](trace_construction/README.md) for details.
 
 Load from a saved trace:
@@ -56,7 +75,7 @@ trace = ActivationTrace.load("expert_trace.json")
 trace = ActivationTrace.from_flat_trace(trace_data)
 ```
 
-### DataMovementTrace — Replay Input
+### GPUReplayTrace — Replay Input
 
 Complete schedule of every prefetch, eviction, and demand load for an entire
 decode sequence. Produced by policy simulators, consumed by `ReplayController`.
@@ -69,7 +88,7 @@ layer 0, 0 in layer 5, 3 in layer 10) as long as the total does not exceed
 `cache_size`.
 
 ```
-DataMovementTrace:
+GPUReplayTrace:
     num_layers:          int
     num_experts:         int
     cache_size:          int                         # total unified GPU cache slots
@@ -112,12 +131,12 @@ is fully supported.
 
 ```python
 trace.save("lru_movement.json")       # JSON with indent=2
-trace = DataMovementTrace.load("lru_movement.json")
+trace = GPUReplayTrace.load("lru_movement.json")
 ```
 
 ### Validation
 
-`DataMovementTrace.validate()` simulates the residency state machine and returns
+`GPUReplayTrace.validate()` simulates the residency state machine and returns
 a list of error strings (empty = valid). It checks:
 
 1. **Initial capacity**: `len(initial_cache_state) <= cache_size`.
@@ -142,7 +161,7 @@ Any cache policy can be combined with any prefetch policy. All classes live in
 `policy_simulator.py`.
 
 ```python
-from data_movement_trace import ActivationTrace
+from gpu_replay_trace import ActivationTrace
 from policy_simulator import LRU, Belady, StaticFreq, OraclePrefetch, NoPrefetch, simulate
 
 trace = ActivationTrace.load("expert_trace.json")
@@ -194,9 +213,9 @@ Pre-computes access frequencies over the **entire** trace, then:
 1. **Initial cache**: the top `cache_size` experts by global frequency.
 2. **On miss**: evict the resident with the lowest global frequency.
 
-The top `(cache_size - E)` experts are effectively **pinned** and never
-evicted. Requires oracle knowledge (full trace). Answers: "how well can you
-do if you simply keep the most popular experts?"
+High-frequency experts are effectively **pinned**: eviction always targets
+the lowest-frequency resident. Requires oracle knowledge (full trace).
+Answers: "how well can you do if you simply keep the most popular experts?"
 
 ### Prefetch Policies
 
@@ -239,7 +258,7 @@ Policies are named `<CachePolicy>-<PrefetchPolicy>`:
 ## Replay Controller
 
 `replay_controller.py` implements `ReplayController`, which replays a
-`DataMovementTrace` on real GPU hardware using the MoEEngine's piecewise CUDA
+`GPUReplayTrace` on real GPU hardware using the MoEEngine's piecewise CUDA
 graph infrastructure.
 
 ### CUDA Stream Architecture
@@ -430,45 +449,63 @@ adding ~13 ms of blocking IO to the ~1.4 ms of compute. This matches the
 validated latency model from Phase 4: IO accounts for 90–96% of wall-clock
 time in demand-load-only configurations.
 
-### Scheduling Metadata and Preemption
+### Scheduling Metadata — Multi-Sequence Replay
 
-When the `DataMovementTrace` is produced from a batched `ActivationTrace` (via
+When the `GPUReplayTrace` is produced from a batched `ActivationTrace` (via
 `build_trace.py` → policy simulator), each `StepTrace` carries optional
 `StepScheduling` metadata describing the batch composition and scheduling events.
 
-The `ReplayController` exposes helpers for the replay loop:
+**This metadata is the ground truth for faithful replay.** The GPU replay loop
+MUST consume this metadata to reconstruct the correct batch at each step —
+dispatching the right decode sequences, prefill chunks, and continuations at
+their traced token counts. Without this, compute kernel durations and prefetch
+overlap windows do not reflect realistic serving, making policy timing
+comparisons invalid.
+
+**No-preemption policy:** Since replay is trace-driven (output lengths known in
+advance), pages for the full sequence (prompt + output) are pre-allocated at
+admission. No request is ever preempted or readmitted. Events are limited to
+`complete`, `admit`, and `force_admit`.
+
+Each `StepScheduling` contains:
+- `active_requests`: list of `RequestScheduling` — per-request metadata including
+  `request_id`, `seq_len`, `is_prefill`, `prefill_chunk_start`,
+  `prefill_chunk_length`, `is_continuation`.
+- `events`: list of scheduling events (`complete`, `admit`).
+
+**Token type dispatch** (from `RequestScheduling`):
+- `is_prefill=False` → decode (1 token, FlashInfer paged-KV attention)
+- `is_prefill=True, is_continuation=False` → new prefill (FA3 self-attention)
+- `is_prefill=True, is_continuation=True` → continuation chunk (FlashInfer
+  paged-KV, offset = `prefill_chunk_start`)
+
+The `ReplayController` exposes helpers:
 
 ```python
-controller.get_step_scheduling(step)      # → StepScheduling or None
-controller.get_preempted_seq_ids(step)    # → [request_id, ...]
-controller.get_readmitted_seq_ids(step)   # → [request_id, ...]
+controller.get_step_scheduling(step)       # → StepScheduling or None
 controller.get_newly_admitted_seq_ids(step) # → [request_id, ...]
 ```
 
-The replay loop uses these to manage KV cache:
+**request_id → seq_id mapping:** The trace uses `request_id` (0..N-1, index
+into conversations). The engine uses `seq_id` as a KV cache slot in
+`[0, max_seqs)`. The replay loop maintains a free pool:
 
 ```python
-for step in range(len(trace.steps)):
-    sched = controller.get_step_scheduling(step)
+free_seq_ids = set(range(max_seqs))
+request_to_slot = {}
 
-    # Before compute: handle completions, readmissions, admissions
-    for rid in controller.get_newly_admitted_seq_ids(step):
-        engine.chunked_prefill_to_slot(rid, prompt_tokens[rid])
-    for rid in controller.get_readmitted_seq_ids(step):
-        engine.free_seq(rid)   # reset KV
-        engine.chunked_prefill_to_slot(rid, ...)  # re-prefill (recompute model)
+# On admit:
+sid = free_seq_ids.pop()
+request_to_slot[request_id] = sid
 
-    # Run the step (ReplayController manages expert cache internally)
-    logits = engine.mixed_step(decode_ids, decode_tokens, prefill_ids, prefill_tokens)
-
-    # After compute: handle preemptions
-    for rid in controller.get_preempted_seq_ids(step):
-        engine.free_seq(rid)   # logically free KV pages
+# On complete:
+engine.free_seq(sid)
+free_seq_ids.add(request_to_slot.pop(request_id))
 ```
 
-The `engine.free_seq(seq_id)` method resets `_seq_lens_cpu[seq_id]` and
-`seq_lens[seq_id]` to 0, logically freeing the sequence's KV pages. For
-readmission with the recompute model, re-prefill into the same seq_id.
+The multi-sequence replay loop in `scripts/batched_replay.py` processes each
+step's scheduling metadata, dispatches to `engine.mixed_step()` with the
+correct decode/prefill/continuation split, and uses actual traced tokens.
 
 ### GPU Memory Budget for Replay
 
@@ -516,7 +553,7 @@ Max feasible `cache_size` for Mixtral on single H100 (with minimal KV):
 
 | Aspect | ReplayController | ExpertOffloadEngine |
 |--------|-----------------|---------------------|
-| **Decision source** | Pre-computed `DataMovementTrace` | Reactive (reads routing at runtime) |
+| **Decision source** | Pre-computed `GPUReplayTrace` | Reactive (reads routing at runtime) |
 | **Cache model** | Unified `cache_size` slots across all layers | Per-layer `experts_per_layer` + scratchpad |
 | **Prefetching** | Scheduled per trace (2 categories: prefetch + demand) | None (pure demand loading) |
 | **Eviction policy** | Encoded in trace (any policy) | Simple demand load (no policy) |
@@ -528,72 +565,63 @@ Max feasible `cache_size` for Mixtral on single H100 (with minimal KV):
 
 ## End-to-End Usage
 
-### Step 1: Record an Activation Trace
+### Single-Sequence Replay (Development Only)
+
+For simple single-sequence development and testing. Transfer counts are correct
+but timing is not representative of batched serving — use `batched_replay.py`
+for experiments.
 
 ```python
 from moe_engine import MoEEngine
+from gpu_replay_trace import ActivationTrace, GPUReplayTrace
+from policy_simulator import Belady, OraclePrefetch, simulate
+from replay_controller import ReplayController
 
-# Use experts_per_layer for trace recording (ExpertOffloadEngine mode)
+# Step 1: Record a trace (ExpertOffloadEngine mode)
 engine = MoEEngine("models/Mixtral-8x7B", experts_per_layer=2)
 engine.capture_prefill_cuda_graph(total_token_sizes=[128])
 engine.capture_mixed_cuda_graphs(total_token_sizes=[128])
-
-# Run inference (prefill + decode steps)
 with torch.inference_mode():
     engine.prefill_to_slot(0, input_ids)
     for step in range(50):
         logits = engine.mixed_step([0], [next_token], [], [])
         next_token = logits.argmax(-1)
-
-# Save the trace recorded by ExpertOffloadEngine
 engine.offload_engine.save_trace("expert_trace.json")
-```
 
-### Step 2: Simulate a Cache Policy
+# Step 2: Simulate a policy (CPU-only)
+trace = ActivationTrace.load("expert_trace.json")
+dm_trace = simulate(Belady(), OraclePrefetch(), trace, cache_size=128)
+assert not dm_trace.validate()
+dm_trace.save("belady_oracle_cs128.json")
 
-```python
-from data_movement_trace import ActivationTrace
-from policy_simulator import Belady, OraclePrefetch, simulate
-
-activation_trace = ActivationTrace.load("expert_trace.json")
-# cache_size = total unified GPU slots (e.g., 4 experts per layer * 32 layers = 128)
-dm_trace = simulate(Belady(), OraclePrefetch(), activation_trace, cache_size=128)
-
-# Validate and inspect
-errors = dm_trace.validate()
-assert not errors, f"Trace errors: {errors}"
-
-stats = dm_trace.summary()
-print(f"Demand loads: {stats['demand_loads']}, "
-      f"Prefetches: {stats['prefetches']}, "
-      f"Evictions: {stats['evictions']}")
-
-dm_trace.save("belady_oracle_cs128_movement.json")
-```
-
-### Step 3: Replay on GPU Hardware
-
-```python
-from data_movement_trace import DataMovementTrace
-from replay_controller import ReplayController
-
-dm_trace = DataMovementTrace.load("oracle_cs128_movement.json")
-# For replay, use cache_size mode (unified cache)
+# Step 3: Replay on GPU
+dm_trace = GPUReplayTrace.load("belady_oracle_cs128.json")
 engine = MoEEngine("models/Mixtral-8x7B", cache_size=128)
 controller = ReplayController(engine, dm_trace)
-controller.setup()  # Load initial cache state into unified GPU buffer
-
-# Attach to engine and run the same inference
+controller.setup()
 engine.replay_controller = controller
 with torch.inference_mode():
     engine.prefill_to_slot(0, input_ids)
     for step in range(len(dm_trace.steps)):
         logits = engine.mixed_step([0], [next_token], [], [])
         next_token = logits.argmax(-1)
-
-# Detach
 engine.replay_controller = None
-replay_stats = controller.get_replay_stats()
+```
+
+### Multi-Sequence Batched Replay (Experiments — Required for Valid Timing)
+
+For realistic multi-sequence experiments, use `scripts/batched_replay.py`.
+**This is the only replay mode that produces valid timing data.** It faithfully
+recreates the batch compositions from Phase 2 (continuous batching simulator),
+handling the full pipeline: loading batched traces, simulating policies,
+managing request_id→seq_id mapping, and replaying with mixed decode/prefill/
+continuation batches. See [scripts/README.md](scripts/README.md) for usage.
+
+```bash
+python scripts/batched_replay.py \
+    --model models/Mixtral-8x7B-Instruct-v0.1 \
+    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b \
+    --cache-fraction 0.5 --max-seqs 256 --max-graph-size 512
 ```
 
 ### Comparing Policies
@@ -625,7 +653,7 @@ for cp in caches:
 
 | Category | Tests | What's verified |
 |----------|-------|-----------------|
-| Serialization | 4 | TransferEvent round-trip, cross-layer evict, DataMovementTrace save/load |
+| Serialization | 4 | TransferEvent round-trip, cross-layer evict, GPUReplayTrace save/load |
 | Validation | 5 | Valid trace passes, missing expert, overcapacity, free slot addition |
 | ActivationTrace | 7 | from_flat_trace, save/load round-trip, empty trace, router inputs round-trip, policies work with router inputs |
 | LRU | 5 | No misses when all fit, eviction order, validate passes, no prefetches, cross-layer eviction |
@@ -644,7 +672,7 @@ Run: `cd GPU_Offloading/src/MoE && python -m pytest tests/test_replay_policy.py 
 
 | File | Role |
 |------|------|
-| `data_movement_trace.py` | `DataMovementTrace`, `ActivationTrace`, `TransferEvent`, `LayerTrace`, `StepTrace` — trace format with serialization and validation |
+| `gpu_replay_trace.py` | `GPUReplayTrace`, `ActivationTrace`, `TransferEvent`, `LayerTrace`, `StepTrace` — trace format with serialization and validation |
 | `policy_simulator.py` | `CachePolicy` (LRU, Belady, LFU, StaticFreq) × `PrefetchPolicy` (NoPrefetch, OraclePrefetch) + `simulate()` — orthogonal policy simulators |
 | `replay_controller.py` | `ReplayController` — GPU replay with async CUDA streams |
 | `expert_offload_engine.py` | `ExpertOffloadEngine` — reactive demand loading, trace recording |

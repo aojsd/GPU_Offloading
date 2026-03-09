@@ -29,7 +29,7 @@ combinations for the unified expert cache.
 
 | Category | Tests | What's verified |
 |----------|-------|-----------------|
-| Serialization | 4 | TransferEvent round-trip, cross-layer evict, DataMovementTrace save/load |
+| Serialization | 4 | TransferEvent round-trip, cross-layer evict, GPUReplayTrace save/load |
 | Validation | 5 | Valid trace passes, missing expert, overcapacity, free slot addition |
 | ActivationTrace | 7 | from_flat_trace, save/load round-trip, empty trace, router inputs |
 | LRU | 5 | No misses when all fit, eviction order, validate, cross-layer eviction |

@@ -151,7 +151,7 @@ out = flash_attn_varlen_func(
 
 ### Prefill Performance (batch=1)
 
-**OLMoE-1B-7B** (CUDA graph without torch.compile, median ms):
+**OLMoE-1B-7B** (CUDA graph + torch.compile, median ms):
 
 ```
 seq_len  Custom   vLLM      Delta       Ratio

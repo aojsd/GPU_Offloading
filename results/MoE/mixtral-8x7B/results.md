@@ -5,121 +5,98 @@
 - 2x H100 80GB, PCIe 5.0, ~56 GB/s H2D per GPU (no contention: 1.00x with concurrent transfers)
 - Full Mixtral-8x7B 32L × 8E (256 total experts, 336 MB each, ~86 GB total)
 - System RAM: ~1 TB, no cgroup limit
-- Bench script: `tests/bench_replay_policies.py`, 100 steps, 2 warmup, 3 trials (median)
-- Each config tests 4 policies: StaticFreq-None, StaticFreq-Oracle, Oracle(1), Oracle(2)
+- Bench script: `scripts/batched_replay.py`, real-batch warmup, full trace replay (single trial)
+- Each config tests 4 cache policies × 3 prefetch policies = 12 combinations
+
+## Trace Pipeline
+
+- **Phase 1**: 200 ShareGPT conversations, per-conversation GPU traces with fixed 256-token prefill chunks
+- **Phase 2**: Continuous batching simulator, `max_graph_size=512`, no preemption (full-sequence page pre-allocation)
+- **Phase 3**: Policy simulation (4 cache × 3 prefetch = 12 policies per cache%)
+- **Phase 4**: GPU replay with CUDA event I/O timing (in progress)
 
 ## Offloading Replay Results (Single GPU)
 
-### Per-Step Wall-Clock Time (ms/step, median of 3 trials, 100 steps)
+Workload: 200 ShareGPT conversations, continuous batching with no preemption
+(full-sequence page pre-allocation). Fixed 256-token prefill chunks. 50/60% have
+identical step counts (KV budget exceeds peak demand); 70% is slightly constrained;
+80% and 85% have reduced KV budgets → smaller batches → more steps.
 
-| Cache% | CS  | Steps | SF-None | SF-Oracle | SF-Oracle(1) | SF-Oracle(2) |
-|--------|-----|-------|---------|-----------|--------------|--------------|
-| 50%    | 128 | 2847  | 866.68  | 886.54    | 873.50       | 879.89       |
-| 60%    | 153 | 2847  | 703.07  | 720.79    | 709.43       | 713.87       |
-| 70%    | 179 | 2847  | 531.94  | 543.38    | 537.27       | 536.86       |
-| 80%    | 204 | 3101  | 372.75  | 384.15    | 372.68       | 374.33       |
-| 85%    | 217 | 4110  | 290.61  | 295.50    | 288.59       | 290.64       |
+| Cache% | Cached Experts  | Steps | KV Budget (pages) | Avg Batch Size | Peak Batch Size |
+|--------|-----|-------|-------------------|----------------|-----------------|
+| 50%    | 128 | 4246  | 16,644            | 21.4           | 173             |
+| 60%    | 153 | 4246  | 12,444            | 21.4           | 173             |
+| 70%    | 179 | 4246  | 8,076             | 21.4           | 163             |
+| 80%    | 204 | 4742  | 3,876             | 19.1           | 81              |
+| 85%    | 217 | 5956  | 1,692             | 15.2           | 44              |
+
+### GPU Replay: Wall-Clock Timing (All Policies)
+
+_Pending re-run with fixed batched replay (B1-B6 fixes applied). Previous results
+used BS=1 replay with eager routing — invalid for I/O-to-compute ratio analysis._
 
 ### Transfer Counts (from policy simulation)
 
-| Cache% | SF-None demands | SF-Oracle prefetches | SF-O(1) demand+pf | SF-O(2) demand+pf |
-|--------|-----------------|---------------------|--------------------|--------------------|
-| 50%    | 215,526         | 222,529             | 140,982+76,251     | 89,854+128,856     |
-| 60%    | 171,630         | 178,253             | 103,170+70,023     | 57,595+117,046     |
-| 70%    | 126,809         | 132,089             | 65,096+63,267      | 25,202+104,537     |
-| 80%    | 96,479          | 102,412             | 39,791+58,378      | 15,097+84,607      |
-| 85%    | 119,155         | 126,896             | 47,955+73,832      | 14,716+109,649     |
+Format: **demand / prefetch / total**
+
+| Cache% | LRU-None | LRU-Oracle | LRU-O(1) | LFU-None | LFU-Oracle | LFU-O(1) |
+|--------|----------|------------|----------|----------|------------|----------|
+| 50%    | 623,771 / 0 / 623,771 | 0 / 623,771 / 623,771 | 491,807 / 131,964 / 623,771 | 452,983 / 0 / 452,983 | 0 / 458,237 / 458,237 | 328,355 / 126,347 / 454,702 |
+| 60%    | 521,264 / 0 / 521,264 | 0 / 521,264 / 521,264 | 393,028 / 128,236 / 521,264 | 405,079 / 0 / 405,079 | 0 / 409,671 / 409,671 | 288,671 / 117,998 / 406,669 |
+| 70%    | 487,949 / 0 / 487,949 | 0 / 487,949 / 487,949 | 369,453 / 118,496 / 487,949 | 368,191 / 0 / 368,191 | 0 / 371,424 / 371,424 | 263,187 / 106,308 / 369,495 |
+| 80%    | 578,375 / 0 / 578,375 | 0 / 578,375 / 578,375 | 461,170 / 117,205 / 578,375 | 458,048 / 0 / 458,048 | 0 / 460,942 / 460,942 | 355,268 / 103,930 / 459,198 |
+| 85%    | 1,071,932 / 0 / 1,071,932 | 0 / 1,071,932 / 1,071,932 | 910,130 / 161,802 / 1,071,932 | 284,968 / 0 / 284,968 | 0 / 296,618 / 296,618 | 153,450 / 134,214 / 287,664 |
+
+| Cache% | Belady-None | Belady-Oracle | Belady-O(1) | SF-None | SF-Oracle | SF-O(1) |
+|--------|-------------|---------------|-------------|---------|-----------|---------|
+| 50%    | 258,340 / 0 / 258,340 | 0 / 265,290 / 265,290 | 155,574 / 104,884 / 260,458 | 330,384 / 0 / 330,384 | 0 / 342,082 / 342,082 | 207,985 / 125,155 / 333,140 |
+| 60%    | 195,762 / 0 / 195,762 | 0 / 200,895 / 200,895 | 106,377 / 91,171 / 197,548 | 261,660 / 0 / 261,660 | 0 / 270,914 / 270,914 | 147,232 / 117,000 / 264,232 |
+| 70%    | 141,089 / 0 / 141,089 | 0 / 144,813 / 144,813 | 65,548 / 77,145 / 142,693 | 194,157 / 0 / 194,157 | 0 / 201,676 / 201,676 | 92,138 / 104,512 / 196,650 |
+| 80%    | 120,322 / 0 / 120,322 | 0 / 123,691 / 123,691 | 43,261 / 78,968 / 122,229 | 158,768 / 0 / 158,768 | 0 / 163,897 / 163,897 | 60,661 / 99,143 / 159,804 |
+| 85%    | 158,602 / 0 / 158,602 | 0 / 163,522 / 163,522 | 40,811 / 121,190 / 162,001 | 197,864 / 0 / 197,864 | 0 / 210,355 / 210,355 | 82,630 / 119,494 / 202,124 |
+
+### Transfers Per Step (total transfers / steps)
+
+| Cache% | Steps | LRU-None | LFU-None | Belady-None | SF-None | LFU-Oracle | Belady-O(1) |
+|--------|-------|----------|----------|-------------|---------|------------|-------------|
+| 50%    | 4246  | 146.9    | 106.7    | 60.8        | 77.8    | 107.9      | 61.3        |
+| 60%    | 4246  | 122.7    | 95.4     | 46.1        | 61.6    | 96.5       | 46.5        |
+| 70%    | 4246  | 114.9    | 86.7     | 33.2        | 45.7    | 87.5       | 33.6        |
+| 80%    | 4742  | 122.0    | 96.6     | 25.4        | 33.5    | 97.2       | 25.8        |
+| 85%    | 5956  | 179.9    | 47.8     | 26.6        | 33.2    | 49.8       | 27.2        |
 
 ### Key Observations
 
-1. **NoPrefetch is the fastest policy at every cache fraction.** Oracle prefetch
-   converts demand loads to prefetches but the total transfer count is higher
-   (~3% more), and async prefetches still contend for PCIe bandwidth during compute.
-   The extra transfers negate the latency-hiding benefit.
+1. **Belady dominates**: At every cache%, Belady has the lowest total transfers by
+   a large margin. At 80%, Belady-None needs 120K transfers vs LRU-None's 578K — 4.8x
+   fewer. This gap widens at higher cache% where Belady can better exploit future knowledge.
 
-2. **Oracle(1) and Oracle(2)** are between None and Oracle — throttling prefetches
-   helps but doesn't beat no prefetch at all. At 70-85%, Oracle(2) approaches None.
+2. **LRU is prefetch-invariant**: LRU-None/Oracle/O(1) always have identical total
+   transfers (e.g., all 623,771 at 50%). Oracle only changes when transfers happen (async
+   vs blocking), not how many. This is the expected behavior for LRU.
 
-3. **Latency scales linearly with cache pressure**: 50%→85% reduces ms/step by ~3x,
-   matching the ~2x reduction in transfer count. IO completely dominates compute.
+3. **LFU-Oracle slightly increases total transfers**: At 50%, LFU-Oracle has 458,237
+   total vs LFU-None's 452,983 (1.2% more). Oracle prefetch adds eviction churn that
+   slightly outweighs the demand-load savings. The effect is consistent across cache%.
+
+4. **StaticFreq Oracle > StaticFreq None by 3-6%**: Oracle prefetch causes more total
+   transfers than NoPrefetch with StaticFreq, because prefetch evicts high-frequency
+   non-static experts that would otherwise persist across steps. This is a known property
+   of the interaction between global-frequency eviction and prefetch-induced churn
+   (validated by StaticScratchpad experiments in earlier trace format).
+
+5. **LRU pathology at 85%**: LRU-None needs 1.07M transfers at 85% (217 cache slots)
+   vs only 578K at 80% (204 slots). With more cache and fewer KV pages, requests are
+   served more sequentially (fewer concurrent, longer-lived), causing LRU's recency
+   tracking to thrash. LFU and Belady scale smoothly.
+
+6. **Belady-O(1) ≈ Belady-None**: Throttling prefetch to 1 per layer produces nearly
+   the same total transfers as no prefetch (within 1-3%). This suggests the optimal
+   prefetch strategy with Belady eviction is minimal — most benefit comes from the
+   eviction policy itself.
+
+7. **Policy ranking** (total transfers at 50%): Belady-None (258K) < Belady-O(1) (260K)
+   < SF-None (330K) < SF-O(1) (333K) < LFU-None (453K) < LFU-O(1) (455K) < LFU-Oracle (458K) < LRU (624K).
 
 ## Compute vs Offloading Comparison
-
-**Pure compute time** (kernel-only, no Python/launch overhead):
-- Sequential (1 GPU, all 32 layers): **14.46 ms/step**
-- PP=2 (overlap): **7.27 ms/step** (bottleneck GPU)
-- PP=2 wall-clock (including overhead): **15.60 ms/step**
-
-**Offloading slowdown vs PP=2 wall-clock (15.60 ms/step):**
-
-| Cache% | Best Policy (ms/step) | vs PP=2 | IO Overhead |
-|--------|----------------------|---------|-------------|
-| 50%    | 866.68 (None)        | 55.6x   | 851.1 ms    |
-| 60%    | 703.07 (None)        | 45.1x   | 687.5 ms    |
-| 70%    | 531.94 (None)        | 34.1x   | 516.3 ms    |
-| 80%    | 372.68 (Oracle(1))   | 23.9x   | 357.1 ms    |
-| 85%    | 288.59 (Oracle(1))   | 18.5x   | 273.0 ms    |
-
-**Offloading slowdown vs pure sequential compute (14.46 ms/step):**
-
-| Cache% | Best (ms/step) | vs Compute | Compute % of Total |
-|--------|---------------|------------|-------------------|
-| 50%    | 866.68        | 59.9x      | 1.7%              |
-| 60%    | 703.07        | 48.6x      | 2.1%              |
-| 70%    | 531.94        | 36.8x      | 2.7%              |
-| 80%    | 372.68        | 25.8x      | 3.9%              |
-| 85%    | 288.59        | 20.0x      | 5.0%              |
-
-**Conclusion**: Expert offloading on Mixtral-8x7B is 18-60x slower than all-in-memory
-execution. Compute accounts for only 1.7-5% of total time — the rest is PCIe data
-movement. Even at 85% cache (39 missing experts per layer), offloading adds ~273 ms
-of IO per step. Oracle prefetch cannot help because total transfer volume increases
-by ~3% (prefetching experts that may not be needed) and PCIe bandwidth is fully
-saturated regardless of transfer timing.
-
-## Sanity Check: StaticScratchpad (FIFO, 2E, expire-per-step)
-
-To verify that Oracle's higher IO with StaticFreq is fundamental (not an eviction
-policy artifact), we tested `StaticScratchpad(2E=16)`: top `cache_size - 16` experts
-pinned by global frequency (never evicted), 16 FIFO scratchpad slots that expire at
-step start. This design guarantees:
-- Pinned experts are never disturbed by prefetches or demand loads
-- Scratchpad entries cannot persist across steps (no cross-step reuse)
-- FIFO eviction treats all entries equally (no frequency bias)
-
-### Transfer Counts: StaticFreq vs StaticScratchpad
-
-| Cache% | CS  | SF-None   | SF-Oracle | Scratch-None | Scratch-Oracle | Diff |
-|--------|-----|-----------|-----------|--------------|----------------|------|
-| 50%    | 128 | 215,526   | 222,529   | 234,694      | 234,694        | **+0** |
-| 60%    | 153 | 171,630   | 178,253   | 191,529      | 191,529        | **+0** |
-| 70%    | 179 | 126,809   | 132,089   | 147,631      | 147,631        | **+0** |
-| 80%    | 204 | 96,479    | 102,412   | 119,348      | 119,348        | **+0** |
-| 85%    | 217 | 119,155   | 126,896   | 154,467      | 154,467        | **+0** |
-
-Oracle has 0 demand loads (all prefetched) and exactly the same total transfers as
-NoPrefetch at every cache fraction.
-
-### Analysis
-
-1. **Scratchpad Oracle = Scratchpad NoPrefetch** confirms that the total IO volume is
-   policy-independent when the cache policy is identical. Oracle only changes WHEN
-   transfers happen (async prefetch vs blocking demand), not HOW MANY.
-
-2. **StaticFreq Oracle > StaticFreq NoPrefetch by 3-6%** because StaticFreq uses
-   global-frequency eviction, which gives NoPrefetch unfair cross-step reuse: high-frequency
-   non-static experts persist in cache across steps (never evicted because they're always
-   the highest-frequency entry). Oracle's prefetch evicts these survivors because the
-   prefetch protected set only covers the current + next layer, leaving earlier layers'
-   high-frequency entries unprotected.
-
-3. **Scratchpad totals > StaticFreq totals** because the scratchpad reserves 16 slots
-   that start empty (fewer initially-cached experts) and expire per step (no cross-step
-   reuse). StaticFreq fills all `cache_size` slots and retains them.
-
-4. **Conclusion**: Oracle prefetch is correctly implemented. The 3-6% gap in StaticFreq
-   is not a prefetch bug — it's a property of the eviction policy interacting with
-   prefetch-induced churn. With an eviction policy that treats all scratchpad entries
-   equally (FIFO + expire), Oracle and NoPrefetch are exactly equivalent in IO volume.
-
-GPU replay results in `results/MoE/mixtral-8x7B/`.
+GPU replay with new traces pending — will update throughput comparison once completed.

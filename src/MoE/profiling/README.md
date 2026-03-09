@@ -10,7 +10,7 @@ Run from `src/MoE/`.
 
 Three modes for comparing single-GPU vs PP=2 decode performance:
 - `20L-single`: Mixtral-8x7B-20L on 1 GPU (baseline per-layer cost)
-- `32L-single`: Mixtral-8x7B-32L on 1 GPU with offloading
+- `32L-single`: Mixtral-8x7B-32L on 1 GPU with offloading (requires >87 GB; OOMs on 80 GB H100)
 - `32L-pp2`: Mixtral-8x7B-32L across 2 GPUs (pipeline parallel)
 
 Provides both wall-clock timing and detailed per-layer/per-stage CUDA event
@@ -47,23 +47,26 @@ Generates `profiling.md` with formatted kernel breakdown tables.
 
 ```bash
 # CUDA event sweep (no nsys needed)
-python profiling/profile_phases.py sweep --model models/Mixtral-8x7B-20L
+python profiling/profile_phases.py --sweep
 
 # nsys capture + analysis
-nsys profile -c cudaProfilerApi --capture-range=cudaProfilerApi -o profile \
-    python profiling/profile_phases.py nsys --model models/Mixtral-8x7B-20L
-python profiling/profile_phases.py analyze --sqlite profile.sqlite
+nsys profile -c cudaProfilerApi -o profile \
+    python profiling/profile_phases.py --decode 128 --worker
+python profiling/profile_phases.py --analyze profile.sqlite --layers 20
 
 # PCIe transfer measurement
-python profiling/profile_phases.py transfer --model models/Mixtral-8x7B-20L
+python profiling/profile_phases.py --measure-transfer
 ```
 
 | Arg | Default | Description |
 |-----|---------|-------------|
-| subcommand | (required) | `nsys`, `sweep`, `analyze`, or `transfer` |
+| `--decode` | (none) | Decode configs: `128` or `4:2048` (batch:seqlen) |
+| `--prefill` | (none) | Prefill configs: `1024` or `2:128` |
 | `--model` | `models/Mixtral-8x7B-20L` | Path to model directory |
-| `--experts-per-layer` | None | Experts per layer (None = all resident) |
-| `--output` | (auto) | Output path for profiling.md |
+| `--sweep` | off | Run CUDA-event sweep, generate profiling.md |
+| `--compile` | off | Enable torch.compile |
+| `--analyze` | None | Analyze existing sqlite file (skip profiling) |
+| `--measure-transfer` | off | Measure expert PCIe transfer bandwidth |
 
 **Output**: Per-phase timing tables, kernel category breakdowns, PCIe bandwidth measurements.
 

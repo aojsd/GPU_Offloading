@@ -1,0 +1,647 @@
+"""Batched GPU replay with multi-sequence scheduling and expert offloading.
+
+Phase 4 of the trace pipeline: replay a GPUReplayTrace on real GPU hardware
+with all batched requests running real computation. Consumes step_scheduling
+metadata to manage KV cache slots, prefill/decode/continuation dispatch, and
+request lifecycle.
+
+Usage:
+    # Run replay for a specific cache% with all policies:
+    python scripts/batched_replay.py \
+        --model models/Mixtral-8x7B-Instruct-v0.1 \
+        --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b \
+        --cache-fraction 0.5 \
+        --max-seqs 256 \
+        --max-graph-size 512
+
+    # Single policy:
+    python scripts/batched_replay.py \
+        --model models/Mixtral-8x7B-Instruct-v0.1 \
+        --batched-trace path/to/batched.json \
+        --cache-size 128 \
+        --policy LRU-Oracle
+"""
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+MOE_DIR = SCRIPT_DIR.parent
+sys.path.insert(0, str(MOE_DIR))
+sys.path.insert(0, str(MOE_DIR / 'trace_construction'))
+
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+import torch
+import moe_engine as _moe_engine_mod  # noqa: F401 — glibc patches
+from moe_engine import MoEEngine
+from replay_controller import ReplayController
+from gpu_replay_trace import ActivationTrace
+from build_trace import load_traces, ConversationTrace, compute_kv_budget_from_cache
+from policy_simulator import (
+    LRU, LFU, Belady, StaticFreq, NoPrefetch, OraclePrefetch, simulate,
+)
+
+
+CACHE_POLICIES = [
+    ("LRU", lambda: LRU()),
+    ("LFU", lambda: LFU()),
+    ("Belady", lambda: Belady()),
+    ("StaticFreq", lambda: StaticFreq()),
+]
+
+PREFETCH_POLICIES = [
+    ("None", lambda: NoPrefetch()),
+    ("Oracle", lambda: OraclePrefetch()),
+    ("Oracle(1)", lambda: OraclePrefetch(max_per_layer=1)),
+]
+
+
+def load_prompt_tokens(traces: list[ConversationTrace],
+                       device: torch.device) -> dict[int, torch.Tensor]:
+    """Pre-load all prompt token tensors keyed by trace index."""
+    prompts = {}
+    for i, t in enumerate(traces):
+        if t.prompt_token_ids is not None:
+            prompts[i] = torch.tensor(t.prompt_token_ids, dtype=torch.long,
+                                      device=device)
+        else:
+            # Fallback: dummy tokens (won't produce correct output, but
+            # timing will be representative since computation is real)
+            prompts[i] = torch.ones(t.prompt_tokens, dtype=torch.long,
+                                    device=device)
+    return prompts
+
+
+def _run_steps(engine, controller, per_conv_traces, prompts, max_seqs,
+               n_steps):
+    """Run n_steps of batched replay. Returns skipped_admissions count."""
+    free_seq_ids = set(range(max_seqs))
+    request_to_slot: dict[int, int] = {}
+    active_requests: dict[int, dict] = {}
+    skipped_admissions = 0
+
+    with torch.inference_mode():
+        for step in range(n_steps):
+            sched = controller.get_step_scheduling(step)
+            if sched is None:
+                raise RuntimeError(
+                    f"Step {step}: no scheduling metadata. "
+                    f"Batched replay requires traces from build_trace.py.")
+
+            # Process events: completions, admissions
+            for evt in sched.events:
+                if evt['event'] == 'complete':
+                    rid = evt['request_id']
+                    if rid in request_to_slot:
+                        sid = request_to_slot.pop(rid)
+                        engine.free_seq(sid)
+                        free_seq_ids.add(sid)
+                        active_requests.pop(rid, None)
+
+                elif evt['event'] in ('admit', 'force_admit'):
+                    rid = evt['request_id']
+                    if not free_seq_ids:
+                        skipped_admissions += 1
+                        continue
+                    sid = free_seq_ids.pop()
+                    request_to_slot[rid] = sid
+                    active_requests[rid] = {
+                        'sid': sid,
+                        'decode_step': 0,
+                    }
+
+                elif evt['event'] in ('preempt', 'readmit', 'force_readmit'):
+                    assert False, (
+                        f"Step {step}: unexpected event '{evt['event']}'. "
+                        f"No-preemption policy should prevent this."
+                    )
+
+            # Build mixed_step arguments from active_requests metadata
+            decode_sids = []
+            decode_tokens = []
+            prefill_sids = []
+            prefill_tokens = []
+            continuation_sids = []
+            continuation_tokens = []
+            continuation_offsets = []
+
+            for ar in sched.active_requests:
+                rid = ar.request_id
+                if rid not in request_to_slot:
+                    continue
+                sid = request_to_slot[rid]
+                state = active_requests[rid]
+
+                if ar.is_prefill:
+                    chunk_start = ar.prefill_chunk_start
+                    chunk_len = ar.prefill_chunk_length
+                    prompt = prompts[rid]
+                    chunk_tokens = prompt[chunk_start:chunk_start + chunk_len]
+
+                    if ar.is_continuation:
+                        continuation_sids.append(sid)
+                        continuation_tokens.append(chunk_tokens)
+                        continuation_offsets.append(chunk_start)
+                    else:
+                        prefill_sids.append(sid)
+                        prefill_tokens.append(chunk_tokens)
+                else:
+                    decode_sids.append(sid)
+                    # Use traced output token if available for faithful replay
+                    trace = per_conv_traces[rid]
+                    decode_idx = state['decode_step']
+                    if (trace.output_token_ids is not None
+                            and decode_idx < len(trace.output_token_ids)):
+                        decode_tokens.append(trace.output_token_ids[decode_idx])
+                    else:
+                        decode_tokens.append(1)  # dummy fallback
+                    state['decode_step'] = decode_idx + 1
+
+            # Prepare inputs
+            if decode_tokens:
+                decode_token_tensor = torch.tensor(
+                    decode_tokens, dtype=torch.long, device=engine.device)
+            else:
+                decode_token_tensor = torch.tensor(
+                    [], dtype=torch.long, device=engine.device)
+
+            # Call mixed_step with all three token types
+            engine.mixed_step(
+                decode_seq_ids=decode_sids,
+                decode_token_ids=decode_token_tensor,
+                prefill_seq_ids=prefill_sids,
+                prefill_input_ids=prefill_tokens,
+                continuation_seq_ids=continuation_sids,
+                continuation_input_ids=continuation_tokens,
+                continuation_offsets=continuation_offsets,
+            )
+
+    return skipped_admissions
+
+
+def replay_trace(engine, dm_trace, per_conv_traces, prompts,
+                 max_graph_size, warmup_steps=50, max_steps=None):
+    """Run a full batched replay of a GPUReplayTrace.
+
+    Args:
+        engine: MoEEngine with cache_size set and graphs captured.
+        dm_trace: GPUReplayTrace from policy simulation.
+        per_conv_traces: List of ConversationTrace objects.
+        prompts: Dict[int, Tensor] of prompt token IDs.
+        max_graph_size: Max total tokens per step.
+        warmup_steps: Number of untimed warmup steps.
+
+    Returns:
+        Dict with timing results.
+    """
+    total_steps = len(dm_trace.steps)
+    if max_steps is not None:
+        total_steps = min(total_steps, max_steps)
+    max_seqs = engine.max_seqs
+
+    # --- Warmup pass: replay first N steps with actual trace data ---
+    n_warmup = min(warmup_steps, total_steps)
+    engine.reset()
+    warmup_ctrl = ReplayController(engine, dm_trace)
+    warmup_ctrl.setup()
+    engine.replay_controller = warmup_ctrl
+    _run_steps(engine, warmup_ctrl, per_conv_traces, prompts, max_seqs,
+               n_warmup)
+    engine.replay_controller = None
+
+    # --- Timed replay: full run from step 0 with fresh controller ---
+    engine.reset()
+    controller = ReplayController(engine, dm_trace, track_phases=True)
+    controller.setup()
+    engine.replay_controller = controller
+
+    torch.cuda.synchronize()
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt = torch.cuda.Event(enable_timing=True)
+    start_evt.record()
+
+    skipped_admissions = _run_steps(
+        engine, controller, per_conv_traces, prompts, max_seqs, total_steps)
+
+    end_evt.record()
+    torch.cuda.synchronize()
+    total_ms = start_evt.elapsed_time(end_evt)
+
+    engine.replay_controller = None
+
+    if skipped_admissions > 0:
+        import warnings
+        warnings.warn(
+            f"Skipped {skipped_admissions} admissions due to "
+            f"max_seqs={max_seqs} < trace demand. Results may be invalid.")
+
+    # Extract per-phase timing if available
+    result = {
+        'total_ms': total_ms,
+        'ms_per_step': total_ms / total_steps,
+        'steps': total_steps,
+        'skipped_admissions': skipped_admissions,
+    }
+    phases = controller.get_phase_times_ms()
+    if phases:
+        result['phases'] = phases
+        io_ms = phases.get('io', 0.0)
+        result['io_ms'] = io_ms
+        result['compute_pct'] = (
+            (total_ms - io_ms) / total_ms * 100 if total_ms > 0 else 0)
+
+    return result
+
+
+def run_batched_replay(model_path, batched_trace_path, per_conv_traces,
+                       cache_size, max_graph_size=512, warmup_steps=50,
+                       policies=None, max_seqs_override=None,
+                       max_steps=None):
+    """Run GPU replay for all policies on a batched trace.
+
+    Args:
+        model_path: Path to model weights.
+        batched_trace_path: Path to batched ActivationTrace JSON.
+        per_conv_traces: List of ConversationTrace objects.
+        cache_size: Number of expert cache slots.
+        max_graph_size: Max CUDA graph size.
+        warmup_steps: Steps for CUDA warmup.
+        policies: List of (name, cache_policy_fn, prefetch_policy_fn) tuples.
+            If None, runs all cache x prefetch combinations.
+
+    Returns:
+        Dict of results keyed by policy name.
+    """
+    # Load batched activation trace
+    at = ActivationTrace.load(batched_trace_path)
+    total_steps = len(at.steps)
+
+    # CUDA graph sizes — compact set to save GPU memory
+    graph_sizes = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224,
+                   256, 288, 320, 352, 384, 448, 512]
+    graph_sizes = [s for s in graph_sizes if s <= max_graph_size]
+
+    # Read memory budget from trace metadata (set by build_trace.py's
+    # simulate_batch). This ensures replay uses exactly the same max_seqs
+    # and KV budget as the batch simulator, avoiding silent batch shrinkage.
+    trace_sched = at.scheduling_config or {}
+    trace_max_seqs = trace_sched.get('max_seqs')
+    trace_kv_budget = trace_sched.get('kv_page_budget')
+    trace_page_size = trace_sched.get('page_size', 16)
+
+    trace_peak_seqs = max(
+        ss.batch_size
+        for ss in (at.scheduling or [])
+    ) if at.scheduling else 256
+
+    if trace_max_seqs is not None:
+        max_seqs = trace_max_seqs
+    else:
+        max_seqs = trace_peak_seqs
+    if max_seqs_override is not None:
+        max_seqs = min(max_seqs, max_seqs_override)
+
+    # Compute max_seq_len from KV budget
+    if trace_kv_budget and trace_kv_budget > 0:
+        _pages_per_seq = trace_kv_budget // max(1, max_seqs)
+        max_seq_len = _pages_per_seq * trace_page_size
+    else:
+        _actual_max = max(t.prompt_tokens + t.output_tokens
+                          for t in per_conv_traces)
+        max_seq_len = _actual_max
+
+    # Hard error on batch shrinkage — do not silently degrade
+    if max_seqs < trace_peak_seqs:
+        raise RuntimeError(
+            f"max_seqs={max_seqs} < trace peak batch size {trace_peak_seqs}. "
+            f"Cannot faithfully replay. Reduce cache_size or use --max-seqs "
+            f"to explicitly accept smaller batches."
+        )
+
+    print(f"Memory budget from trace: max_seqs={max_seqs} "
+          f"(trace peak: {trace_peak_seqs}), max_seq_len={max_seq_len}, "
+          f"kv_budget={trace_kv_budget} pages")
+
+    # Generate policy traces
+    if policies is None:
+        policies = [
+            (f"{cp_name}-{pf_name}", cp_fn, pf_fn)
+            for cp_name, cp_fn in CACHE_POLICIES
+            for pf_name, pf_fn in PREFETCH_POLICIES
+        ]
+
+    print(f"\n=== Generating policy traces (CS={cache_size}) ===")
+    dm_traces = {}
+    for name, cp_fn, pf_fn in policies:
+        dm = simulate(cp_fn(), pf_fn(), at, cache_size=cache_size)
+        s = dm.summary()
+        print(f"  {name:<18s}  demands={s['demand_loads']:6d}  "
+              f"prefetches={s['prefetches']:6d}  total={s['total_transfers']:6d}")
+        dm_traces[name] = dm
+
+    # Load engine
+    print(f"\n=== Loading model: {model_path} (cache_size={cache_size}, "
+          f"max_seqs={max_seqs}) ===")
+    engine = MoEEngine(
+        model_path,
+        cache_size=cache_size,
+        max_seqs=max_seqs,
+        max_seq_len=max_seq_len,
+        use_torch_compile=True,
+    )
+
+    # Capture CUDA graphs — one size at a time, stop on OOM
+    print(f"Capturing piecewise CUDA graphs for {len(graph_sizes)} sizes "
+          f"({graph_sizes})...")
+    captured_sizes = []
+    for gs in graph_sizes:
+        try:
+            engine.capture_mixed_cuda_graphs(total_token_sizes=[gs])
+            captured_sizes.append(gs)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            print(f"  OOM at N={gs} — stopping graph capture "
+                  f"(captured {len(captured_sizes)} sizes: {captured_sizes})")
+            break
+    if not captured_sizes:
+        raise RuntimeError("Failed to capture any CUDA graphs — reduce cache_size or max_seqs")
+
+    graph_overhead_gb = engine.graph_memory_overhead_bytes() / 1024**3
+    print(f"Graph memory overhead: {graph_overhead_gb:.2f} GB "
+          f"({len(captured_sizes)} sizes captured)")
+
+    # Validate graph coverage: verify captured graphs cover all trace steps
+    max_step_tokens = 0
+    for ss in (at.scheduling or []):
+        n_tokens = sum(
+            ar.prefill_chunk_length if ar.is_prefill else 1
+            for ar in ss.active_requests
+        )
+        max_step_tokens = max(max_step_tokens, n_tokens)
+
+    if max_step_tokens > max(captured_sizes):
+        raise RuntimeError(
+            f"Largest captured graph ({max(captured_sizes)} tokens) < "
+            f"max step tokens ({max_step_tokens}). OOM stopped graph "
+            f"capture too early. Reduce cache_size, max_seqs, or "
+            f"max_graph_size.")
+
+    # Coverage histogram: how many steps use each graph size
+    from collections import Counter
+    _size_usage = Counter()
+    for ss in (at.scheduling or []):
+        n_tok = sum(ar.prefill_chunk_length if ar.is_prefill else 1
+                    for ar in ss.active_requests)
+        covering = min((s for s in captured_sizes if s >= n_tok),
+                       default=None)
+        if covering is not None:
+            _size_usage[covering] += 1
+    print(f"Graph coverage: {dict(sorted(_size_usage.items()))}")
+
+    # Pre-load prompt tokens
+    prompts = load_prompt_tokens(per_conv_traces, engine.device)
+
+    # Replay each policy
+    print(f"\n=== Replay ({warmup_steps}-step warmup + {total_steps}-step "
+          f"timed run) ===")
+    print(f"{'Policy':<20s}  {'Total ms':>10s}  {'ms/step':>8s}  "
+          f"{'Steps':>5s}  {'Demands':>7s}  {'Prefetch':>8s}")
+    print("-" * 70)
+
+    results = {}
+    for name, dm in dm_traces.items():
+        s = dm.summary()
+        timing = replay_trace(
+            engine, dm, per_conv_traces, prompts,
+            max_graph_size, warmup_steps, max_steps,
+        )
+        print(f"{name:<20s}  {timing['total_ms']:10.1f}  "
+              f"{timing['ms_per_step']:8.2f}  {timing['steps']:5d}  "
+              f"{s['demand_loads']:7d}  {s['prefetches']:8d}",
+              flush=True)
+        results[name] = {
+            **timing,
+            'demands': s['demand_loads'],
+            'prefetches': s['prefetches'],
+            'total_transfers': s['total_transfers'],
+        }
+
+    # Cleanup
+    del engine
+    torch.cuda.empty_cache()
+
+    return results
+
+
+def _parse_policy(name):
+    """Parse 'CachePolicy-PrefetchPolicy' into (name, cp_fn, pf_fn)."""
+    cp_map = {n: fn for n, fn in CACHE_POLICIES}
+    pf_map = {n: fn for n, fn in PREFETCH_POLICIES}
+    # Split on first '-' so 'Oracle(1)' stays intact
+    parts = name.split('-', 1)
+    if len(parts) != 2:
+        raise ValueError(f"Policy must be CachePolicy-PrefetchPolicy, got: {name}")
+    cp_name, pf_name = parts
+    if cp_name not in cp_map:
+        raise ValueError(f"Unknown cache policy: {cp_name}. "
+                         f"Options: {list(cp_map.keys())}")
+    if pf_name not in pf_map:
+        raise ValueError(f"Unknown prefetch policy: {pf_name}. "
+                         f"Options: {list(pf_map.keys())}")
+    return (name, cp_map[cp_name], pf_map[pf_name])
+
+
+def _append_result_to_md(result_dict, results_md_path):
+    """Append a timing row to results.md with file locking."""
+    import fcntl
+
+    table_header = (
+        "### GPU Replay: Wall-Clock Timing (All Policies)\n\n"
+        "| Cache% | Policy | ms/step | Compute% | Demands | Prefetches |\n"
+        "|--------|--------|---------|----------|---------|------------|\n"
+    )
+
+    row = (
+        f"| {result_dict['cache_pct']}%    "
+        f"| {result_dict['policy']:<20s} "
+        f"| {result_dict['ms_per_step']:>7.2f} "
+        f"| {result_dict.get('compute_pct', 0):>6.1f}% "
+        f"| {result_dict.get('demands', 0):>7d} "
+        f"| {result_dict.get('prefetches', 0):>10d} |\n"
+    )
+
+    os.makedirs(os.path.dirname(results_md_path), exist_ok=True)
+
+    with open(results_md_path, 'a+') as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            content = f.read()
+            if "### GPU Replay: Wall-Clock Timing" not in content:
+                f.write("\n" + table_header)
+            f.write(row)
+            f.flush()
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+# Cache percentage to number of expert slots (Mixtral-8x7B, 256 total)
+CACHE_PCT_TO_SIZE = {85: 217, 80: 204, 70: 179, 60: 153, 50: 128}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Batched GPU replay with multi-sequence scheduling")
+    parser.add_argument("--model", type=str, required=True,
+                        help="Path to model directory")
+    parser.add_argument("--trace-dir", type=str, default=None,
+                        help="Directory with per-conversation traces")
+    parser.add_argument("--batched-trace", type=str, default=None,
+                        help="Path to batched ActivationTrace JSON")
+    parser.add_argument("--cache-fraction", type=float, default=None,
+                        help="Expert cache fraction (generates batched trace)")
+    parser.add_argument("--cache-pct", type=int, default=None,
+                        help="Cache percentage (e.g. 85). Auto-locates "
+                             "batched trace.")
+    parser.add_argument("--cache-size", type=int, default=None,
+                        help="Explicit cache size (number of expert slots)")
+    parser.add_argument("--max-seqs", type=int, default=256)
+    parser.add_argument("--max-graph-size", type=int, default=512)
+    parser.add_argument("--warmup-steps", type=int, default=50)
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="Max replay steps (default: all)")
+    parser.add_argument("--policy", type=str, default=None,
+                        help="Single policy (e.g. LRU-Oracle). Default: all.")
+    parser.add_argument("--policies", type=str, default=None,
+                        help="Comma-separated policy names "
+                             "(e.g. LRU-None,Belady-Oracle(1))")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output JSON path for results")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Dir for per-policy result JSONs (default: "
+                             "results/MoE/mixtral-8x7B/tmp)")
+    parser.add_argument("--results-md", type=str, default=None,
+                        help="Path to results.md for incremental appending")
+    args = parser.parse_args()
+
+    # Validate args
+    if args.trace_dir is None:
+        parser.error("--trace-dir is required")
+    if args.cache_pct and args.cache_fraction:
+        parser.error("--cache-pct and --cache-fraction are mutually exclusive")
+    if args.policy and args.policies:
+        parser.error("--policy and --policies are mutually exclusive")
+
+    # Handle --cache-pct: convert to cache_size and locate batched trace
+    if args.cache_pct is not None:
+        pct = args.cache_pct
+        if pct not in CACHE_PCT_TO_SIZE:
+            parser.error(f"--cache-pct {pct} not in {list(CACHE_PCT_TO_SIZE.keys())}. "
+                         f"Use --cache-size + --batched-trace for custom values.")
+        cache_size = CACHE_PCT_TO_SIZE[pct]
+        batched_trace_path = os.path.join(
+            args.trace_dir, f"cache{pct}pct", "batched.json")
+        if not os.path.exists(batched_trace_path):
+            parser.error(f"Batched trace not found: {batched_trace_path}")
+    elif args.batched_trace:
+        batched_trace_path = args.batched_trace
+        if args.cache_size is None:
+            parser.error("--cache-size required when using --batched-trace")
+        cache_size = args.cache_size
+        pct = None
+    elif args.cache_fraction is not None:
+        from build_trace import simulate_batch, compute_kv_budget_from_cache
+        model_config = str(Path(args.model) / "config.json")
+        mem = compute_kv_budget_from_cache(
+            model_config, args.cache_fraction, gpu_memory_gb=80.0)
+        cache_size = mem['expert_cache_size']
+        kv_budget = mem['kv_page_budget']
+        pct = int(args.cache_fraction * 100)
+        print(f"Cache fraction {args.cache_fraction}: "
+              f"cache_size={cache_size}, kv_budget={kv_budget}")
+
+        per_conv_traces_early, _ = load_traces(args.trace_dir)
+        result = simulate_batch(
+            per_conv_traces_early, kv_budget, page_size=16,
+            max_seqs=args.max_seqs,
+            max_graph_size=args.max_graph_size,
+        )
+        batched_trace_path = os.path.join(
+            args.trace_dir, f"cache{pct}pct", "batched.json")
+        os.makedirs(os.path.dirname(batched_trace_path), exist_ok=True)
+        with open(batched_trace_path, 'w') as f:
+            json.dump(result, f)
+        print(f"Saved batched trace: {batched_trace_path}")
+    else:
+        parser.error("One of --cache-pct, --batched-trace, or "
+                     "--cache-fraction is required")
+
+    max_graph_size = args.max_graph_size
+
+    # Load per-conversation traces
+    per_conv_traces, manifest = load_traces(args.trace_dir)
+    print(f"Loaded {len(per_conv_traces)} per-conversation traces")
+
+    # Parse policies
+    policies = None
+    if args.policies:
+        policies = [_parse_policy(name) for name in args.policies.split(',')]
+    elif args.policy:
+        policies = [_parse_policy(args.policy)]
+
+    # Determine output directory
+    moe_root = Path(__file__).resolve().parent.parent
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+    else:
+        output_dir = moe_root / ".." / "results" / "MoE" / "mixtral-8x7B" / "tmp"
+
+    # Determine results.md path
+    if args.results_md:
+        results_md_path = args.results_md
+    else:
+        results_md_path = str(
+            moe_root / ".." / "results" / "MoE" / "mixtral-8x7B" / "results.md")
+
+    results = run_batched_replay(
+        args.model, batched_trace_path, per_conv_traces,
+        cache_size, max_graph_size, args.warmup_steps,
+        policies, max_seqs_override=args.max_seqs,
+        max_steps=args.max_steps,
+    )
+
+    # Save per-policy results
+    os.makedirs(str(output_dir), exist_ok=True)
+    for policy_name, policy_result in results.items():
+        # Enrich with metadata
+        policy_result['policy'] = policy_name
+        if pct is not None:
+            policy_result['cache_pct'] = pct
+        policy_result['cache_size'] = cache_size
+
+        # Save per-policy JSON
+        if pct is not None:
+            out_file = output_dir / f"cache{pct}pct-{policy_name}.json"
+        else:
+            out_file = output_dir / f"cache{cache_size}-{policy_name}.json"
+        with open(str(out_file), 'w') as f:
+            json.dump(policy_result, f, indent=2)
+        print(f"  Saved: {out_file}")
+
+        # Append to results.md incrementally
+        if pct is not None:
+            _append_result_to_md(policy_result, results_md_path)
+
+    # Also save combined results if --output specified
+    if args.output:
+        with open(args.output, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"\nCombined results saved to {args.output}")
+
+
+if __name__ == "__main__":
+    main()

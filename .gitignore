@@ -4,6 +4,7 @@ bin/*
 *.png
 *__pycache__*
 *.ipynb_checkpoints*
+*.json
 
 # MoE model weights (downloaded via models/download.sh)
 src/MoE/models/*
@@ -13,12 +14,11 @@ src/MoE/models/*
 src/MoE/datasets/*
 !src/MoE/datasets/download.sh
 
-# Generated trace files (reproduced via batch_replay.py --trace)
-src/MoE/trace_*.json
-src/MoE/vLLM_comparison/trace_*.json
-
 # Personal CLAUDE.md
 CLAUDE.md
 
 # Figures
 *.pdf
+
+# Temporary results
+results/**/tmp/

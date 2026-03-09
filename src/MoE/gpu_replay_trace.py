@@ -1,4 +1,4 @@
-"""Data movement trace format for MoE expert offloading replay.
+"""GPU Replay trace format for MoE expert offloading replay.
 
 Defines the structured trace format that encodes prefetch, eviction, and
 demand-load decisions produced by cache policy simulators (Phase 7) and
@@ -14,7 +14,7 @@ policy simulators.
 
 Data flow:
     ExpertOffloadEngine.save_trace()  →  ActivationTrace (input to policies)
-    EvictionPolicy.simulate()         →  DataMovementTrace (input to replay)
+    EvictionPolicy.simulate()         →  GPUReplayTrace (input to replay)
     ReplayController(trace)           →  actual GPU execution with timing
 """
 
@@ -61,6 +61,9 @@ class RequestScheduling:
     conversation_id: str
     seq_len: int
     is_prefill: bool
+    prefill_chunk_start: int = 0
+    prefill_chunk_length: int = 0
+    is_continuation: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -68,6 +71,9 @@ class RequestScheduling:
             'conversation_id': self.conversation_id,
             'seq_len': self.seq_len,
             'is_prefill': self.is_prefill,
+            'prefill_chunk_start': self.prefill_chunk_start,
+            'prefill_chunk_length': self.prefill_chunk_length,
+            'is_continuation': self.is_continuation,
         }
 
     @staticmethod
@@ -77,6 +83,9 @@ class RequestScheduling:
             conversation_id=d['conversation_id'],
             seq_len=d['seq_len'],
             is_prefill=d['is_prefill'],
+            prefill_chunk_start=d.get('prefill_chunk_start', 0),
+            prefill_chunk_length=d.get('prefill_chunk_length', 0),
+            is_continuation=d.get('is_continuation', False),
         )
 
 
@@ -84,21 +93,21 @@ class RequestScheduling:
 class StepScheduling:
     """Per-step scheduling metadata from the continuous batching simulator.
 
-    Captures batch composition and scheduling events (admissions, completions,
-    preemptions, readmissions) for each step. Used by the replay loop to
-    manage KV cache and batch composition during trace replay.
+    Captures batch composition and scheduling events for each step. Used by the
+    replay loop to manage KV cache and batch composition during trace replay.
 
     Events happen in this order within a step:
       1. 'complete' — requests that finished in the previous step are removed
-      2. 'readmit' / 'force_readmit' — swapped requests restored
-      3. 'admit' / 'force_admit' — new requests from waiting queue
-      4. [computation happens with active_requests]
-      5. 'preempt' — requests evicted after this step's computation
+      2. 'admit' / 'force_admit' — new requests from waiting queue
+      3. [computation happens with active_requests]
+
+    With the no-preemption policy (full-sequence page pre-allocation), preempt
+    and readmit events never occur.
 
     Attributes:
         step:             Global step index.
         batch_size:       Number of active requests in this step.
-        active_requests:  Per-request metadata (id, seq_len, prefill status).
+        active_requests:  Per-request metadata (id, seq_len, prefill/continuation status).
         events:           Scheduling events for this step.
     """
     step: int
@@ -191,7 +200,7 @@ class StepTrace:
 
 
 @dataclass
-class DataMovementTrace:
+class GPUReplayTrace:
     """Complete data movement trace for an entire decode sequence.
 
     Produced by policy simulators (Phase 7), consumed by ReplayController
@@ -226,15 +235,15 @@ class DataMovementTrace:
         }
         with open(path, 'w') as f:
             json.dump(data, f, indent=2)
-        print(f"DataMovementTrace saved: {len(self.steps)} steps, "
+        print(f"GPUReplayTrace saved: {len(self.steps)} steps, "
               f"{path}")
 
     @staticmethod
-    def load(path: str) -> 'DataMovementTrace':
+    def load(path: str) -> 'GPUReplayTrace':
         """Deserialize from JSON."""
         with open(path) as f:
             data = json.load(f)
-        trace = DataMovementTrace(
+        trace = GPUReplayTrace(
             num_layers=data['num_layers'],
             num_experts=data['num_experts'],
             cache_size=data['cache_size'],
@@ -242,7 +251,7 @@ class DataMovementTrace:
                                  for t in data['initial_cache_state']],
             steps=[StepTrace.from_dict(s) for s in data['steps']],
         )
-        print(f"DataMovementTrace loaded: {len(trace.steps)} steps, "
+        print(f"GPUReplayTrace loaded: {len(trace.steps)} steps, "
               f"{path}")
         return trace
 
@@ -260,9 +269,10 @@ class DataMovementTrace:
         errors = []
 
         # Build initial residency: unified set of (layer, eid)
-        resident = set()
-        for (layer, eid) in self.initial_cache_state:
-            resident.add((layer, eid))
+        ics_tuples = [tuple(x) for x in self.initial_cache_state]
+        if len(ics_tuples) != len(set(ics_tuples)):
+            errors.append("initial_cache_state contains duplicates")
+        resident = set(ics_tuples)
 
         # Check initial capacity
         if len(resident) > self.cache_size:
@@ -283,7 +293,7 @@ class DataMovementTrace:
                 # Apply transfers to unified cache
                 for te in all_transfers:
                     if te.evict is not None:
-                        resident.discard(tuple(te.evict))
+                        resident.remove(tuple(te.evict))
                     resident.add(tuple(te.target))
 
                 # Check total capacity after transfers
@@ -353,6 +363,7 @@ class ActivationTrace:
     steps: list[list[list[int]]]
     router_inputs: Optional[str] = None
     scheduling: Optional[list[StepScheduling]] = None
+    scheduling_config: Optional[dict] = None
 
     @staticmethod
     def from_flat_trace(trace_data: dict,
@@ -376,7 +387,9 @@ class ActivationTrace:
 
         if not flat:
             return ActivationTrace(num_layers, num_experts, [],
-                                   router_inputs=router_inputs_path)
+                                   router_inputs=router_inputs_path,
+                                   scheduling_config=trace_data.get(
+                                       'scheduling', None))
 
         max_step = max(entry['step'] for entry in flat)
         steps = [[[] for _ in range(num_layers)]
@@ -391,9 +404,12 @@ class ActivationTrace:
             scheduling = [StepScheduling.from_dict(s)
                           for s in trace_data['step_scheduling']]
 
+        scheduling_config = trace_data.get('scheduling', None)
+
         return ActivationTrace(num_layers, num_experts, steps,
                                router_inputs=router_inputs_path,
-                               scheduling=scheduling)
+                               scheduling=scheduling,
+                               scheduling_config=scheduling_config)
 
     @staticmethod
     def load(path: str) -> 'ActivationTrace':

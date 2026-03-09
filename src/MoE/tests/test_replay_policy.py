@@ -6,8 +6,8 @@ at start, layer L>0 prefetches stored in layers[L].prefetches, issued
 before stage4b of layer L-1).
 
 Test categories:
-  1. DataMovementTrace serialization round-trip
-  2. DataMovementTrace.validate() correctness
+  1. GPUReplayTrace serialization round-trip
+  2. GPUReplayTrace.validate() correctness
   3. ActivationTrace.from_flat_trace() conversion
   4. LRU-None: eviction order, miss counts
   5. Belady-Oracle: optimality vs LRU, prefetch generation
@@ -30,9 +30,9 @@ import pytest
 # Add parent dir to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from data_movement_trace import (
+from gpu_replay_trace import (
     ActivationTrace,
-    DataMovementTrace,
+    GPUReplayTrace,
     LayerTrace,
     StepTrace,
     TransferEvent,
@@ -110,8 +110,8 @@ class TestSerialization:
         assert te2.target == (0, 2)
         assert te2.evict == (1, 3)
 
-    def test_data_movement_trace_save_load(self, tmp_path):
-        trace = DataMovementTrace(
+    def test_gpu_replay_trace_save_load(self, tmp_path):
+        trace = GPUReplayTrace(
             num_layers=2,
             num_experts=4,
             cache_size=4,
@@ -138,7 +138,7 @@ class TestSerialization:
 
         path = str(tmp_path / "trace.json")
         trace.save(path)
-        loaded = DataMovementTrace.load(path)
+        loaded = GPUReplayTrace.load(path)
 
         assert loaded.num_layers == 2
         assert loaded.num_experts == 4
@@ -158,13 +158,13 @@ class TestSerialization:
         assert lt1.prefetches[0].evict == (0, 1)
 
 
-# ── 2. DataMovementTrace.validate() ─────────────────────────────────
+# ── 2. GPUReplayTrace.validate() ─────────────────────────────────
 
 class TestValidation:
 
     def test_valid_trace_passes(self):
         """A correctly constructed trace should validate with no errors."""
-        trace = DataMovementTrace(
+        trace = GPUReplayTrace(
             num_layers=1,
             num_experts=4,
             cache_size=2,
@@ -191,7 +191,7 @@ class TestValidation:
 
     def test_missing_expert_detected(self):
         """Expert needed but not resident and not loaded -> error."""
-        trace = DataMovementTrace(
+        trace = GPUReplayTrace(
             num_layers=1,
             num_experts=4,
             cache_size=2,
@@ -212,7 +212,7 @@ class TestValidation:
 
     def test_cross_layer_eviction_allowed(self):
         """Unified cache allows evicting from any layer."""
-        trace = DataMovementTrace(
+        trace = GPUReplayTrace(
             num_layers=2,
             num_experts=4,
             cache_size=4,
@@ -239,7 +239,7 @@ class TestValidation:
 
     def test_initial_overcapacity_detected(self):
         """Initial state exceeds cache_size -> error."""
-        trace = DataMovementTrace(
+        trace = GPUReplayTrace(
             num_layers=1,
             num_experts=4,
             cache_size=2,
@@ -251,7 +251,7 @@ class TestValidation:
 
     def test_free_slot_addition(self):
         """evict=None should work when cache has free slots."""
-        trace = DataMovementTrace(
+        trace = GPUReplayTrace(
             num_layers=1,
             num_experts=4,
             cache_size=3,
@@ -322,10 +322,10 @@ class TestActivationTrace:
         # Write companion router inputs
         hidden_dim = 8
         arrays = {
-            'step0_layer0': np.ones((1, hidden_dim), dtype=np.float16) * 0.5,
-            'step0_layer1': np.ones((1, hidden_dim), dtype=np.float16) * 1.0,
-            'step1_layer0': np.ones((1, hidden_dim), dtype=np.float16) * 1.5,
-            'step1_layer1': np.ones((1, hidden_dim), dtype=np.float16) * 2.0,
+            'step0_layer0': np.ones((1, hidden_dim), dtype=np.float32) * 0.5,
+            'step0_layer1': np.ones((1, hidden_dim), dtype=np.float32) * 1.0,
+            'step1_layer0': np.ones((1, hidden_dim), dtype=np.float32) * 1.5,
+            'step1_layer1': np.ones((1, hidden_dim), dtype=np.float32) * 2.0,
         }
         np.savez_compressed(npz_path, **arrays)
 
@@ -338,7 +338,7 @@ class TestActivationTrace:
         ri = at2.get_router_input(0, 0)
         assert ri is not None
         assert ri.shape == (1, hidden_dim)
-        assert ri.dtype == np.float16
+        assert ri.dtype == np.float32
         np.testing.assert_allclose(ri, 0.5)
 
         ri_last = at2.get_router_input(1, 1)
@@ -353,7 +353,7 @@ class TestActivationTrace:
                              steps=[[[0, 1]]])
         at.save(json_path)
         np.savez_compressed(npz_path,
-                            step0_layer0=np.zeros((1, 4), dtype=np.float16))
+                            step0_layer0=np.zeros((1, 4), dtype=np.float32))
 
         at2 = ActivationTrace.load(json_path)
         assert at2.has_router_inputs()
@@ -379,7 +379,7 @@ class TestActivationTrace:
                              steps=[[[0, 1]], [[2, 3]], [[0, 2]]])
         at.save(json_path)
         np.savez_compressed(npz_path,
-                            step0_layer0=np.zeros((1, 4), dtype=np.float16))
+                            step0_layer0=np.zeros((1, 4), dtype=np.float32))
 
         at2 = ActivationTrace.load(json_path)
         assert at2.has_router_inputs()
@@ -514,6 +514,7 @@ class TestBeladyOracle:
         dm = simulate(Belady(), OraclePrefetch(), at, cache_size=4)
 
         lt1 = dm.steps[0].layers[1]
+        assert len(lt1.prefetches) > 0, "OraclePrefetch should generate prefetches"
         for pf in lt1.prefetches:
             assert pf.target[0] == 1, \
                 f"Prefetch in layers[1] should target layer 1, " \
@@ -716,7 +717,7 @@ class TestSummary:
             ])
         dm = simulate(Belady(), OraclePrefetch(), at, cache_size=6)
         s = dm.summary()
-        assert s['total_transfers'] > 0
+        assert s['prefetches'] > 0
 
 
 # ── 10. Unified cache specific ───────────────────────────────────────

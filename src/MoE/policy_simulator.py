@@ -27,9 +27,9 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from typing import Optional
 
-from data_movement_trace import (
+from gpu_replay_trace import (
     ActivationTrace,
-    DataMovementTrace,
+    GPUReplayTrace,
     LayerTrace,
     StepScheduling,
     StepTrace,
@@ -213,7 +213,7 @@ class LFU(CachePolicy):
     def insert(self, key):
         self._cache.add(key)
         if key not in self._freq:
-            self._freq[key] = 1
+            self._freq[key] = 0
 
     def remove(self, key):
         self._cache.discard(key)
@@ -241,9 +241,9 @@ class StaticFreq(CachePolicy):
     """Global frequency ranking: initial cache = top-k by frequency,
     eviction = lowest global frequency.
 
-    Pre-computes access frequencies over the ENTIRE trace. The top
-    (cache_size - num_experts) experts are effectively pinned and never
-    evicted. Requires oracle knowledge (full trace).
+    Pre-computes access frequencies over the ENTIRE trace. High-frequency
+    experts are effectively pinned: eviction always targets the
+    lowest-frequency resident. Requires oracle knowledge (full trace).
     """
 
     def setup(self, activation_trace, cache_size, num_layers, num_experts):
@@ -293,83 +293,6 @@ class StaticFreq(CachePolicy):
                 if f < best_freq:
                     best_freq, best_key = f, key
         return best_key
-
-
-class StaticScratchpad(CachePolicy):
-    """Static pinned experts + FIFO scratchpad for demand/prefetch.
-
-    Like StaticFreq, but reserves `scratchpad_size` empty slots. The top
-    `cache_size - scratchpad_size` experts by global frequency are pinned
-    and NEVER evicted. All demand loads and prefetches go into the
-    scratchpad. Eviction uses FIFO (oldest insertion first) to ensure
-    Oracle prefetch cannot increase total IO vs NoPrefetch.
-
-    Args:
-        scratchpad_size: Number of slots reserved for dynamic use. Should
-            be 2*E (2x experts per layer) so current + next layer's
-            non-static experts fit simultaneously.
-    """
-
-    def __init__(self, scratchpad_size: int):
-        self._scratchpad_size = scratchpad_size
-
-    def setup(self, activation_trace, cache_size, num_layers, num_experts):
-        self._global_freq = {}
-        for step_experts in activation_trace.steps:
-            for layer in range(num_layers):
-                for eid in step_experts[layer]:
-                    key = (layer, eid)
-                    self._global_freq[key] = self._global_freq.get(key, 0) + 1
-        all_experts = [(layer, eid)
-                       for layer in range(num_layers)
-                       for eid in range(num_experts)]
-        all_experts.sort(key=lambda k: (-self._global_freq.get(k, 0), k))
-        n_pinned = cache_size - self._scratchpad_size
-        self._pinned = set(tuple(k) for k in all_experts[:n_pinned])
-        return all_experts[:n_pinned]  # scratchpad starts empty
-
-    def init_cache(self, initial_cache):
-        self._cache = set()
-        self._fifo = OrderedDict()  # FIFO eviction order for scratchpad
-        for key in initial_cache:
-            self._cache.add(tuple(key))
-
-    def begin_step(self, step_idx):
-        # Expire all scratchpad entries — no cross-step reuse
-        for key in list(self._fifo):
-            self._cache.discard(key)
-        self._fifo.clear()
-
-    def contains(self, key):
-        return key in self._cache
-
-    def on_hit(self, key):
-        pass
-
-    def insert(self, key):
-        self._cache.add(key)
-        if key not in self._pinned:
-            if key in self._fifo:
-                self._fifo.move_to_end(key)
-            else:
-                self._fifo[key] = True
-
-    def remove(self, key):
-        self._cache.discard(key)
-        self._fifo.pop(key, None)
-
-    def occupancy(self):
-        return len(self._cache)
-
-    def evict_victim(self, protected, current_pos):
-        # FIFO: evict oldest scratchpad entry that isn't protected
-        for key in self._fifo:
-            if key not in protected:
-                return key
-        # Fallback: evict oldest (ignore protected)
-        for key in self._fifo:
-            return key
-        return None
 
 
 # ── Prefetch Policies ──────────────────────────────────────────────
@@ -467,7 +390,7 @@ def simulate(cache_policy: CachePolicy,
              activation_trace: ActivationTrace,
              cache_size: int,
              initial_cache: Optional[list[tuple[int, int]]] = None
-             ) -> DataMovementTrace:
+             ) -> GPUReplayTrace:
     """Run a cache+prefetch policy simulation on an activation trace.
 
     Args:
@@ -479,7 +402,7 @@ def simulate(cache_policy: CachePolicy,
         initial_cache: Optional explicit initial cache contents.
 
     Returns:
-        DataMovementTrace ready for replay.
+        GPUReplayTrace ready for replay.
     """
     num_layers = activation_trace.num_layers
     num_experts = activation_trace.num_experts
@@ -574,7 +497,7 @@ def simulate(cache_policy: CachePolicy,
             layers=layer_traces,
             scheduling=_get_scheduling(activation_trace, step_idx)))
 
-    return DataMovementTrace(
+    return GPUReplayTrace(
         num_layers=num_layers,
         num_experts=num_experts,
         cache_size=cache_size,

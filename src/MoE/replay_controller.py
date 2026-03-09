@@ -1,6 +1,6 @@
 """Replay Controller for MoE expert offloading (Phase 6).
 
-Replays a pre-computed DataMovementTrace on real GPU hardware using a
+Replays a pre-computed GPUReplayTrace on real GPU hardware using a
 unified expert cache shared across all layers. Drives the same
 _mixed_step_piecewise loop as ExpertOffloadEngine but uses trace-specified
 prefetch/eviction/demand-load schedules instead of reactive demand loading.
@@ -13,14 +13,14 @@ Prefetch timing:
 
 Data flow:
     1. Record activation trace:   ExpertOffloadEngine.save_trace()
-    2. Simulate policy:           LRUPolicy.simulate() -> DataMovementTrace
+    2. Simulate policy:           simulate(cache, prefetch, trace, cache_size) -> GPUReplayTrace
     3. Replay on hardware:        ReplayController(engine, trace) -> timing
 
 Usage:
-    from data_movement_trace import DataMovementTrace
+    from gpu_replay_trace import GPUReplayTrace
     from replay_controller import ReplayController
 
-    trace = DataMovementTrace.load("lru_movement.json")
+    trace = GPUReplayTrace.load("lru_movement.json")
     controller = ReplayController(engine, trace)
     controller.setup()
 
@@ -33,11 +33,100 @@ Usage:
 
 import torch
 
-from data_movement_trace import DataMovementTrace, StepScheduling, TransferEvent
+from gpu_replay_trace import GPUReplayTrace, StepScheduling, TransferEvent
+
+
+class PhaseTimer:
+    """CUDA event-based per-phase timing for replay steps.
+
+    Records GPU timestamps at phase boundaries with near-zero overhead
+    (each record() enqueues a single stream command). Phase times are
+    computed post-run from event pairs after torch.cuda.synchronize().
+
+    Per-layer phases (summed across all layers and steps):
+        stage1:    Pre-attention (RMSNorm + RoPE + QKV projection)
+        attention: Decode + prefill attention (stages 2+3)
+        stage4a:   Post-attention RMSNorm + router
+        io:        CPU break (prefetch sync + demand loads + map update
+                   + next-layer prefetch dispatch)
+        stage4b:   Fused MoE computation
+
+    Per-step phases:
+        step_setup:  Token/position/slot setup + FlashInfer plan + embed
+        step_finish: Final RMSNorm + lm_head
+    """
+
+    PHASES = ('step_setup', 'stage1', 'attention', 'stage4a',
+              'io', 'stage4b', 'step_finish')
+
+    def __init__(self, num_steps, num_layers):
+        self._num_steps = num_steps
+        self._num_layers = num_layers
+        self._step = -1
+        # Events per step: step_start, after_setup,
+        #   per layer: after_stage1, after_attn, after_stage4a,
+        #              after_io, after_stage4b,
+        #   after_final
+        self._eps = 2 + num_layers * 5 + 1
+        total = self._eps * num_steps
+        self._events = [torch.cuda.Event(enable_timing=True)
+                        for _ in range(total)]
+
+    # ── Recording (called by engine during replay) ──
+
+    def step_start(self):
+        self._step += 1
+        self._events[self._step * self._eps].record()
+
+    def after_setup(self):
+        self._events[self._step * self._eps + 1].record()
+
+    def after_stage1(self, layer):
+        self._events[self._step * self._eps + 2 + layer * 5].record()
+
+    def after_attn(self, layer):
+        self._events[self._step * self._eps + 2 + layer * 5 + 1].record()
+
+    def after_stage4a(self, layer):
+        self._events[self._step * self._eps + 2 + layer * 5 + 2].record()
+
+    def after_io(self, layer):
+        self._events[self._step * self._eps + 2 + layer * 5 + 3].record()
+
+    def after_stage4b(self, layer):
+        self._events[self._step * self._eps + 2 + layer * 5 + 4].record()
+
+    def after_final(self):
+        self._events[self._step * self._eps + self._eps - 1].record()
+
+    # ── Aggregation (call after torch.cuda.synchronize()) ──
+
+    def get_phase_times_ms(self) -> dict[str, float]:
+        """Compute per-phase aggregate times in milliseconds."""
+        totals = {p: 0.0 for p in self.PHASES}
+        L = self._num_layers
+        n = self._step + 1
+        e = self._events
+        eps = self._eps
+        for s in range(n):
+            base = s * eps
+            totals['step_setup'] += e[base].elapsed_time(e[base + 1])
+            for l in range(L):
+                lb = base + 2 + l * 5
+                before_s1 = e[base + 1] if l == 0 else e[lb - 1]
+                totals['stage1'] += before_s1.elapsed_time(e[lb])
+                totals['attention'] += e[lb].elapsed_time(e[lb + 1])
+                totals['stage4a'] += e[lb + 1].elapsed_time(e[lb + 2])
+                totals['io'] += e[lb + 2].elapsed_time(e[lb + 3])
+                totals['stage4b'] += e[lb + 3].elapsed_time(e[lb + 4])
+            last_s4b = e[base + 2 + (L - 1) * 5 + 4]
+            totals['step_finish'] += last_s4b.elapsed_time(
+                e[base + eps - 1])
+        return totals
 
 
 class ReplayController:
-    """Replays a DataMovementTrace with async transfers on real GPU hardware.
+    """Replays a GPUReplayTrace with async transfers on real GPU hardware.
 
     Uses a unified expert cache: any slot can hold any (layer, expert_id).
     No per-layer partitioning or scratchpad.
@@ -54,12 +143,20 @@ class ReplayController:
         post_layer()            — called after stage4b (no-op for unified)
     """
 
-    def __init__(self, engine, trace: DataMovementTrace):
+    def __init__(self, engine, trace: GPUReplayTrace, track_io=False,
+                 track_phases=False):
         """Create replay controller.
 
         Args:
             engine: MoEEngine instance with cache_size set.
             trace: Pre-computed data movement trace to replay.
+            track_io: Record CUDA events around demand loads to measure
+                I/O vs compute time. Most meaningful for no-prefetch runs
+                where all I/O is blocking on the compute stream.
+            track_phases: Record CUDA events at every phase boundary
+                (stage1, attention, stage4a, io, stage4b, step_setup,
+                step_finish). Superset of track_io. The engine records
+                events via self._phase_timer in _mixed_step_piecewise.
         """
         self.trace = trace
         self.device = engine.device
@@ -89,8 +186,15 @@ class ReplayController:
         self._current_step = -1
         self._has_prefetches = False
 
-        # Timing records
-        self.step_timings = []
+        # I/O timing: CUDA event pairs around demand load blocks
+        self._track_io = track_io
+        self._demand_event_pairs = []  # [(start_evt, end_evt), ...]
+
+        # Per-phase timing (superset of track_io)
+        self._phase_timer = None
+        if track_phases:
+            self._phase_timer = PhaseTimer(
+                len(trace.steps), engine.num_layers)
 
     def setup(self):
         """Load initial cache state from trace into unified buffer.
@@ -165,8 +269,16 @@ class ReplayController:
                 self._prefetch_done_event)
 
         # Step 3: demand loads (blocking, on compute stream)
-        for event in layer_trace.demand_loads:
-            self._execute_transfer(event)
+        if layer_trace.demand_loads:
+            if self._track_io:
+                io_start = torch.cuda.Event(enable_timing=True)
+                io_end = torch.cuda.Event(enable_timing=True)
+                io_start.record()
+            for event in layer_trace.demand_loads:
+                self._execute_transfer(event)
+            if self._track_io:
+                io_end.record()
+                self._demand_event_pairs.append((io_start, io_end))
 
         # Step 4: re-copy expert_map (may have been updated by transfers)
         self.expert_map_buf.copy_(self.expert_map_abs[layer])
@@ -231,36 +343,6 @@ class ReplayController:
             return None
         return self.trace.steps[step].scheduling
 
-    def get_preempted_seq_ids(self, step: int = None) -> list[int]:
-        """Get request_ids that should be preempted after this step.
-
-        Reads from the scheduling metadata attached to the trace.
-        The caller (replay loop) should call engine.free_seq() for each.
-
-        Returns:
-            List of request_ids to preempt, or empty list.
-        """
-        sched = self.get_step_scheduling(step)
-        if sched is None:
-            return []
-        return [evt['request_id'] for evt in sched.events
-                if evt['event'] == 'preempt']
-
-    def get_readmitted_seq_ids(self, step: int = None) -> list[int]:
-        """Get request_ids readmitted at this step (need re-prefill).
-
-        Reads from the scheduling metadata attached to the trace.
-        The caller should re-prefill these sequences before the step.
-
-        Returns:
-            List of request_ids readmitted, or empty list.
-        """
-        sched = self.get_step_scheduling(step)
-        if sched is None:
-            return []
-        return [evt['request_id'] for evt in sched.events
-                if evt['event'] in ('readmit', 'force_readmit')]
-
     def get_newly_admitted_seq_ids(self, step: int = None) -> list[int]:
         """Get request_ids newly admitted at this step (need initial prefill).
 
@@ -272,6 +354,28 @@ class ReplayController:
             return []
         return [evt['request_id'] for evt in sched.events
                 if evt['event'] in ('admit', 'force_admit')]
+
+    def get_demand_load_time_ms(self) -> float:
+        """Total demand load time in ms. Call after torch.cuda.synchronize().
+
+        Only meaningful when track_io=True. For no-prefetch runs, this is
+        the total blocking I/O time on the compute stream, so:
+            compute_time = total_time - demand_load_time
+        """
+        total = 0.0
+        for start, end in self._demand_event_pairs:
+            total += start.elapsed_time(end)
+        return total
+
+    def get_phase_times_ms(self) -> dict[str, float]:
+        """Per-phase aggregate times in ms. Call after synchronize().
+
+        Requires track_phases=True. Returns dict with keys:
+            step_setup, stage1, attention, stage4a, io, stage4b, step_finish
+        """
+        if self._phase_timer is None:
+            raise RuntimeError("track_phases=True required")
+        return self._phase_timer.get_phase_times_ms()
 
     def get_replay_stats(self) -> dict:
         """Compute summary statistics from the trace being replayed."""

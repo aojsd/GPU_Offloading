@@ -20,7 +20,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 MOE_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(MOE_DIR))
 
-from data_movement_trace import ActivationTrace
+from gpu_replay_trace import ActivationTrace
 from policy_simulator import (
     StaticFreq, NoPrefetch, OraclePrefetch, simulate,
 )

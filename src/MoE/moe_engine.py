@@ -13,6 +13,7 @@ Uses the same kernels as vLLM 0.11.2 v1 engine on H100:
 
 import json
 import math
+from collections import deque
 import torch
 import torch.nn.functional as F
 from pathlib import Path
@@ -181,6 +182,7 @@ class MoEEngine:
         experts_per_layer: int = None,
         cache_size: int = None,
         pipeline_parallel_size: int = 1,
+        kv_page_budget: int = None,
     ):
         # Resolve to a concrete device with index (e.g. "cuda" -> "cuda:0")
         self.device = torch.device(device)
@@ -287,7 +289,11 @@ class MoEEngine:
         # seq_lens, FlashInfer — per-GPU when PP, single tensors otherwise
         self._attn_scale = 1.0 / math.sqrt(self.head_dim)
         self.max_pages_per_seq = math.ceil(max_seq_len / page_size)
-        self.total_pages = max_seqs * self.max_pages_per_seq
+        self._dynamic_pages = kv_page_budget is not None
+        if self._dynamic_pages:
+            self.total_pages = kv_page_budget
+        else:
+            self.total_pages = max_seqs * self.max_pages_per_seq
 
         if self.pp_size > 1:
             # Per-GPU replicated small tensors
@@ -313,13 +319,17 @@ class MoEEngine:
             ]
 
             # Block table: replicated on each GPU
-            bt = torch.zeros(max_seqs, self.max_pages_per_seq,
-                             dtype=torch.int32)
-            for i in range(max_seqs):
-                bt[i] = torch.arange(
-                    i * self.max_pages_per_seq,
-                    (i + 1) * self.max_pages_per_seq,
-                    dtype=torch.int32)
+            if self._dynamic_pages:
+                bt = torch.full((max_seqs, self.max_pages_per_seq),
+                                -1, dtype=torch.int32)
+            else:
+                bt = torch.zeros(max_seqs, self.max_pages_per_seq,
+                                 dtype=torch.int32)
+                for i in range(max_seqs):
+                    bt[i] = torch.arange(
+                        i * self.max_pages_per_seq,
+                        (i + 1) * self.max_pages_per_seq,
+                        dtype=torch.int32)
             self.block_table = [bt.to(d) for d in self.pp_devices]
 
             # Sequence length tracker: replicated on each GPU
@@ -363,14 +373,19 @@ class MoEEngine:
             ]
 
             # Block table
-            self.block_table = torch.zeros(
-                max_seqs, self.max_pages_per_seq, dtype=torch.int32,
-                device=device)
-            for i in range(max_seqs):
-                self.block_table[i] = torch.arange(
-                    i * self.max_pages_per_seq,
-                    (i + 1) * self.max_pages_per_seq,
+            if self._dynamic_pages:
+                self.block_table = torch.full(
+                    (max_seqs, self.max_pages_per_seq), -1,
                     dtype=torch.int32, device=device)
+            else:
+                self.block_table = torch.zeros(
+                    max_seqs, self.max_pages_per_seq, dtype=torch.int32,
+                    device=device)
+                for i in range(max_seqs):
+                    self.block_table[i] = torch.arange(
+                        i * self.max_pages_per_seq,
+                        (i + 1) * self.max_pages_per_seq,
+                        dtype=torch.int32, device=device)
 
             # Sequence length tracker
             self.seq_lens = torch.zeros(max_seqs, dtype=torch.int32,
@@ -383,6 +398,12 @@ class MoEEngine:
                 128 * 1024 * 1024, dtype=torch.uint8, device=device)
             self._decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self._workspace_buf, kv_layout="NHD", use_cuda_graph=False)
+
+        # Dynamic page allocation pool
+        if self._dynamic_pages:
+            self._free_pages = deque(range(self.total_pages))
+            self._seq_page_list: list[list[int]] = [
+                [] for _ in range(max_seqs)]
 
         # Guard: check model fits on GPU (skip in offloading/PP mode)
         if not self.offloading and self.pp_size == 1:
@@ -2668,16 +2689,18 @@ class MoEEngine:
             if _nvtx: torch.cuda.nvtx.range_pop()  # cpu_break
             if _pt: _pt.after_io(layer)
 
-            # Neutralize padding tokens: route to uncached expert so
-            # fused_moe's Triton kernel early-returns (no matmul, no weight
-            # read) instead of executing full GEMMs on padding positions.
-            # expert_map_buf is finalized by the CPU break above.
-            if N_actual < graph_N and self.offloading:
-                emap = self.expert_map_buf
-                uncached = (emap == -1).nonzero(as_tuple=True)[0]
-                if len(uncached) > 0:
-                    buf['topk_ids_buf'][N_actual:].fill_(uncached[0].item())
+            # Neutralize padding tokens: zero weights so fused_moe
+            # multiplies by 0 and padding contributes nothing to output.
+            # Trace recorder slices topk_ids_buf[:n_tokens], unaffected.
+            if N_actual < graph_N:
                 buf['topk_weights_buf'][N_actual:].zero_()
+                # In offloading mode, also route padding to an uncached
+                # expert so expert_map lookup doesn't hit -1.
+                if self.offloading:
+                    emap = self.expert_map_buf
+                    uncached = (emap == -1).nonzero(as_tuple=True)[0]
+                    if len(uncached) > 0:
+                        buf['topk_ids_buf'][N_actual:].fill_(uncached[0].item())
 
             # Stage 4b: MoE (CUDA graph)
             if _nvtx: torch.cuda.nvtx.range_push("stage4b")
@@ -2770,13 +2793,20 @@ class MoEEngine:
         for l in range(self.num_layers):
             self.k_cache[l].zero_()
             self.v_cache[l].zero_()
+        if self._dynamic_pages:
+            self._free_pages = deque(range(self.total_pages))
+            self._seq_page_list = [[] for _ in range(self.max_seqs)]
+            if self.pp_size > 1:
+                for bt in self.block_table:
+                    bt.fill_(-1)
+            else:
+                self.block_table.fill_(-1)
 
     def free_seq(self, seq_id: int):
-        """Free a single sequence's KV cache (for preemption).
+        """Free a single sequence's KV cache.
 
-        Resets seq_len to 0 so the pages are logically freed. Physical
-        pages stay allocated (static block table) but won't be read.
-        To readmit with recompute model, re-prefill into the same seq_id.
+        Resets seq_len to 0. With dynamic page allocation, also returns
+        physical pages to the free pool.
         """
         self._seq_lens_cpu[seq_id] = 0
         if self.pp_size > 1:
@@ -2784,6 +2814,74 @@ class MoEEngine:
                 sl[seq_id] = 0
         else:
             self.seq_lens[seq_id] = 0
+        if self._dynamic_pages:
+            self.free_seq_pages(seq_id)
+
+    # ── Dynamic Page Allocation ───────────────────────────────────────
+
+    def alloc_pages(self, seq_id: int, n_pages: int):
+        """Allocate n_pages from the free pool for seq_id.
+
+        Assigns physical pages to block_table[seq_id] starting at the
+        current allocation watermark. Raises RuntimeError if the free
+        pool doesn't have enough pages.
+        """
+        if n_pages <= 0:
+            return
+        current = len(self._seq_page_list[seq_id])
+        if current + n_pages > self.max_pages_per_seq:
+            raise RuntimeError(
+                f"Cannot allocate {n_pages} pages for seq {seq_id}: "
+                f"would exceed max_pages_per_seq={self.max_pages_per_seq} "
+                f"(current={current})")
+        if len(self._free_pages) < n_pages:
+            raise RuntimeError(
+                f"Cannot allocate {n_pages} pages for seq {seq_id}: "
+                f"only {len(self._free_pages)} free pages remain "
+                f"(budget={self.total_pages})")
+        pages = [self._free_pages.popleft() for _ in range(n_pages)]
+        self._seq_page_list[seq_id].extend(pages)
+        page_t = torch.tensor(pages, dtype=torch.int32)
+        if self.pp_size > 1:
+            for bt in self.block_table:
+                bt[seq_id, current:current + n_pages] = page_t.to(bt.device)
+        else:
+            self.block_table[seq_id, current:current + n_pages] = (
+                page_t.to(self.block_table.device))
+
+    def free_seq_pages(self, seq_id: int):
+        """Return all pages for seq_id to the free pool."""
+        pages = self._seq_page_list[seq_id]
+        if not pages:
+            return
+        n = len(pages)
+        self._free_pages.extend(pages)
+        self._seq_page_list[seq_id] = []
+        if self.pp_size > 1:
+            for bt in self.block_table:
+                bt[seq_id, :n] = -1
+        else:
+            self.block_table[seq_id, :n] = -1
+
+    def ensure_pages(self, seq_id: int, needed_pages: int):
+        """Ensure seq_id has at least needed_pages allocated.
+
+        Called by the scheduler before mixed_step() for every sequence
+        that will grow in this step. No-op when pages are sufficient.
+        """
+        current = len(self._seq_page_list[seq_id])
+        if needed_pages > current:
+            self.alloc_pages(seq_id, needed_pages - current)
+
+    @property
+    def pages_free(self) -> int:
+        """Number of unallocated pages (dynamic mode only)."""
+        return len(self._free_pages)
+
+    @property
+    def pages_in_use(self) -> int:
+        """Number of allocated pages (dynamic mode only)."""
+        return self.total_pages - len(self._free_pages)
 
     # ── CUDA Graph Support ────────────────────────────────────────────
 

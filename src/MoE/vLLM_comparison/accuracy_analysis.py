@@ -588,7 +588,7 @@ def main():
     print("  Phase 1: Custom Engine — EAGER (use_torch_compile=False)")
     print("=" * 72)
 
-    engine_eager = MoEEngine(args.model, max_batch_size=4, max_seq_len=4096,
+    engine_eager = MoEEngine(args.model, max_seqs=4, max_seq_len=4096,
                              use_torch_compile=False)
     engine_eager.capture_prefill_cuda_graph(
         total_token_sizes=[8, 16], use_torch_compile=False)
@@ -619,7 +619,7 @@ def main():
     print("  Phase 2: Custom Engine — COMPILED (use_torch_compile=True)")
     print("=" * 72)
 
-    engine_compiled = MoEEngine(args.model, max_batch_size=4, max_seq_len=4096,
+    engine_compiled = MoEEngine(args.model, max_seqs=4, max_seq_len=4096,
                                 use_torch_compile=True)
     engine_compiled.capture_prefill_cuda_graph(
         total_token_sizes=[8, 16], use_torch_compile=True)
@@ -652,7 +652,7 @@ def main():
 
     # Phase 2c: Re-run eager with locked tokens for apples-to-apples
     print("\n  Re-running eager engine for locked-step + self-consistency...")
-    engine_eager2 = MoEEngine(args.model, max_batch_size=4, max_seq_len=4096,
+    engine_eager2 = MoEEngine(args.model, max_seqs=4, max_seq_len=4096,
                               use_torch_compile=False)
     engine_eager2.capture_prefill_cuda_graph(
         total_token_sizes=[8, 16], use_torch_compile=False)

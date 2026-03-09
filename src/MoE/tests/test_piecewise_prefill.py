@@ -28,7 +28,7 @@ DEFAULT_MODEL = str(Path(__file__).resolve().parent.parent / "models" / "Mixtral
 def get_flat_prefill_tokens(model_path, prompt, seq_len, graph_sizes):
     """Load engine without offloading, prefill with flat graph, return greedy tokens."""
     print("\n--- Loading engine (flat prefill, no offloading) ---")
-    engine = MoEEngine(model_path, max_batch_size=8, max_seq_len=2048,
+    engine = MoEEngine(model_path, max_seqs=8, max_seq_len=2048,
                        use_torch_compile=False)
 
     with torch.inference_mode():
@@ -63,7 +63,7 @@ def get_piecewise_prefill_tokens(model_path, prompt, seq_len, graph_sizes,
                                  experts_per_layer):
     """Load engine with offloading (all resident), prefill via piecewise, return tokens."""
     print(f"\n--- Loading engine (piecewise prefill, experts_per_layer={experts_per_layer}) ---")
-    engine = MoEEngine(model_path, max_batch_size=8, max_seq_len=2048,
+    engine = MoEEngine(model_path, max_seqs=8, max_seq_len=2048,
                        experts_per_layer=experts_per_layer,
                        use_torch_compile=False)
 
@@ -100,7 +100,7 @@ def test_partial_offloading(model_path, prompt, seq_len, graph_sizes,
                             experts_per_layer):
     """Test prefill with partial offloading — no crash, no NaN."""
     print(f"\n--- Loading engine (partial offloading, experts_per_layer={experts_per_layer}) ---")
-    engine = MoEEngine(model_path, max_batch_size=8, max_seq_len=2048,
+    engine = MoEEngine(model_path, max_seqs=8, max_seq_len=2048,
                        experts_per_layer=experts_per_layer,
                        use_torch_compile=False)
 

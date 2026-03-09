@@ -35,7 +35,7 @@ def test_correctness(model_path, epl=4):
 
     # ── PP=2 ──
     print("\nLoading PP=2 engine...")
-    engine_pp = MoEEngine(model_path, max_batch_size=4,
+    engine_pp = MoEEngine(model_path, max_seqs=4,
                           max_seq_len=2048 + 128,
                           pipeline_parallel_size=2,
                           use_torch_compile=False)
@@ -79,7 +79,7 @@ def test_correctness(model_path, epl=4):
 
     # ── Single-GPU offloaded ──
     print(f"\nLoading single-GPU engine (epl={epl})...")
-    engine_1g = MoEEngine(model_path, max_batch_size=4,
+    engine_1g = MoEEngine(model_path, max_seqs=4,
                           max_seq_len=2048 + 128,
                           experts_per_layer=epl,
                           use_torch_compile=False)
@@ -118,6 +118,7 @@ def test_correctness(model_path, epl=4):
     sg_mixed = logits_1g_mixed.cpu()
 
     # ── Compare ──
+    all_pass = True
     for name, pp_l, sg_l in [
         ("Prefill", pp_prefill, sg_prefill),
         ("Decode", pp_decode, sg_decode),
@@ -129,6 +130,8 @@ def test_correctness(model_path, epl=4):
         top1_match = (pp_l.argmax(dim=-1) == sg_l.argmax(dim=-1)).float().mean().item()
 
         status = "PASS" if top1_match > 0.95 else "FAIL"
+        if top1_match <= 0.95:
+            all_pass = False
         print(f"\n  {name}:")
         print(f"    Max diff:     {max_diff:.4f}")
         print(f"    Mean diff:    {mean_diff:.6f}")
@@ -137,6 +140,7 @@ def test_correctness(model_path, epl=4):
     del engine_1g
     gc.collect()
     torch.cuda.empty_cache()
+    return all_pass
 
 
 def _sync_all():
@@ -156,7 +160,7 @@ def test_performance(model_path, epl=4, n_warmup=3, n_trials=10):
 
     # ── PP=2 ──
     print("\nLoading PP=2 engine...")
-    engine_pp = MoEEngine(model_path, max_batch_size=4,
+    engine_pp = MoEEngine(model_path, max_seqs=4,
                           max_seq_len=2048 + 128,
                           pipeline_parallel_size=2,
                           use_torch_compile=False)
@@ -207,7 +211,7 @@ def test_performance(model_path, epl=4, n_warmup=3, n_trials=10):
 
     # ── Single-GPU offloaded ──
     print(f"\nLoading single-GPU engine (epl={epl})...")
-    engine_1g = MoEEngine(model_path, max_batch_size=4,
+    engine_1g = MoEEngine(model_path, max_seqs=4,
                           max_seq_len=2048 + 128,
                           experts_per_layer=epl,
                           use_torch_compile=False)
@@ -282,7 +286,7 @@ def test_trace_collection(model_path):
     from trace_recorder import TraceRecorder
 
     print("\nLoading PP=2 engine...")
-    engine = MoEEngine(model_path, max_batch_size=4,
+    engine = MoEEngine(model_path, max_seqs=4,
                        max_seq_len=2048 + 128,
                        pipeline_parallel_size=2,
                        use_torch_compile=False)
@@ -378,7 +382,7 @@ def test_memory(model_path):
     print("TEST 4: Memory — per-GPU allocation with PP=2")
     print("=" * 70)
 
-    engine = MoEEngine(model_path, max_batch_size=4,
+    engine = MoEEngine(model_path, max_seqs=4,
                        max_seq_len=2048 + 128,
                        pipeline_parallel_size=2,
                        use_torch_compile=False)
@@ -416,7 +420,9 @@ def main():
         torch.cuda.empty_cache()
 
     if args.test in ("all", "correctness"):
-        test_correctness(args.model, epl=args.epl)
+        if not test_correctness(args.model, epl=args.epl):
+            print("\nFAILED: correctness test")
+            sys.exit(1)
         gc.collect()
         torch.cuda.empty_cache()
 

@@ -810,7 +810,7 @@ def main():
     max_gen = max(r.max_new_tokens for r in workload)
     max_seq = max_prompt_len + max_gen + 64
 
-    engine = MoEEngine(args.model, max_batch_size=max_batch,
+    engine = MoEEngine(args.model, max_seqs=max_batch,
                        max_seq_len=max_seq,
                        use_torch_compile=args.use_compile)
 

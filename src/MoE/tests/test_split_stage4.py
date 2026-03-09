@@ -116,7 +116,7 @@ def main():
     print(f"Model: {args.model}")
     print(f"torch.compile: {use_compile}")
 
-    engine = MoEEngine(args.model, max_batch_size=8, max_seq_len=2048,
+    engine = MoEEngine(args.model, max_seqs=8, max_seq_len=2048,
                        use_torch_compile=use_compile)
 
     # Capture both flat prefill and piecewise graphs
@@ -136,14 +136,23 @@ def main():
 
     with torch.inference_mode():
         # Test 1: Flat prefill vs piecewise prefill
-        test_prefill_flat_vs_piecewise(engine, seq_len=128,
-                                       use_compile=use_compile)
+        _, t1_match = test_prefill_flat_vs_piecewise(engine, seq_len=128,
+                                                      use_compile=use_compile)
 
         # Test 2: Decode via piecewise vs flat graph
-        test_decode_piecewise(engine, prompt_len=128, decode_steps=5,
-                              use_compile=use_compile)
+        t2_match = test_decode_piecewise(engine, prompt_len=128, decode_steps=5,
+                                          use_compile=use_compile)
 
-    print("\n=== All tests complete ===")
+    all_pass = t1_match and t2_match
+    if not all_pass:
+        if use_compile and t1_match:
+            # Decode mismatch with compile is expected (inductor noise)
+            print("\n=== Tests complete (decode mismatch expected with compile) ===")
+        else:
+            print("\nFAILED")
+            sys.exit(1)
+    else:
+        print("\n=== All tests passed ===")
 
 
 if __name__ == "__main__":

@@ -112,7 +112,7 @@ def write_custom_driver(path, seq_len, model_dir):
         NUM_WARMUP = {NUM_WARMUP}
         NUM_DECODE = {NUM_DECODE}
 
-        engine = MoEEngine("{model_dir}", max_batch_size=1, max_seq_len=MAX_SEQ)
+        engine = MoEEngine("{model_dir}", max_seqs=1, max_seq_len=MAX_SEQ)
         engine.capture_decode_cuda_graph(
             batch_size=1, warmup_seq_len=128,
             max_decode_tokens=MAX_SEQ - 128)
@@ -215,7 +215,7 @@ def write_custom_prefill_driver(path, seq_len, model_dir):
         SEQ_LEN = {seq_len}
         NUM_PREFILL = {NUM_PREFILL_STEPS}
 
-        engine = MoEEngine("{model_dir}", max_batch_size=1, max_seq_len=4096,
+        engine = MoEEngine("{model_dir}", max_seqs=1, max_seq_len=4096,
                            use_torch_compile=True)
         engine.capture_prefill_cuda_graph(
             total_token_sizes=[SEQ_LEN],

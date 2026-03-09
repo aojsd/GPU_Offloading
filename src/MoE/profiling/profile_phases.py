@@ -135,9 +135,9 @@ def run_worker(args):
     tokens_per_step = D + sum(prefill_lengths)
     print(f"Batch: {desc}")
     print(f"Total tokens/step: {tokens_per_step}")
-    print(f"max_batch_size={max_batch}, max_seq_len={max_seq}")
+    print(f"max_seqs={max_batch}, max_seq_len={max_seq}")
 
-    engine = MoEEngine(args.model, max_batch_size=max_batch,
+    engine = MoEEngine(args.model, max_seqs=max_batch,
                        max_seq_len=max_seq)
 
     with torch.inference_mode():
@@ -952,9 +952,9 @@ def run_sweep(args):
     max_pos = max(DECODE_POSITIONS)
     max_seq = max_pos + n_warmup + n_steps + 16
     print(f"\n--- Decode sweep ---")
-    print(f"  max_batch_size=1, max_seq_len={max_seq}")
+    print(f"  max_seqs=1, max_seq_len={max_seq}")
 
-    engine = MoEEngine(args.model, max_batch_size=1, max_seq_len=max_seq)
+    engine = MoEEngine(args.model, max_seqs=1, max_seq_len=max_seq)
     L = engine.num_layers
 
     with torch.inference_mode():
@@ -985,9 +985,9 @@ def run_sweep(args):
     max_batch = n_warmup + n_steps
     max_seq = max(PREFILL_SIZES) + 16
     print(f"\n--- Prefill sweep ---")
-    print(f"  max_batch_size={max_batch}, max_seq_len={max_seq}")
+    print(f"  max_seqs={max_batch}, max_seq_len={max_seq}")
 
-    engine = MoEEngine(args.model, max_batch_size=max_batch,
+    engine = MoEEngine(args.model, max_seqs=max_batch,
                        max_seq_len=max_seq)
 
     prefill_results = {}

@@ -454,7 +454,7 @@ def run_cuda_graph_correctness(model_dir):
 
     short = _make_short_prompt(model_dir)
     engine = MoEEngine(
-        model_dir, max_batch_size=4, max_seq_len=1024, use_torch_compile=False)
+        model_dir, max_seqs=4, max_seq_len=1024, use_torch_compile=False)
     engine.capture_prefill_cuda_graph(
         total_token_sizes=[len(short)], use_torch_compile=False)
 
@@ -539,7 +539,7 @@ def run_cuda_graph_timing(model_dir):
 
     # Eager (FlashInfer, no graph)
     eng_eager = MoEEngine(
-        model_dir, max_batch_size=4, max_seq_len=1024, use_torch_compile=False)
+        model_dir, max_seqs=4, max_seq_len=1024, use_torch_compile=False)
     eng_eager.capture_prefill_cuda_graph(
         total_token_sizes=[warmup_seq], use_torch_compile=False)
     eng_eager.reset()
@@ -550,7 +550,7 @@ def run_cuda_graph_timing(model_dir):
 
     # CUDA Graph (no compile)
     eng_no_compile = MoEEngine(
-        model_dir, max_batch_size=4, max_seq_len=warmup_seq + 512 + 256,
+        model_dir, max_seqs=4, max_seq_len=warmup_seq + 512 + 256,
         use_torch_compile=False)
     eng_no_compile.capture_prefill_cuda_graph(
         total_token_sizes=[warmup_seq], use_torch_compile=False)
@@ -566,7 +566,7 @@ def run_cuda_graph_timing(model_dir):
 
     # CUDA Graph + torch.compile
     eng_compile = MoEEngine(
-        model_dir, max_batch_size=4, max_seq_len=warmup_seq + 512 + 256,
+        model_dir, max_seqs=4, max_seq_len=warmup_seq + 512 + 256,
         use_torch_compile=True)
     eng_compile.capture_prefill_cuda_graph(
         total_token_sizes=[warmup_seq], use_torch_compile=True)
@@ -597,7 +597,7 @@ def test_pure_decode_via_mixed(model_dir):
     """Pure decode through mixed_step must match decode_step exactly."""
     print("Test 1: pure decode via mixed_step...")
     short = _make_short_prompt(model_dir)
-    engine = MoEEngine(model_dir, max_batch_size=4, max_seq_len=512,
+    engine = MoEEngine(model_dir, max_seqs=4, max_seq_len=512,
                        use_torch_compile=False)
     engine.capture_prefill_cuda_graph(
         total_token_sizes=[len(short)], use_torch_compile=False)
@@ -626,7 +626,7 @@ def test_pure_prefill_via_mixed(model_dir):
     """Pure prefill through mixed_step must match prefill exactly."""
     print("Test 2: pure prefill via mixed_step...")
     short = _make_short_prompt(model_dir)
-    engine = MoEEngine(model_dir, max_batch_size=4, max_seq_len=512,
+    engine = MoEEngine(model_dir, max_seqs=4, max_seq_len=512,
                        use_torch_compile=False)
     engine.capture_prefill_cuda_graph(
         total_token_sizes=[len(short)], use_torch_compile=False)
@@ -653,7 +653,7 @@ def test_mixed_batch(model_dir):
     """Mixed decode + prefill: verify both parts produce reasonable logits."""
     print("Test 3: mixed decode + prefill batch...")
     short = _make_short_prompt(model_dir)
-    engine = MoEEngine(model_dir, max_batch_size=8, max_seq_len=512,
+    engine = MoEEngine(model_dir, max_seqs=8, max_seq_len=512,
                        use_torch_compile=False)
     engine.capture_prefill_cuda_graph(
         total_token_sizes=[len(short), 8], use_torch_compile=False)
@@ -704,7 +704,7 @@ def test_mixed_batch(model_dir):
 def test_multi_decode_multi_prefill(model_dir):
     """Multiple decode + multiple prefill in same batch."""
     print("Test 4: multi-decode + multi-prefill...")
-    engine = MoEEngine(model_dir, max_batch_size=8, max_seq_len=512,
+    engine = MoEEngine(model_dir, max_seqs=8, max_seq_len=512,
                        use_torch_compile=False)
     engine.capture_prefill_cuda_graph(
         total_token_sizes=[64], use_torch_compile=False)
@@ -765,7 +765,7 @@ def _run_eager_mixed(engine, decode_seq_ids, decode_token_ids,
 def test_piecewise_graphed_vs_eager(model_dir):
     """Piecewise graphed mixed_step matches eager exactly (no torch.compile)."""
     print("Test 5: piecewise graphed vs eager (exact match)...")
-    engine = MoEEngine(model_dir, max_batch_size=8, max_seq_len=512,
+    engine = MoEEngine(model_dir, max_seqs=8, max_seq_len=512,
                        use_torch_compile=False)
 
     engine.capture_mixed_cuda_graphs(
@@ -814,7 +814,7 @@ def test_piecewise_graphed_vs_eager(model_dir):
 def test_piecewise_padding(model_dir):
     """Padding correctness: capture at N=128, run with N_actual < 128."""
     print("Test 6: piecewise padding correctness...")
-    engine = MoEEngine(model_dir, max_batch_size=8, max_seq_len=512,
+    engine = MoEEngine(model_dir, max_seqs=8, max_seq_len=512,
                        use_torch_compile=False)
     engine.capture_mixed_cuda_graphs(
         total_token_sizes=[128], use_torch_compile=False)
@@ -850,7 +850,7 @@ def test_piecewise_padding(model_dir):
 def test_piecewise_multi_step(model_dir):
     """Multi-step generation: piecewise matches eager across 5 steps."""
     print("Test 7: piecewise multi-step generation...")
-    engine = MoEEngine(model_dir, max_batch_size=8, max_seq_len=512,
+    engine = MoEEngine(model_dir, max_seqs=8, max_seq_len=512,
                        use_torch_compile=False)
     engine.capture_mixed_cuda_graphs(
         total_token_sizes=[128], use_torch_compile=False)
@@ -934,7 +934,7 @@ def cmd_decode(args):
         print("=" * 70)
 
         max_needed = max(seq_lens) + 256 if run_perf else 1024
-        engine = MoEEngine(args.model, max_batch_size=1, max_seq_len=max_needed,
+        engine = MoEEngine(args.model, max_seqs=1, max_seq_len=max_needed,
                            use_torch_compile=False)
 
         if not args.no_graph:
@@ -1155,7 +1155,7 @@ def cmd_prefill(args):
 
     # CUDA graph only (no torch.compile)
     print("\n── Custom Engine Prefill (CUDA graph, no compile) ──")
-    engine = MoEEngine(args.model, max_batch_size=4, max_seq_len=4096,
+    engine = MoEEngine(args.model, max_seqs=4, max_seq_len=4096,
                        use_torch_compile=False)
     custom_graph = benchmark_prefill_custom_graph(
         engine, args.seq_lens, use_torch_compile=False)
@@ -1164,7 +1164,7 @@ def cmd_prefill(args):
 
     # torch.compile + CUDA graph
     print("\n── Custom Engine Prefill (torch.compile + CUDA graph) ──")
-    engine = MoEEngine(args.model, max_batch_size=4, max_seq_len=4096,
+    engine = MoEEngine(args.model, max_seqs=4, max_seq_len=4096,
                        use_torch_compile=True)
     custom_compiled = benchmark_prefill_custom_graph(
         engine, args.seq_lens, use_torch_compile=True)

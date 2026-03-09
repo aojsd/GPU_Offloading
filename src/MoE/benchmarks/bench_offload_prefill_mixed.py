@@ -190,12 +190,12 @@ def main():
     graph_sizes = sorted(set([16, 32, 128, 256, 512]))
     print(f"Piecewise graph sizes: {graph_sizes}")
 
-    max_batch_size = max_decode + 8  # extra slots for prefill seqs
-    print(f"max_batch_size: {max_batch_size}")
+    max_seqs = max_decode + 8  # extra slots for prefill seqs
+    print(f"max_seqs: {max_seqs}")
 
     # Create engine
     print(f"\nLoading engine with experts_per_layer={max_epl}...")
-    engine = MoEEngine(args.model, max_batch_size=max_batch_size,
+    engine = MoEEngine(args.model, max_seqs=max_seqs,
                        max_seq_len=2048,
                        experts_per_layer=max_epl,
                        use_torch_compile=False)

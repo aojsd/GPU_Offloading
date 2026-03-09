@@ -10,6 +10,7 @@ Usage:
 """
 import argparse
 import gc
+import json
 import sys
 from pathlib import Path
 
@@ -260,7 +261,7 @@ def main():
     print(f"torch.compile: {use_compile}")
 
     # Test 1: split overhead (no offload engine needed — experts_per_layer=None)
-    engine = MoEEngine(args.model, max_batch_size=8, max_seq_len=2048,
+    engine = MoEEngine(args.model, max_seqs=8, max_seq_len=2048,
                        use_torch_compile=use_compile)
 
     with torch.inference_mode():
@@ -286,8 +287,10 @@ def main():
 
     # Tests 2-3: offloading correctness (experts_per_layer=E, all resident,
     # then configure() to reduce budget for demand loading tests)
-    E = 8  # Mixtral experts — read from config if needed
-    engine = MoEEngine(args.model, max_batch_size=8, max_seq_len=2048,
+    with open(Path(args.model) / "config.json") as f:
+        cfg = json.load(f)
+    E = cfg.get("num_local_experts") or cfg.get("num_experts")
+    engine = MoEEngine(args.model, max_seqs=8, max_seq_len=2048,
                        experts_per_layer=E,
                        use_torch_compile=use_compile)
 
@@ -301,10 +304,14 @@ def main():
             use_torch_compile=use_compile)
 
     with torch.inference_mode():
-        test_demand_load_correctness(engine, seq_len=128)
-        test_decode_with_offloading(engine, prompt_len=128, decode_steps=10)
+        _, top1_match = test_demand_load_correctness(engine, seq_len=128)
+        decode_match = test_decode_with_offloading(engine, prompt_len=128,
+                                                    decode_steps=10)
 
-    print("\n=== All tests complete ===")
+    if not (top1_match and decode_match):
+        print("\nFAILED")
+        sys.exit(1)
+    print("\n=== All tests passed ===")
 
 
 if __name__ == "__main__":

@@ -244,7 +244,7 @@ class ExpertOffloadEngine:
             self._router_inputs.append({
                 'step': self._current_step,
                 'layer': layer,
-                'hidden': router_input_buf[:n_tokens].half().cpu().numpy(),
+                'hidden': router_input_buf[:n_tokens].float().cpu().numpy(),
             })
 
         # Load missing experts (before stage4b graph replay)
@@ -414,7 +414,7 @@ class ExpertOffloadEngine:
             self._router_inputs.append({
                 'step': self._current_step,
                 'layer': layer,
-                'hidden': router_input_buf[:n_tokens].half().cpu().numpy(),
+                'hidden': router_input_buf[:n_tokens].float().cpu().numpy(),
             })
 
         # Step 4: identify what's still missing after pre-attn prefetch

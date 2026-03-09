@@ -4,21 +4,26 @@ Phase 1 of the trace construction pipeline: run each conversation through an
 MoE model one at a time, recording which experts are selected at each layer
 at each step. Produces one JSON trace file per conversation.
 
+Uses fixed 256-token prefill chunks: each chunk is a separate mixed_step()
+call, producing per-chunk expert routing (one trace step per chunk). This
+ensures identical chunk boundaries between collection and replay.
+
 Usage:
+    # Pipeline parallel (recommended for full Mixtral-8x7B):
+    python collect_traces.py \
+        --model ../models/Mixtral-8x7B-Instruct-v0.1 \
+        --dataset ../datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json \
+        --num-conversations 200 \
+        --pipeline-parallel 2 \
+        --max-output-tokens 4096 \
+        --output-dir ../datasets/ShareGPT_Vicuna/expert_traces/
+
     # Single GPU with offloading:
     python collect_traces.py \
         --model ../models/Mixtral-8x7B-Instruct-v0.1 \
         --dataset ../datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json \
         --num-conversations 200 \
         --experts-per-layer 2 \
-        --output-dir ../datasets/ShareGPT_Vicuna/expert_traces/
-
-    # Pipeline parallel (multi-GPU, no offloading):
-    python collect_traces.py \
-        --model ../models/Mixtral-8x7B-Instruct-v0.1 \
-        --dataset ../datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json \
-        --num-conversations 200 \
-        --pipeline-parallel 2 \
         --output-dir ../datasets/ShareGPT_Vicuna/expert_traces/
 """
 import argparse
@@ -39,6 +44,13 @@ from transformers import AutoTokenizer
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 import moe_engine as _moe_engine_mod  # noqa: F401
 from moe_engine import MoEEngine
+
+# Fixed prefill chunk size and max graph size.
+# All prefill is done in 256-token chunks (last chunk <= 256).
+# max_graph_size=512 leaves room for up to 256 decode tokens alongside
+# a 256-token prefill chunk in a single batch step.
+PREFILL_CHUNK_SIZE = 256
+MAX_GRAPH_SIZE = 512
 
 
 def load_sharegpt(path: str, num_conversations: int = None):
@@ -142,7 +154,8 @@ def main():
     # With PP, weights are split across GPUs (roughly evenly)
     weight_per_gpu = total_weight_bytes / max(pp_size, 1)
     # Reserve for graph buffers (~200MB per graph size per GPU) and overhead
-    graph_overhead = len([1, 128, 512, 2048, 4096]) * 200 * 1024**2
+    collection_graph_sizes = [1, 64, 128, 256]
+    graph_overhead = len(collection_graph_sizes) * 200 * 1024**2
     fixed_overhead = 2 * 1024**3  # 2 GB for CUDA context, activations, etc.
 
     gpu_total = torch.cuda.get_device_properties(0).total_memory
@@ -162,15 +175,17 @@ def main():
     print(f"KV cache: max_seq_len={max_seq_len} "
           f"(memory-derived limit: {max_seq_len_from_mem})")
 
-    # Create engine — use_torch_compile=False for exact routing decisions.
+    # Create engine — use_torch_compile=True for production-faithful routing.
+    # Compiled routing produces different expert access patterns than eager
+    # (inductor noise), but this reflects production deployment behavior.
     if args.pipeline_parallel > 1:
         print(f"Loading model (pipeline_parallel={args.pipeline_parallel})...")
         engine = MoEEngine(
             args.model,
-            max_batch_size=1,
+            max_seqs=1,
             max_seq_len=max_seq_len,
             pipeline_parallel_size=args.pipeline_parallel,
-            use_torch_compile=False,
+            use_torch_compile=True,
         )
         from trace_recorder import TraceRecorder
         recorder = TraceRecorder(
@@ -182,24 +197,24 @@ def main():
         print(f"Loading model (experts_per_layer={epl})...")
         engine = MoEEngine(
             args.model,
-            max_batch_size=1,
+            max_seqs=1,
             max_seq_len=max_seq_len,
             experts_per_layer=epl,
-            use_torch_compile=False,
+            use_torch_compile=True,
         )
         recorder = engine.offload_engine
         if args.record_router_inputs:
             recorder.record_router_inputs = True
 
-    # Capture CUDA graphs (piecewise, required for offload engine / PP path)
-    # 1 required for decode (single-token steps); rest cover prefill prompts.
-    # Fewer sizes = less graph pool memory, enabling larger max prompt.
-    # For batch replay later, add intermediate sizes (16, 32, etc).
-    graph_sizes = [1, 128, 512, 2048, 4096]
-    print(f"Capturing mixed CUDA graphs for sizes: {graph_sizes}")
+    # Capture CUDA graphs. For collection (single-sequence), we only need
+    # sizes to cover decode (1 token) and prefill chunks (up to 256 tokens).
+    # The full vllm_graph_sizes(512) is only needed for replay (multi-seq).
+    # Graph padding doesn't affect expert routing (recorder uses N_actual).
+    graph_sizes = [1, 64, 128, 256]
+    print(f"Capturing mixed CUDA graphs for {len(graph_sizes)} sizes "
+          f"(1 to {max(graph_sizes)})...")
     engine.capture_mixed_cuda_graphs(
         total_token_sizes=graph_sizes,
-        use_torch_compile=False,
     )
 
     # Auto-set max_prompt_tokens from KV cache capacity (chunked prefill
@@ -241,18 +256,47 @@ def main():
             continue
 
         input_ids = torch.tensor(tokens, dtype=torch.long, device=engine.device)
+        empty = torch.empty(0, dtype=torch.long, device=engine.device)
 
         # Reset engine state
         engine.reset()
         recorder.reset_trace()
 
-        # Prefill — uses chunked prefill for prompts exceeding max graph size
-        logits = engine.chunked_prefill_to_slot(0, input_ids)
-        next_token = logits[-1].argmax().unsqueeze(0)
+        # Prefill via fixed 256-token chunks. Each chunk is a separate
+        # mixed_step() call, producing one trace step per chunk with
+        # per-chunk expert routing.
+        S = input_ids.shape[0]
+        offset = 0
+        with torch.inference_mode():
+            while offset < S:
+                chunk_end = min(offset + PREFILL_CHUNK_SIZE, S)
+                chunk = input_ids[offset:chunk_end]
+                chunk_len = chunk.shape[0]
+
+                if offset == 0:
+                    logits = engine.mixed_step(
+                        decode_seq_ids=[],
+                        decode_token_ids=empty,
+                        prefill_seq_ids=[0],
+                        prefill_input_ids=[chunk],
+                    )
+                else:
+                    logits = engine.mixed_step(
+                        decode_seq_ids=[],
+                        decode_token_ids=empty,
+                        prefill_seq_ids=[],
+                        prefill_input_ids=[],
+                        continuation_seq_ids=[0],
+                        continuation_input_ids=[chunk],
+                        continuation_offsets=[offset],
+                    )
+                offset = chunk_end
+
+        next_token = logits[chunk_len - 1].argmax().unsqueeze(0)
 
         n_decoded = 0
         decode_limit = (max_seq_len - len(tokens)) if args.max_output_tokens < 0 else args.max_output_tokens
-        output_token_ids = []
+        output_token_ids = [next_token.item()]  # include first token from prefill
         for step in range(decode_limit):
             logits = engine.mixed_step(
                 decode_seq_ids=[0],
@@ -274,7 +318,9 @@ def main():
             "conversation_id": conv["id"],
             "model": model_name,
             "prompt_text": conv["text"],
+            "prompt_token_ids": tokens,
             "output_text": output_text,
+            "output_token_ids": output_token_ids,
             "prompt_tokens": len(tokens),
             "output_tokens": n_decoded,
             "num_layers": num_layers,

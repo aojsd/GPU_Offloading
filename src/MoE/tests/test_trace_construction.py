@@ -1,6 +1,10 @@
 """Tests for trace_construction/build_trace.py — continuous batching simulator.
 
 CPU-only tests using synthetic per-conversation traces. No GPU or model needed.
+
+Tests use the fixed-chunk prefill semantics: each prefill chunk is a separate
+trace step (matching collect_traces.py per-chunk expert routing), and convo_step
+advances per chunk.
 """
 import json
 import math
@@ -15,26 +19,33 @@ sys.path.insert(0, MOE_DIR)
 sys.path.insert(0, os.path.join(MOE_DIR, 'trace_construction'))
 
 from build_trace import (
-    ConversationTrace, simulate_batch, pages_needed, compute_memory_budget,
-    load_traces,
+    ConversationTrace, PREFILL_CHUNK_SIZE, simulate_batch, pages_needed,
+    compute_memory_budget, load_traces,
 )
-from data_movement_trace import ActivationTrace
+from gpu_replay_trace import ActivationTrace
 
 
 def make_convo_trace(conv_id, prompt_tokens, output_tokens,
-                     num_layers=4, num_experts=8, top_k=2):
-    """Create a synthetic ConversationTrace with deterministic expert selections."""
-    steps = []
-    # Step 0: prefill — use experts based on prompt length
-    prefill_experts = []
-    for layer in range(num_layers):
-        # Deterministic: hash-like selection
-        experts = [(prompt_tokens + layer * 3 + i) % num_experts
-                   for i in range(top_k)]
-        prefill_experts.append(sorted(set(experts)))
-    steps.append(prefill_experts)
+                     num_layers=4, num_experts=8, top_k=2,
+                     prefill_chunk_size=PREFILL_CHUNK_SIZE):
+    """Create a synthetic ConversationTrace with per-chunk prefill steps.
 
-    # Steps 1..output_tokens: decode
+    Matches the format produced by collect_traces.py: each 256-token prefill
+    chunk is a separate step with its own expert routing.
+    """
+    steps = []
+    num_prefill_chunks = math.ceil(prompt_tokens / prefill_chunk_size)
+
+    # Steps 0..K-1: prefill chunks (each with distinct experts)
+    for chunk_idx in range(num_prefill_chunks):
+        chunk_experts = []
+        for layer in range(num_layers):
+            experts = [(prompt_tokens + chunk_idx * 7 + layer * 3 + i) % num_experts
+                       for i in range(top_k)]
+            chunk_experts.append(sorted(set(experts)))
+        steps.append(chunk_experts)
+
+    # Steps K..K+N-1: decode
     for s in range(output_tokens):
         decode_experts = []
         for layer in range(num_layers):
@@ -100,36 +111,36 @@ class TestSimulateBatch(unittest.TestCase):
     """Test the continuous batching simulator."""
 
     def test_single_conversation(self):
-        """One conversation with plenty of budget should run without preemption."""
+        """One conversation with plenty of budget should run without issue."""
         trace = make_convo_trace("conv0", prompt_tokens=32, output_tokens=10)
         result = simulate_batch([trace], kv_page_budget=100, page_size=16)
 
-        self.assertEqual(result['statistics']['total_preemptions'], 0)
+        self.assertEqual(result['scheduling']['preemption_policy'], 'none')
         self.assertEqual(result['statistics']['peak_batch_size'], 1)
-        # 1 prefill + 10 decode = 11 steps
+        # ceil(32/256)=1 prefill + 10 decode = 11 steps
         self.assertEqual(result['statistics']['total_steps'], 11)
 
     def test_two_conversations_sequential(self):
-        """Two convos with budget for only one at a time → sequential execution."""
+        """Two convos with budget for only one at a time -> sequential."""
         traces = [
             make_convo_trace("c0", prompt_tokens=32, output_tokens=5),
             make_convo_trace("c1", prompt_tokens=32, output_tokens=5),
         ]
-        # Budget for only 1 sequence (2 pages for 32 tokens)
-        result = simulate_batch(traces, kv_page_budget=2, page_size=16)
+        # Full sequence pages: ceil((32+5)/16) = 3 pages each.
+        # Budget for only 1 sequence at a time.
+        result = simulate_batch(traces, kv_page_budget=3, page_size=16)
 
         self.assertEqual(result['statistics']['peak_batch_size'], 1)
         # Each conv: 1 prefill + 5 decode = 6 steps. Sequential = 12.
         self.assertEqual(result['statistics']['total_steps'], 12)
-        self.assertEqual(result['statistics']['total_preemptions'], 0)
 
     def test_two_conversations_concurrent(self):
-        """Two convos with enough budget → concurrent execution."""
+        """Two convos with enough budget -> concurrent execution."""
         traces = [
             make_convo_trace("c0", prompt_tokens=16, output_tokens=5),
             make_convo_trace("c1", prompt_tokens=16, output_tokens=5),
         ]
-        # Budget for 2 sequences (1 page each for 16 tokens, growing to ~21 = 2 pages)
+        # Full sequence: ceil((16+5)/16) = 2 pages each. Need 4 for both.
         result = simulate_batch(traces, kv_page_budget=10, page_size=16)
 
         self.assertEqual(result['statistics']['peak_batch_size'], 2)
@@ -151,68 +162,35 @@ class TestSimulateBatch(unittest.TestCase):
         at = ActivationTrace.from_flat_trace(result)
         for step_idx in range(len(at.steps)):
             for layer_idx in range(at.num_layers):
-                # Union should have >= each individual trace's experts
                 combined = set(at.steps[step_idx][layer_idx])
                 s0 = set(t0.steps[step_idx][layer_idx]) if step_idx < len(t0.steps) else set()
                 s1 = set(t1.steps[step_idx][layer_idx]) if step_idx < len(t1.steps) else set()
-                self.assertTrue(combined >= s0,
-                                f"Step {step_idx} layer {layer_idx}: "
-                                f"combined {combined} missing {s0 - combined}")
+                self.assertTrue(combined >= s0)
                 self.assertTrue(combined >= s1)
 
-    def test_lifo_preemption_order(self):
-        """LIFO: most recently admitted request is evicted first."""
-        traces = [
-            make_convo_trace("c0", prompt_tokens=32, output_tokens=20),
-            make_convo_trace("c1", prompt_tokens=32, output_tokens=20),
-            make_convo_trace("c2", prompt_tokens=32, output_tokens=20),
-        ]
-        # Budget for 2 sequences only: each prompt = 32 tokens = 2 pages,
-        # so budget=4 pages fits exactly 2 prompts (2+2=4). c2 must wait.
-        result = simulate_batch(traces, kv_page_budget=4, page_size=16)
-
-        self.assertLessEqual(result['statistics']['peak_batch_size'], 2)
-        # c0+c1 concurrent (21 steps), then c2 alone (21 steps) = at least 21
-        self.assertGreater(result['statistics']['total_steps'], 21)
-
-    def test_lifo_preemption_and_readmission(self):
-        """Preempted requests come back when space frees."""
-        # c0: short prompt, long decode
-        # c1: short prompt, long decode
-        # c2: large prompt that forces preemption of c1
-        traces = [
-            make_convo_trace("c0", prompt_tokens=16, output_tokens=5),
-            make_convo_trace("c1", prompt_tokens=16, output_tokens=5),
-            make_convo_trace("c2", prompt_tokens=48, output_tokens=5),
-        ]
-        # Budget: 4 pages. c0(1 page) + c1(1 page) fits.
-        # c2(3 pages) won't fit with c0+c1. Must wait.
-        # After c0 finishes at step 6, c2 can't fit yet (c1 ~21 tokens = 2 pages + c2 48 = 3+2=5 > 4)
-        # After c1 finishes, c2 admitted.
-        result = simulate_batch(traces, kv_page_budget=4, page_size=16)
-
-        # All conversations should complete
-        total_decode = 5 + 5 + 5
-        # At minimum, total_steps >= max single conversation steps
-        self.assertGreaterEqual(result['statistics']['total_steps'], 6)
-
-    def test_preemption_during_decode(self):
-        """When sequences grow past budget during decode, preemption occurs."""
-        # Two sequences, each starts at 16 tokens (1 page)
-        # Budget = 3 pages. Both fit initially (2 pages).
-        # After 16 decode steps, each is at 32 tokens (2 pages each = 4 > 3)
-        # → preemption should occur
+    def test_full_sequence_preallocation(self):
+        """Pages are pre-allocated for full sequence (prompt + output)."""
         traces = [
             make_convo_trace("c0", prompt_tokens=16, output_tokens=30),
             make_convo_trace("c1", prompt_tokens=16, output_tokens=30),
         ]
-        result = simulate_batch(traces, kv_page_budget=3, page_size=16)
+        # Full sequence: ceil((16+30)/16) = 3 pages each.
+        # Budget = 5: only fits one at a time (3+3=6 > 5).
+        result = simulate_batch(traces, kv_page_budget=5, page_size=16)
+        self.assertEqual(result['statistics']['peak_batch_size'], 1)
+        self.assertEqual(result['scheduling']['preemption_policy'], 'none')
+        self.assertEqual(result['scheduling']['page_allocation'], 'full_sequence')
 
-        # Should eventually preempt
-        self.assertGreater(result['statistics']['total_preemptions'], 0)
-        # Both should still complete
-        self.assertEqual(result['statistics']['total_steps'],
-                         result['statistics']['total_steps'])  # sanity
+    def test_no_preemption_with_full_preallocation(self):
+        """With full sequence pre-allocation, no preemptions should occur."""
+        traces = [
+            make_convo_trace("c0", prompt_tokens=16, output_tokens=30),
+            make_convo_trace("c1", prompt_tokens=16, output_tokens=30),
+        ]
+        result = simulate_batch(traces, kv_page_budget=6, page_size=16)
+        preemptions = sum(1 for e in result['scheduling_events']
+                         if e['event'] == 'preempt')
+        self.assertEqual(preemptions, 0)
 
     def test_empty_traces_raises(self):
         with self.assertRaises(ValueError):
@@ -232,32 +210,255 @@ class TestSimulateBatch(unittest.TestCase):
         self.assertGreater(at.num_steps(), 0)
 
     def test_deterministic(self):
-        """Same inputs → same output."""
+        """Same inputs -> same output."""
         traces = [make_convo_trace(f"c{i}", 32, 10) for i in range(5)]
-        r1 = simulate_batch(traces, kv_page_budget=20, page_size=16)
-        r2 = simulate_batch(traces, kv_page_budget=20, page_size=16)
+        r1 = simulate_batch(traces, kv_page_budget=200, page_size=16)
+        r2 = simulate_batch(traces, kv_page_budget=200, page_size=16)
         self.assertEqual(r1['trace'], r2['trace'])
         self.assertEqual(r1['statistics'], r2['statistics'])
 
     def test_batch_size_matches_target(self):
-        """With many short requests and large budget, avg batch size ≈ target."""
+        """With many short requests and large budget, avg batch size is reasonable."""
         traces = [make_convo_trace(f"c{i}", 16, 20) for i in range(50)]
-        # Budget for ~10 sequences: 10 * ceil(36/16) = 10*3 = 30 pages
+        # Full seq: ceil((16+20)/16) = 3 pages each. Budget for ~10: 30 pages.
         result = simulate_batch(traces, kv_page_budget=30, page_size=16)
 
         avg_bs = result['statistics']['avg_batch_size']
-        # Should be close to 10 (within reason, given varying seq lengths)
         self.assertGreater(avg_bs, 5)
         self.assertLessEqual(avg_bs, 15)
 
     def test_prefill_seq_len_accounting(self):
-        """After prefill, seq_len should equal prompt_tokens."""
+        """Peak pages should reflect full sequence pre-allocation."""
         trace = make_convo_trace("c0", prompt_tokens=48, output_tokens=5)
         result = simulate_batch([trace], kv_page_budget=100, page_size=16)
-        # Should have pages for 48 tokens after step 0 = 3 pages
-        # Then 49, 50, ... tokens for subsequent steps
+        # Full sequence: ceil((48+5)/16) = 4 pages
         self.assertEqual(result['statistics']['peak_pages_used'],
                          pages_needed(48 + 5, 16))
+
+    def test_all_requests_complete(self):
+        """All requests should complete."""
+        traces = [make_convo_trace(f"c{i}", 32, 10) for i in range(10)]
+        result = simulate_batch(traces, kv_page_budget=100, page_size=16)
+        completed = sum(1 for e in result['scheduling_events']
+                       if e['event'] == 'complete')
+        self.assertEqual(completed, 10)
+
+
+class TestFixedChunkPrefill(unittest.TestCase):
+    """Test fixed-size chunked prefill (256-token chunks)."""
+
+    def test_max_graph_size_is_token_budget(self):
+        """Total tokens per step should not exceed max_graph_size."""
+        # Use small chunk size for testing
+        traces = [make_convo_trace(f"c{i}", 64, 10, prefill_chunk_size=16)
+                  for i in range(5)]
+        result = simulate_batch(
+            traces, kv_page_budget=1000, page_size=16,
+            max_graph_size=32, prefill_chunk_size=16,
+        )
+        for ss in result['step_scheduling']:
+            self.assertLessEqual(ss['total_tokens'], 32,
+                                 f"Step {ss['step']}: total_tokens={ss['total_tokens']} > 32")
+
+    def test_fixed_chunk_size_creates_continuations(self):
+        """Prompts larger than chunk size produce continuation chunks."""
+        # 512-token prompt with 256-token chunks = 2 chunks
+        traces = [make_convo_trace("c0", prompt_tokens=512, output_tokens=5)]
+        result = simulate_batch(
+            traces, kv_page_budget=1000, page_size=16,
+            max_graph_size=512,
+        )
+        has_continuation = any(
+            ar['is_continuation']
+            for ss in result['step_scheduling']
+            for ar in ss['active_requests']
+        )
+        self.assertTrue(has_continuation,
+                        "Expected continuation chunks for 512-token prompt")
+
+    def test_convo_step_advances_per_chunk(self):
+        """convo_step should advance by 1 for each prefill chunk.
+
+        Each chunk uses its own trace step's expert routing (per-chunk
+        routing from collect_traces.py).
+        """
+        # 600-token prompt: 3 chunks (256, 256, 88)
+        traces = [make_convo_trace("c0", prompt_tokens=600, output_tokens=5)]
+        result = simulate_batch(
+            traces, kv_page_budget=1000, page_size=16,
+            max_graph_size=512,
+        )
+        at = ActivationTrace.from_flat_trace(result)
+
+        # Each prefill step should use a different convo_step's experts
+        prefill_step_experts = []
+        for step_idx, ss in enumerate(result['step_scheduling']):
+            for ar in ss['active_requests']:
+                if ar['is_prefill']:
+                    prefill_step_experts.append(
+                        [sorted(at.steps[step_idx][l]) for l in range(at.num_layers)]
+                    )
+
+        # Should have 3 prefill steps with per-chunk expert routing
+        self.assertEqual(len(prefill_step_experts), 3)
+        # Each should match the corresponding chunk's trace step
+        for chunk_idx, experts in enumerate(prefill_step_experts):
+            expected = [sorted(traces[0].steps[chunk_idx][l])
+                       for l in range(traces[0].num_layers)]
+            self.assertEqual(experts, expected,
+                             f"Chunk {chunk_idx}: expert routing mismatch")
+
+    def test_chunk_sizes_are_fixed(self):
+        """Chunk sizes should be exactly prefill_chunk_size (except last)."""
+        # 600-token prompt: chunks should be 256, 256, 88
+        traces = [make_convo_trace("c0", prompt_tokens=600, output_tokens=5)]
+        result = simulate_batch(
+            traces, kv_page_budget=1000, page_size=16,
+            max_graph_size=512,
+        )
+        chunks = []
+        for ss in result['step_scheduling']:
+            for ar in ss['active_requests']:
+                if ar['is_prefill']:
+                    chunks.append(ar['prefill_chunk_length'])
+
+        self.assertEqual(chunks, [256, 256, 88],
+                         f"Expected [256, 256, 88], got {chunks}")
+
+    def test_force_admit_correctness(self):
+        """force_admit should start with num_computed_tokens=0 and complete."""
+        traces = [make_convo_trace("c0", prompt_tokens=256, output_tokens=50)]
+        # Budget = 1 page (way too small for ceil((256+50)/16) = 20 pages)
+        result = simulate_batch(traces, kv_page_budget=1, page_size=16)
+
+        force_admits = [e for e in result['scheduling_events']
+                       if e['event'] == 'force_admit']
+        self.assertEqual(len(force_admits), 1)
+        completed = [e for e in result['scheduling_events']
+                    if e['event'] == 'complete']
+        self.assertEqual(len(completed), 1)
+
+    def test_continuation_offsets_sequential(self):
+        """Continuation chunk offsets should be sequential with fixed sizes."""
+        # Use small chunks for clearer testing
+        traces = [make_convo_trace("c0", prompt_tokens=100, output_tokens=5,
+                                   prefill_chunk_size=32)]
+        result = simulate_batch(
+            traces, kv_page_budget=1000, page_size=16,
+            max_graph_size=512, prefill_chunk_size=32,
+        )
+        offsets = []
+        for ss in result['step_scheduling']:
+            for ar in ss['active_requests']:
+                if ar['is_prefill']:
+                    offsets.append((ar['prefill_chunk_start'],
+                                   ar['prefill_chunk_length']))
+
+        # Verify offsets are contiguous with fixed chunk sizes
+        expected_start = 0
+        for start, length in offsets:
+            self.assertEqual(start, expected_start)
+            expected_start += length
+        self.assertEqual(expected_start, 100)
+
+        # All chunks except last should be exactly 32
+        for _, length in offsets[:-1]:
+            self.assertEqual(length, 32)
+        # Last chunk is remainder
+        self.assertEqual(offsets[-1][1], 100 % 32)
+
+    def test_max_graph_size_caps_tokens(self):
+        """max_graph_size should cap total tokens per step."""
+        traces = [
+            make_convo_trace("c0", prompt_tokens=16, output_tokens=5),
+            make_convo_trace("c1", prompt_tokens=512, output_tokens=5),
+        ]
+        result = simulate_batch(
+            traces, kv_page_budget=1000, page_size=16,
+            max_graph_size=512,
+        )
+        for ss in result['step_scheduling']:
+            self.assertLessEqual(ss['total_tokens'], 512)
+
+    def test_decode_interleaved_with_prefill_chunks(self):
+        """Decode tokens should share budget with prefill chunks."""
+        traces = [
+            make_convo_trace("c0", prompt_tokens=16, output_tokens=20),
+            make_convo_trace("c1", prompt_tokens=600, output_tokens=5),
+        ]
+        result = simulate_batch(
+            traces, kv_page_budget=1000, page_size=16,
+            max_graph_size=512,
+        )
+        mixed_steps = 0
+        for ss in result['step_scheduling']:
+            has_decode = any(not ar['is_prefill'] for ar in ss['active_requests'])
+            has_prefill = any(ar['is_prefill'] for ar in ss['active_requests'])
+            if has_decode and has_prefill:
+                mixed_steps += 1
+        self.assertGreater(mixed_steps, 0,
+                           "Expected mixed decode+prefill steps")
+
+    def test_no_token_budget_backward_compat(self):
+        """Without max_graph_size, prefills fit in one chunk (prompt<=256)."""
+        traces = [make_convo_trace(f"c{i}", 32, 10) for i in range(3)]
+        result = simulate_batch(traces, kv_page_budget=100, page_size=16)
+        # All prefills with prompt<=256 should complete in one step
+        for ss in result['step_scheduling']:
+            for ar in ss['active_requests']:
+                if ar['is_prefill']:
+                    self.assertFalse(ar['is_continuation'])
+
+    def test_total_steps_with_chunked_prefill(self):
+        """Total steps should account for per-chunk prefill steps."""
+        # 600-token prompt: 3 prefill chunks + 5 decode = 8 steps
+        traces = [make_convo_trace("c0", prompt_tokens=600, output_tokens=5)]
+        result = simulate_batch(
+            traces, kv_page_budget=1000, page_size=16,
+            max_graph_size=512,
+        )
+        self.assertEqual(result['statistics']['total_steps'], 8)
+
+    def test_scheduling_metadata_has_prefill_chunk_size(self):
+        """Scheduling metadata should include prefill_chunk_size."""
+        traces = [make_convo_trace("c0", prompt_tokens=32, output_tokens=5)]
+        result = simulate_batch(traces, kv_page_budget=100, page_size=16)
+        self.assertEqual(result['scheduling']['prefill_chunk_size'],
+                         PREFILL_CHUNK_SIZE)
+
+
+class TestSchedulingMetadata(unittest.TestCase):
+    """Test per-step scheduling metadata for replay."""
+
+    def test_step_scheduling_present(self):
+        traces = [make_convo_trace("c0", prompt_tokens=16, output_tokens=5)]
+        result = simulate_batch(traces, kv_page_budget=100, page_size=16)
+        self.assertIn('step_scheduling', result)
+        self.assertEqual(len(result['step_scheduling']),
+                         result['statistics']['total_steps'])
+
+    def test_active_requests_fields(self):
+        traces = [make_convo_trace("c0", prompt_tokens=600, output_tokens=5)]
+        result = simulate_batch(
+            traces, kv_page_budget=100, page_size=16,
+            max_graph_size=512,
+        )
+        for ss in result['step_scheduling']:
+            for ar in ss['active_requests']:
+                self.assertIn('request_id', ar)
+                self.assertIn('is_prefill', ar)
+                self.assertIn('prefill_chunk_start', ar)
+                self.assertIn('prefill_chunk_length', ar)
+                self.assertIn('is_continuation', ar)
+
+    def test_admit_events_for_all_requests(self):
+        traces = [make_convo_trace(f"c{i}", 16, 5) for i in range(5)]
+        result = simulate_batch(traces, kv_page_budget=1000, page_size=16)
+        admitted = set()
+        for e in result['scheduling_events']:
+            if e['event'] in ('admit', 'force_admit'):
+                admitted.add(e['request_id'])
+        self.assertEqual(admitted, set(range(5)))
 
 
 class TestConversationTraceIO(unittest.TestCase):
@@ -341,22 +542,16 @@ class TestMemoryBudget(unittest.TestCase):
         try:
             budget = compute_memory_budget(config_path, peak_pages=100,
                                            page_size=16, gpu_memory_gb=80)
-            # Per-expert: (2*1024*2048 + 2048*1024) * 2 = (4M + 2M) * 2 = 12 MB
             self.assertAlmostEqual(budget['per_expert_mb'],
                                    6291456 * 2 / 1024**2, places=0)
-            # KV per page per layer: 16 * 2 * 16 * 128 * 2 = 131072 bytes
             self.assertEqual(budget['kv_cache_bytes'],
                              100 * 131072 * 16)
-            # Cache size should be positive (OLMoE experts are small, ~12 MB each,
-            # so on 80 GB GPU we can fit far more than the total 16*64=1024)
             self.assertGreater(budget['expert_cache_size'], 0)
         finally:
             os.unlink(config_path)
 
     def test_kv_budget_scales_with_pages(self):
-        """More pages → more KV memory → fewer expert cache slots."""
-        # Use Mixtral-like config where experts are large (~336 MB each)
-        # so the cap at total_experts doesn't mask the scaling
+        """More pages -> more KV memory -> fewer expert cache slots."""
         with tempfile.NamedTemporaryFile(suffix='.json', mode='w',
                                          delete=False) as f:
             json.dump({
@@ -382,14 +577,29 @@ class TestMemoryBudget(unittest.TestCase):
 
 
 class TestEndToEnd(unittest.TestCase):
-    """Integration: simulate → load as ActivationTrace → run policy."""
+    """Integration: simulate -> load as ActivationTrace -> run policy."""
 
     def test_simulate_then_policy(self):
         """Batched trace should work with policy simulators."""
         from policy_simulator import LRU, NoPrefetch, simulate
 
         traces = [make_convo_trace(f"c{i}", 16, 10) for i in range(5)]
-        result = simulate_batch(traces, kv_page_budget=20, page_size=16)
+        result = simulate_batch(traces, kv_page_budget=200, page_size=16)
+
+        at = ActivationTrace.from_flat_trace(result)
+        dm = simulate(LRU(), NoPrefetch(), at, cache_size=16)
+        errors = dm.validate()
+        self.assertEqual(len(errors), 0, f"Validation errors: {errors}")
+
+    def test_simulate_chunked_then_policy(self):
+        """Chunked prefill trace should also work with policy simulators."""
+        from policy_simulator import LRU, NoPrefetch, simulate
+
+        traces = [make_convo_trace(f"c{i}", 600, 10) for i in range(5)]
+        result = simulate_batch(
+            traces, kv_page_budget=2000, page_size=16,
+            max_graph_size=512,
+        )
 
         at = ActivationTrace.from_flat_trace(result)
         dm = simulate(LRU(), NoPrefetch(), at, cache_size=16)

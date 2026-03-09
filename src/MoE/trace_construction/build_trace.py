@@ -2,7 +2,9 @@
 
 Phase 2 of the trace construction pipeline: simulate continuous batching
 offline (CPU-only) to produce a batched trace representing multiple concurrent
-requests. Supports block-based KV accounting and LIFO preemption.
+requests. Uses fixed 256-token prefill chunks, max_graph_size=512 as the
+single token budget, block-based KV accounting, and no-preemption page
+pre-allocation.
 
 Two modes:
   1. Memory-first (recommended): fix expert cache fraction, maximize KV usage.
@@ -10,7 +12,7 @@ Two modes:
          --input-dir traces/mixtral-8x7b \
          --model-config models/Mixtral-8x7B/config.json \
          --cache-fraction 0.5 \
-         --output traces/mixtral-8x7b/batched_cache50pct.json
+         --output traces/mixtral-8x7b/cache50pct/batched.json
 
   2. Legacy: target a batch size or explicit KV page budget.
      python build_trace.py \
@@ -32,6 +34,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 MOE_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(MOE_DIR))
 
+# Fixed prefill chunk size — must match collect_traces.py and batched_replay.py.
+# All prefill is done in 256-token chunks (last chunk <= 256).
+PREFILL_CHUNK_SIZE = 256
+
 
 # ---------------------------------------------------------------------------
 # Per-conversation trace loading
@@ -48,6 +54,8 @@ class ConversationTrace:
     top_k: int
     # steps[step_idx][layer_idx] = list of expert_ids
     steps: list  # list[list[list[int]]]
+    prompt_token_ids: list = None   # token IDs for replay (avoids re-tokenization)
+    output_token_ids: list = None   # generated token IDs from trace collection
 
     @staticmethod
     def load(path: str) -> 'ConversationTrace':
@@ -74,6 +82,8 @@ class ConversationTrace:
             num_experts=num_experts,
             top_k=data.get('top_k', 2),
             steps=steps,
+            prompt_token_ids=data.get('prompt_token_ids'),
+            output_token_ids=data.get('output_token_ids'),
         )
 
 
@@ -110,7 +120,7 @@ def load_traces(input_dir: str) -> tuple[list[ConversationTrace], dict]:
 
 
 # ---------------------------------------------------------------------------
-# Continuous batching simulator
+# Continuous batching simulator with scheduled chunked prefill
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -120,8 +130,13 @@ class ActiveRequest:
     trace_idx: int = 0              # index in original traces list
     convo_step: int = 0             # current step in per-conversation trace
     seq_len: int = 0                # current KV cache length in tokens
-    needs_prefill: bool = True      # first step after admission
-    admission_order: int = 0        # for LIFO victim selection
+    num_computed_tokens: int = 0    # prefill progress (0 = not started)
+    needs_prefill: bool = True      # True until all prompt tokens computed
+    admission_order: int = 0        # for LIFO victim selection (safety net)
+    # Set during scheduling for this step:
+    scheduled_chunk: int = 0        # tokens scheduled this step (prefill chunk or 1 for decode)
+    prefill_chunk_start: int = 0    # offset into prompt for this chunk
+    is_continuation: bool = False   # True if prefill_chunk_start > 0
 
 
 def pages_needed(seq_len: int, page_size: int) -> int:
@@ -131,27 +146,43 @@ def pages_needed(seq_len: int, page_size: int) -> int:
     return math.ceil(seq_len / page_size)
 
 
-def total_pages(running: list[ActiveRequest], page_size: int) -> int:
-    """Total KV pages across all running requests."""
-    return sum(pages_needed(r.seq_len, page_size) for r in running)
+def _total_preallocated(running: list[ActiveRequest], page_size: int) -> int:
+    """Total pre-allocated pages for all running requests."""
+    return sum(
+        pages_needed(r.trace.prompt_tokens + r.trace.output_tokens, page_size)
+        for r in running
+    )
 
 
 def simulate_batch(
     traces: list[ConversationTrace],
     kv_page_budget: int,
     page_size: int = 16,
-    max_batch_size: int = None,
+    max_seqs: int = None,
+    max_graph_size: int = None,
+    prefill_chunk_size: int = PREFILL_CHUNK_SIZE,
+    original_indices: list[int] = None,
 ) -> dict:
-    """Simulate continuous batching with LIFO preemption.
+    """Simulate continuous batching with fixed-size chunked prefill.
 
-    All requests arrive at t=0 in FCFS order (list order).
+    Uses no-preemption policy: pages for the full sequence (prompt + output)
+    are pre-allocated at admission time. Since output_tokens is known from
+    the trace, this eliminates preemption entirely.
+
+    Prefill uses fixed chunk sizes (default 256 tokens, last chunk <= 256).
+    Each chunk maps to one convo_step in the per-conversation trace, matching
+    how collect_traces.py records per-chunk expert routing. The token budget
+    is max_graph_size (default 512), which is the single cap on total tokens
+    per step (decode + prefill).
 
     Args:
         traces: Per-conversation traces.
         kv_page_budget: Maximum total KV cache pages across all sequences.
         page_size: Tokens per KV page.
-        max_batch_size: Hard cap on concurrent requests. None = no cap
-            (only KV budget limits concurrency).
+        max_seqs: Hard cap on concurrent requests. None = no cap.
+        max_graph_size: Max total tokens that fit in a captured CUDA graph.
+            This is the single token budget per step.
+        prefill_chunk_size: Fixed prefill chunk size (default 256).
 
     Returns:
         Dict with keys: num_layers, num_experts, trace (flat format),
@@ -164,24 +195,27 @@ def simulate_batch(
     num_experts = traces[0].num_experts
 
     waiting = deque(range(len(traces)))  # indices into traces
+    # Map local index -> original manifest index (identity when not filtered)
+    _idx_map = original_indices if original_indices is not None else list(range(len(traces)))
     running: list[ActiveRequest] = []
-    swapped: list[ActiveRequest] = []    # LIFO stack
 
     admit_counter = 0
     batched_steps = []    # list of list[list[int]]: steps[t][layer] = [expert_ids]
     batch_sizes = []
-    total_preemptions = 0
     peak_pages = 0
-    scheduling_events = []  # supplementary preemption/readmission log
+    budget_warned = False
+    scheduling_events = []  # supplementary event log
     step_scheduling = []     # per-step metadata for replay
 
-    while waiting or running or swapped:
+    # Effective per-step token cap — max_graph_size is the single budget
+    token_cap = max_graph_size if max_graph_size is not None else float('inf')
+
+    while waiting or running:
         step_idx = len(batched_steps)
         step_events = []
 
-        # 1. Complete: remove requests that have finished all decode steps
-        #    A request at convo_step S has processed steps 0..S-1.
-        #    Total steps in trace = 1 (prefill) + output_tokens (decode).
+        # 1. Complete: remove requests that have finished all decode steps.
+        #    A request is complete when convo_step >= len(trace.steps).
         still_running = []
         for req in running:
             total_steps = len(req.trace.steps)
@@ -198,48 +232,108 @@ def simulate_batch(
                 still_running.append(req)
         running = still_running
 
-        # 2. Re-admit from swap stack (LIFO: most recently swapped first)
-        while swapped:
-            candidate = swapped[-1]
-            candidate_pages = pages_needed(candidate.seq_len, page_size)
-            if total_pages(running, page_size) + candidate_pages <= kv_page_budget:
-                swapped.pop()
-                running.append(candidate)
-                evt = {
-                    'step': step_idx,
-                    'event': 'readmit',
-                    'request_id': candidate.trace_idx,
-                    'conversation_id': candidate.trace.conversation_id,
-                }
-                scheduling_events.append(evt)
-                step_events.append(evt)
-            else:
-                break
+        # 2. Schedule running requests and compute token budget.
+        #    Decodes cost 1 token each. Prefill chunks are fixed-size (256).
+        token_budget = token_cap if token_cap != float('inf') else float('inf')
 
-        # 3. Admit new requests from waiting queue (FCFS)
+        # First pass: count decode tokens (fixed cost, always scheduled)
+        num_decode_tokens = sum(1 for r in running if not r.needs_prefill)
+        if token_budget != float('inf'):
+            token_budget -= num_decode_tokens
+            token_budget = max(token_budget, 0)
+
+        # Second pass: schedule continuing prefill chunks with fixed size.
+        # Each prefill chunk is exactly prefill_chunk_size (or remainder).
+        # Only schedule if the full chunk fits in the remaining budget.
+        for req in running:
+            if req.needs_prefill:
+                remaining_prompt = req.trace.prompt_tokens - req.num_computed_tokens
+                chunk = min(prefill_chunk_size, remaining_prompt)
+                if token_budget == float('inf') or token_budget >= chunk:
+                    if token_budget != float('inf'):
+                        token_budget -= chunk
+                    req.scheduled_chunk = chunk
+                    req.prefill_chunk_start = req.num_computed_tokens
+                    req.is_continuation = (req.num_computed_tokens > 0)
+                else:
+                    # Not enough budget for this prefill chunk — skip this step
+                    req.scheduled_chunk = 0
+                    req.prefill_chunk_start = req.num_computed_tokens
+                    req.is_continuation = (req.num_computed_tokens > 0)
+            else:
+                req.scheduled_chunk = 1
+                req.prefill_chunk_start = 0
+                req.is_continuation = False
+
+        # 3. Admit new requests from waiting queue (FIFO).
+        #    Pre-allocate pages for full sequence (prompt + output).
+        #    First prefill chunk is fixed-size (min(prefill_chunk_size, prompt)).
         while waiting:
-            if max_batch_size is not None and len(running) >= max_batch_size:
+            if max_seqs is not None and len(running) >= max_seqs:
                 break
             idx = waiting[0]
             trace = traces[idx]
-            prompt_pages = pages_needed(trace.prompt_tokens, page_size)
-            if total_pages(running, page_size) + prompt_pages <= kv_page_budget:
-                waiting.popleft()
+            full_pages = pages_needed(
+                trace.prompt_tokens + trace.output_tokens, page_size)
+            current_pages = _total_preallocated(running, page_size)
+            if current_pages + full_pages > kv_page_budget:
+                break
+
+            # First chunk is fixed-size
+            first_chunk = min(prefill_chunk_size, trace.prompt_tokens)
+            if token_budget != float('inf') and token_budget < first_chunk:
+                break
+
+            waiting.popleft()
+            if token_budget != float('inf'):
+                token_budget -= first_chunk
+
+            req = ActiveRequest(
+                trace=trace,
+                trace_idx=_idx_map[idx],
+                convo_step=0,
+                seq_len=0,
+                num_computed_tokens=0,
+                needs_prefill=True,
+                admission_order=admit_counter,
+                scheduled_chunk=first_chunk,
+                prefill_chunk_start=0,
+                is_continuation=False,
+            )
+            admit_counter += 1
+            running.append(req)
+            evt = {
+                'step': step_idx,
+                'event': 'admit',
+                'request_id': idx,
+                'conversation_id': trace.conversation_id,
+            }
+            scheduling_events.append(evt)
+            step_events.append(evt)
+
+        if not running:
+            if waiting:
+                # Force-admit: single request too large for KV budget
+                idx = waiting.popleft()
+                trace = traces[idx]
+                first_chunk = min(prefill_chunk_size, trace.prompt_tokens)
                 req = ActiveRequest(
                     trace=trace,
-                    trace_idx=idx,
+                    trace_idx=_idx_map[idx],
                     convo_step=0,
-                    # Set seq_len to prompt_tokens immediately so page
-                    # accounting is correct for subsequent admissions
-                    seq_len=trace.prompt_tokens,
+                    seq_len=0,
+                    num_computed_tokens=0,
                     needs_prefill=True,
                     admission_order=admit_counter,
+                    scheduled_chunk=first_chunk,
+                    prefill_chunk_start=0,
+                    is_continuation=False,
                 )
                 admit_counter += 1
                 running.append(req)
                 evt = {
                     'step': step_idx,
-                    'event': 'admit',
+                    'event': 'force_admit',
                     'request_id': idx,
                     'conversation_id': trace.conversation_id,
                 }
@@ -248,102 +342,72 @@ def simulate_batch(
             else:
                 break
 
-        if not running:
-            # Deadlock check: if swapped requests exist but none can fit,
-            # we have a problem (single request too large for budget)
-            if swapped:
-                # Force-admit the top of swap stack anyway
-                req = swapped.pop()
-                running.append(req)
-                evt = {
-                    'step': step_idx,
-                    'event': 'force_readmit',
-                    'request_id': req.trace_idx,
-                    'conversation_id': req.trace.conversation_id,
-                }
-                scheduling_events.append(evt)
-                step_events.append(evt)
-            elif waiting:
-                # Force-admit the next waiting request
-                idx = waiting.popleft()
-                req = ActiveRequest(
-                    trace=traces[idx],
-                    trace_idx=idx,
-                    convo_step=0,
-                    seq_len=0,
-                    needs_prefill=True,
-                    admission_order=admit_counter,
-                )
-                admit_counter += 1
-                running.append(req)
-                evt = {
-                    'step': step_idx,
-                    'event': 'force_admit',
-                    'request_id': idx,
-                    'conversation_id': traces[idx].conversation_id,
-                }
-                scheduling_events.append(evt)
-                step_events.append(evt)
-            else:
-                break
-
-        # 4. Record: union of all active requests' expert selections
+        # 4. Record: union of all scheduled requests' expert selections.
+        #    Each prefill chunk maps to its own convo_step (per-chunk routing
+        #    from collect_traces.py). Skip requests with scheduled_chunk=0.
         step_experts = [set() for _ in range(num_layers)]
         for req in running:
-            if req.convo_step < len(req.trace.steps):
+            if req.scheduled_chunk > 0 and req.convo_step < len(req.trace.steps):
                 for layer in range(num_layers):
                     experts = req.trace.steps[req.convo_step][layer]
                     step_experts[layer].update(experts)
 
         batched_steps.append([sorted(s) for s in step_experts])
-        batch_sizes.append(len(running))
+
+        # Only count scheduled requests (skip prefills with 0 budget)
+        scheduled = [r for r in running if r.scheduled_chunk > 0]
+        total_tokens_this_step = sum(r.scheduled_chunk for r in scheduled)
+        batch_sizes.append(len(scheduled))
 
         # Record per-step scheduling metadata for replay
         step_scheduling.append({
             'step': step_idx,
-            'batch_size': len(running),
+            'batch_size': len(scheduled),
+            'total_tokens': total_tokens_this_step,
             'active_requests': [
                 {
                     'request_id': req.trace_idx,
                     'conversation_id': req.trace.conversation_id,
                     'seq_len': req.seq_len,
                     'is_prefill': req.needs_prefill,
+                    'prefill_chunk_start': req.prefill_chunk_start,
+                    'prefill_chunk_length': req.scheduled_chunk if req.needs_prefill else 0,
+                    'is_continuation': req.is_continuation,
                 }
-                for req in running
+                for req in scheduled
             ],
             'events': step_events,
         })
 
-        # 5. Advance: move each request forward one step
+        # 5. Advance: update state based on scheduled tokens.
+        #    Each prefill chunk advances convo_step by 1 (per-chunk trace).
         for req in running:
             if req.needs_prefill:
-                # Prefill done (seq_len already set to prompt_tokens on admission)
-                req.needs_prefill = False
+                if req.scheduled_chunk > 0:
+                    req.num_computed_tokens += req.scheduled_chunk
+                    req.seq_len = req.num_computed_tokens
+                    req.convo_step += 1  # each chunk = one trace step
+                    if req.num_computed_tokens >= req.trace.prompt_tokens:
+                        req.needs_prefill = False
+                # else: skipped this step, no advance
             else:
-                # Decode adds one token
                 req.seq_len += 1
-            req.convo_step += 1
+                req.convo_step += 1
 
         # Track peak pages
-        current_pages = total_pages(running, page_size)
+        current_pages = _total_preallocated(running, page_size)
         peak_pages = max(peak_pages, current_pages)
 
-        # 6. Preempt: if over budget, evict most recently admitted (LIFO)
-        while total_pages(running, page_size) > kv_page_budget and len(running) > 1:
-            # Find most recently admitted
-            victim_idx = max(range(len(running)),
-                             key=lambda i: running[i].admission_order)
-            victim = running.pop(victim_idx)
-            swapped.append(victim)
-            total_preemptions += 1
-            evt = {
-                'step': step_idx,
-                'event': 'preempt',
-                'request_id': victim.trace_idx,
-                'conversation_id': victim.trace.conversation_id,
-            }
-            scheduling_events.append(evt)
-            step_events.append(evt)
+        # No preemption: pages are pre-allocated for the full sequence.
+        # Safety check: warn if we exceed budget (force_admit can cause
+        # this legitimately; otherwise indicates a bug).
+        if current_pages > kv_page_budget and not budget_warned:
+            import warnings
+            warnings.warn(
+                f"Step {step_idx}: page usage {current_pages} exceeds "
+                f"budget {kv_page_budget}. Expected only with force_admit."
+            )
+            budget_warned = True
 
     # Build flat trace format
     flat_trace = []
@@ -368,15 +432,17 @@ def simulate_batch(
         'scheduling': {
             'kv_page_budget': kv_page_budget,
             'page_size': page_size,
-            'max_batch_size': max_batch_size,
+            'max_seqs': max_seqs,
+            'max_graph_size': max_graph_size,
+            'prefill_chunk_size': prefill_chunk_size,
             'num_conversations': len(traces),
-            'preemption_policy': 'lifo',
+            'preemption_policy': 'none',
+            'page_allocation': 'full_sequence',
         },
         'scheduling_events': scheduling_events,
         'step_scheduling': step_scheduling,
         'statistics': {
             'total_steps': len(batched_steps),
-            'total_preemptions': total_preemptions,
             'peak_pages_used': peak_pages,
             **bs_stats,
         },
@@ -604,8 +670,13 @@ def main():
                         help="Explicit KV page budget (overrides other modes)")
 
     # Shared
-    parser.add_argument("--max-batch-size", type=int, default=128,
-                        help="Max concurrent sequences (default: 128, matches vLLM)")
+    parser.add_argument("--max-seqs", type=int, default=256,
+                        help="Max concurrent sequences (default: 256, matches vLLM)")
+    parser.add_argument("--max-graph-size", type=int, default=512,
+                        help="Max total tokens per step / CUDA graph "
+                             "(default: 512)")
+    parser.add_argument("--prefill-chunk-size", type=int, default=PREFILL_CHUNK_SIZE,
+                        help=f"Fixed prefill chunk size (default: {PREFILL_CHUNK_SIZE})")
 
     parser.add_argument("--indices", type=int, nargs='+', default=None,
                         help="Select specific conversation indices from manifest")
@@ -617,13 +688,17 @@ def main():
     if args.cache_fraction is not None and not args.model_config:
         parser.error("--cache-fraction requires --model-config")
 
+    max_graph_size = args.max_graph_size
+
     # Load traces
     print(f"Loading traces from {args.input_dir}")
     traces, manifest = load_traces(args.input_dir)
     print(f"Loaded {len(traces)} conversation traces")
 
     # Filter to selected indices if specified
+    original_indices = None
     if args.indices is not None:
+        original_indices = args.indices
         traces = [traces[i] for i in args.indices]
         print(f"Selected {len(traces)} conversations by index: {args.indices}")
 
@@ -632,7 +707,7 @@ def main():
         sys.exit(1)
 
     # Compute KV page budget based on mode
-    max_batch_size = args.max_batch_size
+    max_seqs = args.max_seqs
     memory_info = None
 
     if args.kv_page_budget is not None:
@@ -670,7 +745,7 @@ def main():
     else:
         # Legacy mode: target batch size
         target_bs = args.target_batch_size or 16
-        max_batch_size = target_bs
+        max_seqs = target_bs
         peak_lens = sorted(t.prompt_tokens + t.output_tokens for t in traces)
         max_actual = peak_lens[-1]
         seq_len_for_budget = min(max_actual, args.max_seq_len)
@@ -679,7 +754,9 @@ def main():
         print(f"Actual peak seq len: {max_actual} tokens "
               f"(median: {peak_lens[len(peak_lens)//2]})")
 
-    print(f"Max batch size: {max_batch_size}")
+    print(f"Max seqs: {max_seqs}")
+    print(f"Max graph size: {max_graph_size}")
+    print(f"Prefill chunk size: {args.prefill_chunk_size}")
     print(f"KV page budget: {kv_page_budget} pages "
           f"({kv_page_budget * args.page_size} tokens capacity)")
 
@@ -687,7 +764,11 @@ def main():
     print("\nRunning continuous batching simulation...")
     result = simulate_batch(
         traces, kv_page_budget, args.page_size,
-        max_batch_size=max_batch_size)
+        max_seqs=max_seqs,
+        max_graph_size=max_graph_size,
+        prefill_chunk_size=args.prefill_chunk_size,
+        original_indices=original_indices,
+    )
 
     # Attach memory info if available
     if memory_info:
@@ -712,16 +793,26 @@ def main():
           f"p75={stats['p75_batch_size']}, "
           f"max={stats['peak_batch_size']}")
     print(f"               IQR={stats['iqr_batch_size']}")
-    print(f"  Preemptions: {stats['total_preemptions']}")
     print(f"  Peak pages:  {stats['peak_pages_used']}")
+
+    # Count chunked prefill steps
+    chunked_steps = 0
+    for ss in result['step_scheduling']:
+        for ar in ss['active_requests']:
+            if ar['is_continuation']:
+                chunked_steps += 1
+                break
+    print(f"  Steps with continuations: {chunked_steps}")
 
     # Auto-generate output path if not specified
     if args.output is None:
         if args.cache_fraction is not None:
             pct = int(args.cache_fraction * 100)
-            output = os.path.join(args.input_dir, f"batched_cache{pct}pct.json")
-        elif max_batch_size is not None:
-            output = os.path.join(args.input_dir, f"batched_bs{max_batch_size}.json")
+            cache_dir = os.path.join(args.input_dir, f"cache{pct}pct")
+            os.makedirs(cache_dir, exist_ok=True)
+            output = os.path.join(cache_dir, "batched.json")
+        elif max_seqs is not None:
+            output = os.path.join(args.input_dir, f"batched_bs{max_seqs}.json")
         else:
             output = os.path.join(args.input_dir, "batched.json")
     else:

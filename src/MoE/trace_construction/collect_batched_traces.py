@@ -52,6 +52,29 @@ from scheduler import Scheduler                  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
+# Dataset loading
+# ---------------------------------------------------------------------------
+
+def load_sharegpt(path: str, num_conversations: int = None):
+    """Load ShareGPT conversations, extracting the first human turn."""
+    with open(path) as f:
+        data = json.load(f)
+    conversations = []
+    for item in data:
+        turns = item.get("conversations", [])
+        human_turns = [t for t in turns if t["from"] == "human"]
+        if not human_turns:
+            continue
+        conversations.append({
+            "id": item["id"],
+            "text": human_turns[0]["value"],
+        })
+        if num_conversations and len(conversations) >= num_conversations:
+            break
+    return conversations
+
+
+# ---------------------------------------------------------------------------
 # GPU integration — backward-compat wrapper
 # ---------------------------------------------------------------------------
 
@@ -243,8 +266,6 @@ def main():
     import moe_engine as _moe_engine_mod  # noqa: F401
     from moe_engine import MoEEngine
     from transformers import AutoTokenizer
-    from collect_traces import load_sharegpt
-
     page_size = 16
 
     # Read model config

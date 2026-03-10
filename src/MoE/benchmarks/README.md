@@ -67,5 +67,5 @@ python benchmarks/bench_offload_prefill_mixed.py --model models/Mixtral-8x7B
 
 ## Also see
 
-- [vLLM_comparison/](../vLLM_comparison/) — vLLM vs custom engine benchmarks (decode, prefill, mixed batch)
+- [vLLM_comparison/](../tests/vLLM_comparison/) — vLLM vs custom engine benchmarks (decode, prefill, mixed batch)
 - [profiling/](../profiling/) — Nsight Systems and per-phase kernel profiling

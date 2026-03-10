@@ -118,7 +118,7 @@ python tests/verify_unified_cache.py --skip-32L
 - [benchmarks/](../benchmarks/) — Performance benchmarks (kernel timing, e2e latency)
 - [profiling/](../profiling/) — Nsight Systems and per-phase kernel profiling
 - [scripts/](../scripts/) — Experiment runners
-- [vLLM_comparison/](../vLLM_comparison/) — Custom engine vs vLLM benchmarks
+- [vLLM_comparison/](vLLM_comparison/) — Custom engine vs vLLM benchmarks
 
 ## Models
 

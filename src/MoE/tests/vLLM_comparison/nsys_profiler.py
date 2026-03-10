@@ -4,10 +4,10 @@ Runs each (engine, seq_len) pair as a separate process under nsys.
 Outputs per-seq-len .prof files to profiling/<model_name>/.
 
 Usage:
-    python vLLM_comparison/nsys_profiler.py custom 128     # one run
-    python vLLM_comparison/nsys_profiler.py vllm 1024      # one run
-    python vLLM_comparison/nsys_profiler.py all             # all combos
-    python vLLM_comparison/nsys_profiler.py all --model path/to/model
+    python tests/vLLM_comparison/nsys_profiler.py custom 128     # one run
+    python tests/vLLM_comparison/nsys_profiler.py vllm 1024      # one run
+    python tests/vLLM_comparison/nsys_profiler.py all             # all combos
+    python tests/vLLM_comparison/nsys_profiler.py all --model path/to/model
 """
 
 import os
@@ -20,7 +20,7 @@ from pathlib import Path
 from collections import defaultdict
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-MOE_DIR = SCRIPT_DIR.parent
+MOE_DIR = SCRIPT_DIR.parent.parent
 DEFAULT_MODEL_DIR = str(MOE_DIR / "models" / "OLMoE-1B-7B")
 PROFILE_BASE = SCRIPT_DIR / "profiling"
 NSYS = os.path.expanduser("~/software/cuda-12.8/bin/nsys")

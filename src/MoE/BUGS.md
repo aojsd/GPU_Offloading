@@ -124,7 +124,7 @@ actual trace as warmup (untimed).
 ## Not in experiment pipeline (scripts 01-03)
 
 Bugs below affect files outside the scripts 01-03 dependency chain
-(`benchmarks/`, `profiling/`, `tests/`, `vLLM_comparison/`), or affect dormant
+(`benchmarks/`, `profiling/`, `tests/`, `tests/vLLM_comparison/`), or affect dormant
 code paths in pipeline files (unused CLI flags, unused functions).
 
 ### `bench_comprehensive.py`: All-resident baseline silently crashes
@@ -165,14 +165,14 @@ Mismatch only when `--indices` is passed. Normal pipeline does not use
 
 ### `accuracy_analysis.py`: Cross-prompt logit aggregation misalignment
 
-**File:** `vLLM_comparison/accuracy_analysis.py:722-737`
+**File:** `tests/vLLM_comparison/accuracy_analysis.py:722-737`
 
 Flat-list concatenation misaligns at prompt boundaries when engines produce
 different token counts.
 
 ### `batch_replay.py`: Trace classification assumes single-step prefill
 
-**File:** `vLLM_comparison/batch_replay.py:214-221`
+**File:** `tests/vLLM_comparison/batch_replay.py:214-221`
 
 Only first prefill chunk seen with chunked prefill. Harmless for current prompt
 lengths (64-256 tokens).
@@ -191,8 +191,8 @@ Only checks `dm.validate()` passes, never asserts actual eviction behavior.
 
 ### Benchmark fairness: vLLM comparison timing asymmetries
 
-**Files:** `vLLM_comparison/microbenchmark.py`, `vLLM_comparison/batch_replay.py`,
-`vLLM_comparison/accuracy_analysis.py`
+**Files:** `tests/vLLM_comparison/microbenchmark.py`, `tests/vLLM_comparison/batch_replay.py`,
+`tests/vLLM_comparison/accuracy_analysis.py`
 
 - CUDA events vs `time.perf_counter()` (systematically makes vLLM look slower)
 - Single vLLM measurement vs median-of-5 for custom engine
@@ -211,5 +211,5 @@ Only checks `dm.validate()` passes, never asserts actual eviction behavior.
 - `profile_phases.py`: hardcoded "20 steps, 5 warmup" in generated markdown
 - `trace_construction/README.md`: documents `max_seqs=128` but default is 256
 - `collect_batched_traces.py`: `output_tokens` vs `output_token_ids` off-by-one
-- `vLLM_comparison/README.md`: scripts table omits `accuracy_analysis.py`
+- `tests/vLLM_comparison/README.md`: scripts table omits `accuracy_analysis.py`
 - `run_all_policies.py`: comment says "3 dirnames" but does 2

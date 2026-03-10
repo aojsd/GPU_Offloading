@@ -13,8 +13,8 @@ run on H100 80GB with CUDA graphs + torch.compile unless otherwise noted.
 
 Regenerate profiles:
 ```bash
-python src/MoE/vLLM_comparison/nsys_profiler.py all      # decode
-python src/MoE/vLLM_comparison/nsys_profiler.py prefill   # prefill
+python src/MoE/tests/vLLM_comparison/nsys_profiler.py all      # decode
+python src/MoE/tests/vLLM_comparison/nsys_profiler.py prefill   # prefill
 ```
 
 ---

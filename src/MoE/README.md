@@ -151,8 +151,8 @@ Layer L (L > 0):
 
 ## Implementation Phases
 
-1. **Core Compute Engine** (complete): Custom MoE engine with CUDA graph + torch.compile, validated against vLLM on OLMoE-1B-7B and Mixtral-8x7B. See [vLLM_comparison/README.md](vLLM_comparison/README.md).
-2. **Mixed Batch Support** (complete): Mixed prefill+decode via `mixed_step()`, piecewise CUDA graphs (per-layer 4-stage decomposition). 80.4% token match vs vLLM without compile (expected BF16 divergence). See [vLLM_comparison/README.md](vLLM_comparison/README.md).
+1. **Core Compute Engine** (complete): Custom MoE engine with CUDA graph + torch.compile, validated against vLLM on OLMoE-1B-7B and Mixtral-8x7B. See [tests/vLLM_comparison/README.md](tests/vLLM_comparison/README.md).
+2. **Mixed Batch Support** (complete): Mixed prefill+decode via `mixed_step()`, piecewise CUDA graphs (per-layer 4-stage decomposition). 80.4% token match vs vLLM without compile (expected BF16 divergence). See [tests/vLLM_comparison/README.md](tests/vLLM_comparison/README.md).
 3. **Simulated Expert Offloading** (complete): Split stage 4 into 4a (router) + 4b (MoE) with CPU break. ExpertOffloadEngine demand-loads missing experts, records traces. Verified bit-identical + predicted latency = compute + IO. See [offload_1GPU.md](offload_1GPU.md).
 4. **Unified Expert Cache** (complete): Single `w1_buf[L*epl + scratchpad, 2*I, H]` buffer with per-layer views. Eliminated D2D copies (was 14.8 ms/step on 32L). Compute parity 36/36 checks passed. Latency model `wall = compute + IO` validated across 88 experiments. See [offload_1GPU.md](offload_1GPU.md).
 5. **Async Transfer & Prefetch** (complete): Two-stream architecture — transfer stream overlaps CPU→GPU copies with compute stream. Single CUDA event synchronization. See [replay.md](replay.md).
@@ -415,7 +415,7 @@ and GPU memory budget analysis.
 
 | Directory | README | Covers |
 |-----------|--------|--------|
-| [vLLM_comparison/](vLLM_comparison/) | [README.md](vLLM_comparison/README.md) | Decode, prefill, mixed batch benchmarks vs vLLM; profiling data; comparison methodology |
+| [tests/vLLM_comparison/](tests/vLLM_comparison/) | [README.md](tests/vLLM_comparison/README.md) | Decode, prefill, mixed batch benchmarks vs vLLM; profiling data; comparison methodology |
 | [tests/](tests/) | [README.md](tests/README.md) | Unit and correctness tests (pytest) |
 | [benchmarks/](benchmarks/) | [README.md](benchmarks/README.md) | Performance benchmarks: per-layer kernel timing, e2e prefill/mixed latency |
 | [profiling/](profiling/) | [README.md](profiling/README.md) | Nsight Systems and per-phase kernel profiling harnesses |
@@ -426,8 +426,8 @@ and GPU memory budget analysis.
 
 ```bash
 # Regenerate decode profiles
-python src/MoE/vLLM_comparison/nsys_profiler.py all
+python src/MoE/tests/vLLM_comparison/nsys_profiler.py all
 
 # Regenerate prefill profiles
-python src/MoE/vLLM_comparison/nsys_profiler.py prefill
+python src/MoE/tests/vLLM_comparison/nsys_profiler.py prefill
 ```

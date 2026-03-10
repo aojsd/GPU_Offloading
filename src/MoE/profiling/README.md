@@ -72,5 +72,5 @@ python profiling/profile_phases.py --measure-transfer
 
 ## Also see
 
-- [vLLM_comparison/](../vLLM_comparison/) — `nsys_profiler.py` for custom vs vLLM kernel profiling
+- [vLLM_comparison/](../tests/vLLM_comparison/) — `nsys_profiler.py` for custom vs vLLM kernel profiling
 - [benchmarks/](../benchmarks/) — Performance benchmarks (latency, throughput)

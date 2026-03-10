@@ -18,13 +18,13 @@ Industry standards for BF16 numerical equivalence:
 
 Usage:
     # Full three-way comparison (custom eager, custom compiled, vLLM):
-    VLLM_ENABLE_V1_MULTIPROCESSING=0 python vLLM_comparison/accuracy_analysis.py
+    VLLM_ENABLE_V1_MULTIPROCESSING=0 python tests/vLLM_comparison/accuracy_analysis.py
 
     # Skip vLLM (just eager vs compiled):
-    python vLLM_comparison/accuracy_analysis.py --skip-vllm
+    python tests/vLLM_comparison/accuracy_analysis.py --skip-vllm
 
     # Custom prompts, more tokens:
-    python vLLM_comparison/accuracy_analysis.py --max-new-tokens 100
+    python tests/vLLM_comparison/accuracy_analysis.py --max-new-tokens 100
 """
 import os
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -36,7 +36,7 @@ from functools import lru_cache
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-MOE_DIR = SCRIPT_DIR.parent
+MOE_DIR = SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(MOE_DIR))
 
 import torch

@@ -6,7 +6,7 @@ Then replays those exact batches on the custom MoE engine and compares latency
 and correctness.
 
 Usage:
-    VLLM_ENABLE_V1_MULTIPROCESSING=0 python vLLM_comparison/batch_replay.py
+    VLLM_ENABLE_V1_MULTIPROCESSING=0 python tests/vLLM_comparison/batch_replay.py
     ... --workload staggered       # specific workload
     ... --skip-custom              # trace vLLM only
     ... --skip-vllm                # replay from saved trace
@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-MOE_DIR = SCRIPT_DIR.parent
+MOE_DIR = SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(MOE_DIR))
 
 import torch

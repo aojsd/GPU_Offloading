@@ -8,11 +8,11 @@ Subcommands:
     all         Run all benchmarks
 
 Usage:
-    VLLM_ENABLE_V1_MULTIPROCESSING=0 python vLLM_comparison/microbenchmark.py decode
-    VLLM_ENABLE_V1_MULTIPROCESSING=0 python vLLM_comparison/microbenchmark.py prefill --skip-vllm
-    python vLLM_comparison/microbenchmark.py cuda-graph
-    python vLLM_comparison/microbenchmark.py mixed
-    python vLLM_comparison/microbenchmark.py all
+    VLLM_ENABLE_V1_MULTIPROCESSING=0 python tests/vLLM_comparison/microbenchmark.py decode
+    VLLM_ENABLE_V1_MULTIPROCESSING=0 python tests/vLLM_comparison/microbenchmark.py prefill --skip-vllm
+    python tests/vLLM_comparison/microbenchmark.py cuda-graph
+    python tests/vLLM_comparison/microbenchmark.py mixed
+    python tests/vLLM_comparison/microbenchmark.py all
 """
 import os
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -26,7 +26,7 @@ from functools import lru_cache
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-MOE_DIR = SCRIPT_DIR.parent
+MOE_DIR = SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(MOE_DIR))
 
 import torch

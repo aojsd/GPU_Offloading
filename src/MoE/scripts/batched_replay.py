@@ -1,25 +1,24 @@
 """Batched GPU replay with multi-sequence scheduling and expert offloading.
 
-Phase 4 of the trace pipeline: replay a GPUReplayTrace on real GPU hardware
-with all batched requests running real computation. Consumes step_scheduling
-metadata to manage KV cache slots, prefill/decode/continuation dispatch, and
-request lifecycle.
+Step 03 of the trace pipeline: replay a GPUReplayTrace on real GPU hardware
+with all batched requests running real computation. Loads precomputed policy
+traces from step 02 (run_all_policies.py) when available, falling back to
+on-the-fly simulation. Consumes step_scheduling metadata to manage KV cache
+slots, prefill/decode/continuation dispatch, and request lifecycle.
 
 Usage:
     # Run replay for a specific cache% with all policies:
     python scripts/batched_replay.py \
-        --model models/Mixtral-8x7B-Instruct-v0.1 \
-        --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b \
-        --cache-fraction 0.5 \
-        --max-seqs 256 \
-        --max-graph-size 512
+        --model models/Mixtral-8x7B \
+        --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+        --cache-size 179
 
     # Single policy:
     python scripts/batched_replay.py \
-        --model models/Mixtral-8x7B-Instruct-v0.1 \
-        --batched-trace path/to/batched.json \
-        --cache-size 128 \
-        --policy LRU-Oracle
+        --model models/Mixtral-8x7B \
+        --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+        --cache-size 179 \
+        --policies LRU-Oracle
 """
 import argparse
 import json
@@ -39,8 +38,8 @@ import torch
 import moe_engine as _moe_engine_mod  # noqa: F401 — glibc patches
 from moe_engine import MoEEngine
 from replay_controller import ReplayController
-from gpu_replay_trace import ActivationTrace
-from build_trace import load_traces, ConversationTrace, compute_kv_budget_from_cache
+from gpu_replay_trace import ActivationTrace, GPUReplayTrace
+from build_trace import load_traces, ConversationTrace
 from policy_simulator import (
     LRU, LFU, Belady, StaticFreq, NoPrefetch, OraclePrefetch, simulate,
 )
@@ -143,7 +142,7 @@ def replay_trace(engine, dm_trace, per_conv_traces, full_token_seqs,
 def run_batched_replay(model_path, batched_trace_path, per_conv_traces,
                        cache_size, max_graph_size=512, warmup_steps=50,
                        policies=None, max_seqs_override=None,
-                       max_steps=None):
+                       max_steps=None, trace_dir=None):
     """Run GPU replay for all policies on a batched trace.
 
     Args:
@@ -155,6 +154,9 @@ def run_batched_replay(model_path, batched_trace_path, per_conv_traces,
         warmup_steps: Steps for CUDA warmup.
         policies: List of (name, cache_policy_fn, prefetch_policy_fn) tuples.
             If None, runs all cache x prefetch combinations.
+        trace_dir: Directory containing precomputed GPUReplayTrace files
+            from run_all_policies.py (e.g. LRU-Oracle.json). If a file
+            exists for a policy, it is loaded instead of re-simulating.
 
     Returns:
         Dict of results keyed by policy name.
@@ -188,13 +190,13 @@ def run_batched_replay(model_path, batched_trace_path, per_conv_traces,
     if max_seqs_override is not None:
         max_seqs = min(max_seqs, max_seqs_override)
 
-    # Compute max_seq_len from KV budget
+    # Compute max_seq_len: actual max from conversations, capped by KV budget.
+    # With dynamic pages, one sequence can use all pages (preemption frees others).
+    _actual_max = max(t.prompt_tokens + t.output_tokens
+                      for t in per_conv_traces)
     if trace_kv_budget and trace_kv_budget > 0:
-        _pages_per_seq = trace_kv_budget // max(1, max_seqs)
-        max_seq_len = _pages_per_seq * trace_page_size
+        max_seq_len = min(_actual_max, trace_kv_budget * trace_page_size)
     else:
-        _actual_max = max(t.prompt_tokens + t.output_tokens
-                          for t in per_conv_traces)
         max_seq_len = _actual_max
 
     # Hard error on batch shrinkage — do not silently degrade
@@ -217,23 +219,37 @@ def run_batched_replay(model_path, batched_trace_path, per_conv_traces,
             for pf_name, pf_fn in PREFETCH_POLICIES
         ]
 
-    print(f"\n=== Generating policy traces (CS={cache_size}) ===")
+    print(f"\n=== Loading/generating policy traces (CS={cache_size}) ===")
     dm_traces = {}
     for name, cp_fn, pf_fn in policies:
-        dm = simulate(cp_fn(), pf_fn(), at, cache_size=cache_size)
-        s = dm.summary()
-        print(f"  {name:<18s}  demands={s['demand_loads']:6d}  "
-              f"prefetches={s['prefetches']:6d}  total={s['total_transfers']:6d}")
+        precomputed = (os.path.join(trace_dir, f"{name}.json")
+                       if trace_dir else None)
+        if precomputed and os.path.exists(precomputed):
+            dm = GPUReplayTrace.load(precomputed)
+            s = dm.summary()
+            print(f"  {name:<18s}  demands={s['demand_loads']:6d}  "
+                  f"prefetches={s['prefetches']:6d}  total={s['total_transfers']:6d}"
+                  f"  [loaded]")
+        else:
+            dm = simulate(cp_fn(), pf_fn(), at, cache_size=cache_size)
+            s = dm.summary()
+            print(f"  {name:<18s}  demands={s['demand_loads']:6d}  "
+                  f"prefetches={s['prefetches']:6d}  total={s['total_transfers']:6d}"
+                  f"  [simulated]")
         dm_traces[name] = dm
 
-    # Load engine
+    # Load engine — use dynamic KV pages alongside expert cache to avoid
+    # over-allocating KV for long sequences (greedy admission + preemption
+    # traces have sequences longer than kv_budget // max_seqs).
+    kv_page_budget = trace_kv_budget if (trace_kv_budget and trace_kv_budget > 0) else None
     print(f"\n=== Loading model: {model_path} (cache_size={cache_size}, "
-          f"max_seqs={max_seqs}) ===")
+          f"max_seqs={max_seqs}, kv_budget={kv_page_budget}) ===")
     engine = MoEEngine(
         model_path,
         cache_size=cache_size,
         max_seqs=max_seqs,
         max_seq_len=max_seq_len,
+        kv_page_budget=kv_page_budget,
         use_torch_compile=True,
     )
 
@@ -369,8 +385,16 @@ def _append_result_to_md(result_dict, results_md_path):
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
-# Cache percentage to number of expert slots (Mixtral-8x7B, 256 total)
-CACHE_PCT_TO_SIZE = {85: 217, 80: 204, 70: 179, 60: 153, 50: 128}
+def _read_trace_cache_size(trace_path):
+    """Read cache_size from a batched trace's scheduling config."""
+    with open(trace_path) as f:
+        d = json.load(f)
+    cs = d.get('scheduling', {}).get('cache_size')
+    if cs is None:
+        raise ValueError(
+            f"cache_size not found in {trace_path} scheduling config. "
+            f"Re-run collect_batched_traces.py with --cache-fraction.")
+    return cs
 
 
 def main():
@@ -378,17 +402,14 @@ def main():
         description="Batched GPU replay with multi-sequence scheduling")
     parser.add_argument("--model", type=str, required=True,
                         help="Path to model directory")
-    parser.add_argument("--trace-dir", type=str, default=None,
-                        help="Directory with per-conversation traces")
+    parser.add_argument("--trace-dir", type=str, required=True,
+                        help="Directory with batched_trace.json and "
+                             "requests/ (a cache%%pct dir)")
     parser.add_argument("--batched-trace", type=str, default=None,
-                        help="Path to batched ActivationTrace JSON")
-    parser.add_argument("--cache-fraction", type=float, default=None,
-                        help="Expert cache fraction (generates batched trace)")
-    parser.add_argument("--cache-pct", type=int, default=None,
-                        help="Cache percentage (e.g. 85). Auto-locates "
-                             "batched trace.")
+                        help="Path to batched ActivationTrace JSON "
+                             "(default: <trace-dir>/batched_trace.json)")
     parser.add_argument("--cache-size", type=int, default=None,
-                        help="Explicit cache size (number of expert slots)")
+                        help="Override cache size (default: read from trace)")
     parser.add_argument("--max-seqs", type=int, default=256)
     parser.add_argument("--max-graph-size", type=int, default=512)
     parser.add_argument("--warmup-steps", type=int, default=50)
@@ -408,57 +429,31 @@ def main():
                         help="Path to results.md for incremental appending")
     args = parser.parse_args()
 
-    # Validate args
-    if args.trace_dir is None:
-        parser.error("--trace-dir is required")
-    if args.cache_pct and args.cache_fraction:
-        parser.error("--cache-pct and --cache-fraction are mutually exclusive")
     if args.policy and args.policies:
         parser.error("--policy and --policies are mutually exclusive")
 
-    # Handle --cache-pct: convert to cache_size and locate batched trace
-    if args.cache_pct is not None:
-        pct = args.cache_pct
-        if pct not in CACHE_PCT_TO_SIZE:
-            parser.error(f"--cache-pct {pct} not in {list(CACHE_PCT_TO_SIZE.keys())}. "
-                         f"Use --cache-size + --batched-trace for custom values.")
-        cache_size = CACHE_PCT_TO_SIZE[pct]
-        batched_trace_path = os.path.join(
-            args.trace_dir, f"cache{pct}pct", "batched.json")
-        if not os.path.exists(batched_trace_path):
-            parser.error(f"Batched trace not found: {batched_trace_path}")
-    elif args.batched_trace:
+    # Locate batched trace
+    if args.batched_trace:
         batched_trace_path = args.batched_trace
-        if args.cache_size is None:
-            parser.error("--cache-size required when using --batched-trace")
-        cache_size = args.cache_size
-        pct = None
-    elif args.cache_fraction is not None:
-        from build_trace import simulate_batch, compute_kv_budget_from_cache
-        model_config = str(Path(args.model) / "config.json")
-        mem = compute_kv_budget_from_cache(
-            model_config, args.cache_fraction, gpu_memory_gb=80.0)
-        cache_size = mem['expert_cache_size']
-        kv_budget = mem['kv_page_budget']
-        pct = int(args.cache_fraction * 100)
-        print(f"Cache fraction {args.cache_fraction}: "
-              f"cache_size={cache_size}, kv_budget={kv_budget}")
-
-        per_conv_traces_early, _ = load_traces(args.trace_dir)
-        result = simulate_batch(
-            per_conv_traces_early, kv_budget, page_size=16,
-            max_seqs=args.max_seqs,
-            max_graph_size=args.max_graph_size,
-        )
-        batched_trace_path = os.path.join(
-            args.trace_dir, f"cache{pct}pct", "batched.json")
-        os.makedirs(os.path.dirname(batched_trace_path), exist_ok=True)
-        with open(batched_trace_path, 'w') as f:
-            json.dump(result, f)
-        print(f"Saved batched trace: {batched_trace_path}")
     else:
-        parser.error("One of --cache-pct, --batched-trace, or "
-                     "--cache-fraction is required")
+        batched_trace_path = os.path.join(args.trace_dir, "batched_trace.json")
+    if not os.path.exists(batched_trace_path):
+        parser.error(f"Batched trace not found: {batched_trace_path}")
+
+    # Read cache_size from trace metadata (or use override)
+    if args.cache_size is not None:
+        cache_size = args.cache_size
+    else:
+        cache_size = _read_trace_cache_size(batched_trace_path)
+
+    # Infer pct from directory name (e.g. cache60pct)
+    trace_dir_name = os.path.basename(os.path.normpath(args.trace_dir))
+    pct = None
+    if trace_dir_name.startswith("cache") and trace_dir_name.endswith("pct"):
+        try:
+            pct = int(trace_dir_name[5:-3])
+        except ValueError:
+            pass
 
     max_graph_size = args.max_graph_size
 
@@ -474,24 +469,26 @@ def main():
         policies = [_parse_policy(args.policy)]
 
     # Determine output directory
-    moe_root = Path(__file__).resolve().parent.parent
+    moe_root = Path(__file__).resolve().parent.parent   # src/MoE
+    repo_root = moe_root.parent.parent                  # GPU_Offloading
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
-        output_dir = moe_root / ".." / "results" / "MoE" / "mixtral-8x7B" / "tmp"
+        output_dir = repo_root / "results" / "MoE" / "mixtral-8x7B" / "tmp"
 
     # Determine results.md path
     if args.results_md:
         results_md_path = args.results_md
     else:
         results_md_path = str(
-            moe_root / ".." / "results" / "MoE" / "mixtral-8x7B" / "results.md")
+            repo_root / "results" / "MoE" / "mixtral-8x7B" / "results.md")
 
     results = run_batched_replay(
         args.model, batched_trace_path, per_conv_traces,
         cache_size, max_graph_size, args.warmup_steps,
         policies, max_seqs_override=args.max_seqs,
         max_steps=args.max_steps,
+        trace_dir=args.trace_dir,
     )
 
     # Save per-policy results

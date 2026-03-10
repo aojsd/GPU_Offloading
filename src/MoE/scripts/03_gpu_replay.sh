@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# Phase 4: GPU replay of all policy traces across all cache fractions.
+# Phase 3: GPU replay of all policy traces across all cache fractions.
 # Auto-detects GPU count and distributes work across GPUs.
 #
 # Execution order: policies first (SF → Belady → LFU → LRU), then cache sizes
-# within each policy group (80 → 70 → 60 → 50 → 85). LRU runs last since it
-# has by far the most demand loads and takes the longest.
+# within each policy group (80 → 70 → 60). LRU runs last since it has by far
+# the most demand loads and takes the longest.
 #
 # Each (policy_group, cache%) job is dispatched to the next free GPU.
 #
 # Usage:
-#   bash scripts/04_gpu_replay.sh                    # auto-detect GPUs
-#   bash scripts/04_gpu_replay.sh --cache-pct 85     # single cache%
+#   bash scripts/03_gpu_replay.sh                    # auto-detect GPUs
+#   bash scripts/03_gpu_replay.sh --cache-pct 80     # single cache%
+#   bash scripts/03_gpu_replay.sh --resume           # skip completed jobs
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
@@ -28,8 +29,8 @@ POLICY_GROUPS=(
 )
 GROUP_NAMES=("SF" "Belady" "LFU" "LRU")
 
-# Cache sizes in priority order
-CACHE_PCTS=(80 70 60 50 85)
+# Cache percentages in priority order
+CACHE_PCTS=(80 70 60)
 
 # Results directory for resume checking
 RESULTS_TMP="../../results/MoE/mixtral-8x7B/tmp"
@@ -60,27 +61,56 @@ if [ "$NUM_GPUS" -lt 1 ]; then
 fi
 echo "Detected $NUM_GPUS GPU(s)"
 
+# Read cache_size from trace metadata for a given cache%
+get_cache_size() {
+    local pct=$1
+    local trace_dir="$TRACE_BASE/cache${pct}pct"
+    local batched="$trace_dir/batched_trace.json"
+    if [ ! -f "$batched" ]; then
+        echo "ERROR: Batched trace not found: $batched" >&2
+        echo "Run scripts/01_collect_traces.sh first." >&2
+        return 1
+    fi
+    python3 -c "
+import json, sys
+with open('$batched') as f:
+    d = json.load(f)
+cs = d.get('scheduling', {}).get('cache_size')
+if cs is None:
+    print('ERROR: cache_size not found in trace scheduling config', file=sys.stderr)
+    sys.exit(1)
+print(cs)
+"
+}
+
 # Single cache% mode (all policies)
 if [ -n "$SINGLE_PCT" ]; then
     echo "Running single cache% = $SINGLE_PCT"
+    CS=$(get_cache_size "$SINGLE_PCT")
     python3 -u scripts/batched_replay.py \
         --model "$MODEL" \
-        --trace-dir "$TRACE_BASE" \
-        --cache-pct "$SINGLE_PCT" \
+        --trace-dir "$TRACE_BASE/cache${SINGLE_PCT}pct" \
+        --batched-trace "$TRACE_BASE/cache${SINGLE_PCT}pct/batched_trace.json" \
+        --cache-size "$CS" \
         --warmup-steps "$WARMUP" \
         --output-dir "$RESULTS_TMP"
     exit 0
 fi
 
+# Pre-check: all trace dirs exist and have cache_size
+declare -A CACHE_SIZE_MAP
+for pct in "${CACHE_PCTS[@]}"; do
+    CS=$(get_cache_size "$pct") || exit 1
+    CACHE_SIZE_MAP[$pct]=$CS
+    echo "  cache${pct}%: cache_size=$CS"
+done
+
 # Build job list: (policy_group_idx, cache_pct) in priority order
-# Policies first, then cache sizes within each policy group
-# With --resume, skip jobs where all policy result files already exist
 JOBS=()
 SKIPPED=0
 for ((g=0; g<${#POLICY_GROUPS[@]}; g++)); do
     for pct in "${CACHE_PCTS[@]}"; do
         if [ "$RESUME" -eq 1 ]; then
-            # Check if all policies in this group have result files
             all_done=1
             IFS=',' read -ra policies <<< "${POLICY_GROUPS[$g]}"
             for pol in "${policies[@]}"; do
@@ -110,10 +140,9 @@ for job in "${JOBS[@]}"; do
 done
 echo ""
 
-# Dispatch jobs to GPUs: launch up to NUM_GPUS in parallel, wait for
-# any to finish before launching the next.
-declare -a GPU_PID     # PID running on each GPU (0 = free)
-declare -a GPU_LOG     # log file for current job on each GPU
+# Dispatch jobs to GPUs
+declare -a GPU_PID
+declare -a GPU_LOG
 for ((g=0; g<NUM_GPUS; g++)); do
     GPU_PID[$g]=0
 done
@@ -121,7 +150,6 @@ done
 FAILED=0
 JOB_IDX=0
 
-# Launch a job on a specific GPU
 launch_on_gpu() {
     local gpu=$1
     local job=${JOBS[$JOB_IDX]}
@@ -129,13 +157,15 @@ launch_on_gpu() {
     local pct="${job##*:}"
     local policies="${POLICY_GROUPS[$gidx]}"
     local gname="${GROUP_NAMES[$gidx]}"
+    local cs="${CACHE_SIZE_MAP[$pct]}"
     local logfile="/tmp/gpu_replay_gpu${gpu}_${gname}_cache${pct}.log"
 
-    echo "[job $((JOB_IDX+1))/${#JOBS[@]}] GPU $gpu: ${gname} @ cache${pct}% -> $logfile"
+    echo "[job $((JOB_IDX+1))/${#JOBS[@]}] GPU $gpu: ${gname} @ cache${pct}% (CS=$cs) -> $logfile"
     CUDA_VISIBLE_DEVICES=$gpu python3 -u scripts/batched_replay.py \
         --model "$MODEL" \
-        --trace-dir "$TRACE_BASE" \
-        --cache-pct "$pct" \
+        --trace-dir "$TRACE_BASE/cache${pct}pct" \
+        --batched-trace "$TRACE_BASE/cache${pct}pct/batched_trace.json" \
+        --cache-size "$cs" \
         --policies "$policies" \
         --warmup-steps "$WARMUP" \
         --output-dir "$RESULTS_TMP" \
@@ -145,7 +175,6 @@ launch_on_gpu() {
     JOB_IDX=$((JOB_IDX + 1))
 }
 
-# Wait for any GPU to become free, report result
 wait_for_any_gpu() {
     while true; do
         for ((g=0; g<NUM_GPUS; g++)); do
@@ -153,9 +182,7 @@ wait_for_any_gpu() {
             if [ "$pid" -eq 0 ]; then
                 continue
             fi
-            # Check if process finished (non-blocking)
             if ! kill -0 "$pid" 2>/dev/null; then
-                # Process finished, get exit code
                 if wait "$pid" 2>/dev/null; then
                     echo "  GPU $g finished: $(basename ${GPU_LOG[$g]}) [OK]"
                     tail -5 "${GPU_LOG[$g]}" | sed 's/^/    /'
@@ -174,7 +201,6 @@ wait_for_any_gpu() {
 
 # Main dispatch loop
 while [ $JOB_IDX -lt ${#JOBS[@]} ]; do
-    # Find a free GPU
     free_gpu=-1
     for ((g=0; g<NUM_GPUS; g++)); do
         if [ "${GPU_PID[$g]}" -eq 0 ]; then
@@ -186,7 +212,6 @@ while [ $JOB_IDX -lt ${#JOBS[@]} ]; do
     if [ $free_gpu -ge 0 ]; then
         launch_on_gpu $free_gpu
     else
-        # All GPUs busy, wait for one to finish
         wait_for_any_gpu
     fi
 done
@@ -205,11 +230,8 @@ while true; do
 done
 
 echo ""
-echo "All jobs complete. Merging results..."
-
 if [ "$FAILED" -eq 1 ]; then
     echo "WARNING: Some jobs failed. Check logs above."
     exit 1
 fi
-echo ""
-echo "Phase 4 complete. Results in results/MoE/mixtral-8x7B/tmp/"
+echo "Phase 3 complete. Results in $RESULTS_TMP/"

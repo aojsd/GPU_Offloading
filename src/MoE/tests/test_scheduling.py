@@ -21,8 +21,8 @@ from trace_construction.collect_batched_traces import (
     MockPageAllocator,
     ScheduleResult,
     extract_next_tokens,
+    pages_needed,
 )
-from trace_construction.build_trace import pages_needed
 
 
 # ---------------------------------------------------------------------------

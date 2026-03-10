@@ -1,8 +1,12 @@
-"""Build batched ActivationTrace from per-conversation expert traces.
+"""Build batched ActivationTrace from per-conversation expert traces (legacy).
 
-Phase 2 of the trace construction pipeline: simulate continuous batching
-offline (CPU-only) to produce a batched trace representing multiple concurrent
-requests. Uses fixed 256-token prefill chunks, max_graph_size=512 as the
+NOTE: This is the legacy CPU-only batch simulator. The active pipeline uses
+collect_batched_traces.py (Phase 1) which does GPU-based batched collection
+directly. This file is retained for its load_traces() and ConversationTrace
+utilities used by other scripts.
+
+Original purpose: simulate continuous batching offline (CPU-only) to produce a
+batched trace. Uses fixed 256-token prefill chunks, max_graph_size=512 as the
 single token budget, block-based KV accounting, and no-preemption page
 pre-allocation.
 

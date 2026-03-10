@@ -1,15 +1,12 @@
 # Trace Construction Pipeline
 
-Build realistic batched expert traces from ShareGPT conversations without
-requiring a GPU for batch scheduling experiments.
+Build realistic batched expert traces from ShareGPT conversations for
+cache/prefetch policy experiments.
 
 ## Overview
 
 ```
-ShareGPT JSON ──► collect_traces.py ──► per-conversation traces (GPU, once)
-                                                     │
-                                                     ▼
-                            build_trace.py ──► batched ActivationTrace + scheduling (CPU)
+ShareGPT JSON ──► collect_batched_traces.py ──► batched ActivationTrace + scheduling (GPU, per cache fraction)
                                                      │
                                                      ▼
                             policy_simulator.py ──► GPUReplayTrace (CPU)
@@ -18,29 +15,26 @@ ShareGPT JSON ──► collect_traces.py ──► per-conversation traces (GPU
                             replay_controller.py ──► wall-clock timing (GPU)
 ```
 
-**Phase 1 — Collect (GPU, once):** Run each ShareGPT conversation through the
-model individually. Record per-step, per-layer expert selections and optionally
-router inputs. See [collect_traces.py](collect_traces.py).
+**Phase 1 — Collect (GPU, once per cache fraction):** Run continuous batching
+with real GPU computation. Produces a batched `ActivationTrace` with per-step
+scheduling metadata and per-conversation token sequences. KV budget is computed
+from the cache fraction to match single-GPU replay constraints. See
+[collect_batched_traces.py](collect_batched_traces.py).
 
-**Phase 2 — Batch (CPU, sweep freely):** Simulate continuous batching offline.
-Combine per-conversation traces into a batched `ActivationTrace` with per-step
-scheduling metadata (batch composition, preemptions, readmissions). Sweep
-scheduling parameters without touching the GPU. See [build_trace.py](build_trace.py).
-
-**Phase 3 — Policy (CPU, sweep freely):** Run policy simulators (LRU, Oracle,
+**Phase 2 — Policy (CPU, sweep freely):** Run policy simulators (LRU, Oracle,
 Static, etc.) on the batched trace to produce a `GPUReplayTrace`.
 Scheduling metadata propagates automatically. See
 [policy_simulator.py](../policy_simulator.py).
 
-**Phase 4 — Replay (GPU):** Replay the `GPUReplayTrace` on real hardware with
+**Phase 3 — Replay (GPU):** Replay the `GPUReplayTrace` on real hardware with
 the `ReplayController`. Uses async prefetch streams and demand loading. See
 [replay_controller.py](../replay_controller.py) and [replay.md](../replay.md).
 
-**Replay fidelity contract:** The `step_scheduling` metadata produced by Phase 2
+**Replay fidelity contract:** The `step_scheduling` metadata produced by Phase 1
 is the ground truth for batch composition. GPU replay MUST faithfully recreate
 each step's mix of decode sequences, prefill chunks, and continuation chunks at
 the exact token counts recorded in `step_scheduling`. This metadata propagates
-through Phase 3 (`simulate()` copies it from `ActivationTrace` to
+through Phase 2 (`simulate()` copies it from `ActivationTrace` to
 `GPUReplayTrace`) and must be consumed by the replay loop to dispatch correct
 batches. Without faithful batch recreation, compute kernel durations and
 prefetch overlap windows are wrong, making timing comparisons between policies
@@ -55,135 +49,76 @@ Batched traces and policy traces go in per-experiment subdirectories.
 
 ```
 datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/
-├── manifest.json                    # index of all per-conversation traces
-├── requests/                        # per-conversation trace files (Phase 1)
-│   ├── {conversation_id}.json       # e.g. QWJhYvA_0.json
-│   └── ...
-├── conversations/                   # human-readable conversation text
-│   ├── {conversation_id}.txt
-│   └── ...
-│
-├── cache50pct/                      # experiment: 50% expert cache
-│   ├── batched.json                 # batched ActivationTrace (Phase 2)
-│   ├── static_cs128.json            # Static policy GPUReplayTrace (Phase 3)
-│   ├── oracle_cs128.json            # Oracle policy GPUReplayTrace
+├── cache60pct/                      # 60% expert cache fraction
+│   ├── batched_trace.json           # batched ActivationTrace (Phase 1)
+│   ├── manifest.json                # per-conversation index
+│   ├── requests/                    # per-conversation traces
+│   │   ├── {conversation_id}.json
+│   │   └── ...
+│   ├── LRU-None.json                # GPUReplayTrace (Phase 2)
+│   ├── LRU-Oracle.json
+│   ├── Belady-Oracle.json
 │   └── ...
 │
-├── cache90pct_short/                # experiment: 90% cache, few conversations
-│   ├── batched.json                 # batched ActivationTrace (Phase 2)
-│   └── ...                          # dm traces generated per-experiment
+├── cache70pct/                      # 70% expert cache fraction
+│   ├── batched_trace.json
+│   ├── manifest.json
+│   ├── requests/
+│   └── ...
 │
-└── ...                              # more experiment directories
+└── cache80pct/                      # 80% expert cache fraction
+    ├── batched_trace.json
+    ├── manifest.json
+    ├── requests/
+    └── ...
 ```
 
-Each experiment directory is self-contained: one batched trace from Phase 2, plus
-any number of policy traces from Phase 3, all sharing the same batch schedule.
+Each cache fraction directory is self-contained: one batched trace from Phase 1,
+plus any number of policy traces from Phase 2, all sharing the same batch schedule.
 
 ---
 
-## Phase 1: collect_traces.py
+## Phase 1: collect_batched_traces.py
 
 ### Purpose
 
-Run ShareGPT conversations through the MoE model one at a time, recording
-per-step expert selections and router inputs. Each conversation produces one
-trace file.
+GPU-based batched trace collection. Runs continuous batching with real model
+computation, recording expert routing and per-conversation token sequences.
+One run per cache fraction, with KV budget computed to match single-GPU
+replay constraints.
 
 ### Input
 
 - ShareGPT JSON (`ShareGPT_V3_unfiltered_cleaned_split.json`)
-- Model weights (OLMoE or Mixtral)
-- `--num-conversations N`: how many to process (default: all)
-- `--output-dir DIR`: where to write per-conversation traces
-- `--max-output-tokens N`: safety cap (default: -1, no cap — run to EOS)
+- Model weights (Mixtral-8x7B)
+- `--cache-fraction F`: expert cache fraction (required) — determines KV budget
+- `--num-conversations N`: how many to process (default: 200)
+- `--output-dir DIR`: where to write traces (e.g., `cache70pct/`)
+- `--max-output-tokens N`: safety cap (default: 4096)
+- `--pp N`: pipeline parallelism (default: auto-detect GPUs)
 
 ### What we record per layer per step
 
 | Field | What | Source in engine | Purpose |
 |-------|------|------------------|---------
-| `expert_ids` | Selected top-k expert indices | `TraceRecorder` via `process_layer()` | Cache simulation, eviction policies |
-| `router_input` | Hidden state fed to gating network | `TraceRecorder` (opt-in: `record_router_inputs=True`) | Predictive prefetchers |
-
-### CUDA graph sizes
-
-Collection uses a compact graph set `[1, 64, 128, 256]` — only 4 sizes, since
-single-sequence collection never exceeds 256 tokens per step (one 256-token
-prefill chunk or one decode token). This differs from `MoEEngine.vllm_graph_sizes(512)`
-(51 sizes) which is designed for multi-sequence batched replay where total tokens
-per step can reach 512. The smaller set saves ~12 GB of graph capture memory and
-is sufficient for per-conversation tracing.
+| `expert_ids` | Selected top-k expert indices (batch union) | `TraceRecorder` via `process_layer()` | Cache simulation, eviction policies |
 
 ### How it works
 
-1. Load the model into `MoEEngine` with all experts on GPU (no offloading).
-2. For each conversation:
-   a. Tokenize the first user turn as the prompt.
-   b. Run prefill → first decode token.
-   c. Run decode until EOS or max_output_tokens cap.
-   d. `TraceRecorder` records `{step, layer, expert_ids}` at each layer.
-   e. Save trace JSON (and optional `*_router_inputs.npz`).
-   f. Reset recorder before the next conversation.
-3. Save `manifest.json` indexing all conversations.
-
-### Output format (per conversation)
-
-```json
-{
-  "conversation_id": "abc123",
-  "model": "Mixtral-8x7B",
-  "prompt_tokens": 47,
-  "output_tokens": 384,
-  "num_layers": 32,
-  "num_experts": 8,
-  "top_k": 2,
-  "trace": [
-    {"step": 0, "layer": 0, "expert_ids": [2, 5]},
-    {"step": 0, "layer": 1, "expert_ids": [1, 7]},
-    ...
-  ]
-}
-```
-
-Steps 0..K-1 = prefill chunks (expert_ids = union of that chunk's tokens'
-selections). Each chunk is up to 256 tokens, so a 600-token prompt produces
-K=3 steps (256 + 256 + 88 tokens). Steps K..N = decode (one token each,
-expert_ids = that token's top-k per layer).
-
----
-
-## Phase 2: build_trace.py
-
-### Purpose
-
-Offline continuous batching simulator. Takes per-conversation activation traces
-and scheduling parameters, produces a batched `ActivationTrace` with per-step
-scheduling metadata.
-
-### Two modes
-
-**1. Memory-first (recommended):** Fix expert cache fraction → compute KV budget
-from remaining GPU memory → run simulation with that budget.
-
-```bash
-python build_trace.py \
-    --input-dir ../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b \
-    --model-config /path/to/Mixtral-8x7B/config.json \
-    --cache-fraction 0.5 \
-    --output traces/cache50pct/batched.json
-```
-
-**2. Legacy:** Target a batch size or explicit KV page budget.
-
-```bash
-python build_trace.py \
-    --input-dir traces/ \
-    --target-batch-size 16 \
-    --output traces/batched_bs16.json
-```
+1. Compute KV page budget via `compute_replay_kv_budget()` from cache fraction.
+2. Load model into `MoEEngine` with PP=N (all experts on GPU, no offloading).
+3. Run continuous batching (`Scheduler`) with real GPU computation:
+   - Fixed 256-token prefill chunks, max_graph_size=512
+   - Preemption when KV budget is exhausted
+   - EOS detection terminates sequences
+   - `TraceRecorder` records `{step, layer, expert_ids}` at each layer
+4. Save `batched_trace.json` (ActivationTrace format with scheduling metadata),
+   per-conversation JSONs with `prompt_token_ids` and `output_token_ids`,
+   and `manifest.json`.
 
 ### Scheduling model
 
-Simulates vLLM-style continuous batching with scheduled chunked prefill:
+Implements vLLM V1-style continuous batching with scheduled chunked prefill:
 
 ```
 time ──────────────────────────────────────────────────────────►
@@ -200,11 +135,10 @@ The total tokens per step are capped by `max_graph_size` (default: 512), which i
 single token budget per step.
 
 **Chunk alignment invariant:** The fixed 256-token chunk boundaries must be
-identical across Phase 1 (collection), Phase 2 (batch simulation), and Phase 4
-(replay). If chunk boundaries differ, different FP rounding from different
-attention kernels (FA3 for new prefill vs FlashInfer for continuation) can change
-expert routing, breaking the trace-driven guarantee that replay expert selections
-match collection exactly.
+identical across Phase 1 (collection) and Phase 3 (replay). If chunk boundaries
+differ, different FP rounding from different attention kernels (FA3 for new
+prefill vs FlashInfer for continuation) can change expert routing, breaking the
+trace-driven guarantee that replay expert selections match collection exactly.
 
 Each global step:
 1. **Completion:** Remove finished requests.
@@ -215,26 +149,28 @@ Each global step:
 5. **Advance:** Update `num_computed_tokens` for prefill chunks,
    `convo_step` for completed prefills and decodes.
 
-### No-preemption policy
+### Preemption policy
 
-Since this is a trace-driven replay where `output_tokens` is known in advance,
-pages for the **full sequence** (prompt + output) are pre-allocated at admission.
-This eliminates preemption entirely: no request is ever evicted once admitted.
+When KV budget is exhausted, the scheduler preempts the most recently admitted
+request (LIFO). Preempted requests are re-queued and readmitted when budget
+frees up, with recompute prefill from the beginning of the sequence.
 
 ### Parameters
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--input-dir` | Directory of per-conversation trace files | required |
-| `--output` | Output path (auto-generated if omitted) | auto |
-| `--cache-fraction` | Expert cache as fraction of total experts | None |
-| `--model-config` | Path to config.json (required for `--cache-fraction`) | None |
-| `--max-seqs` | Hard cap on concurrent sequences | **256** (vLLM default) |
-| `--max-graph-size` | Max total tokens per step (single CUDA graph budget) | **512** |
-| `--target-batch-size` | Target batch size (legacy mode) | 16 |
-| `--kv-page-budget` | Explicit KV page budget (overrides other modes) | auto |
-| `--page-size` | KV cache page size in tokens | 16 |
-| `--gpu-memory-gb` | Total GPU memory | 80 |
+| `--model` | Path to model directory | required |
+| `--dataset` | Path to ShareGPT JSON | required |
+| `--output-dir` | Output directory (e.g., `cache70pct/`) | required |
+| `--cache-fraction` | Expert cache as fraction of total experts | required |
+| `--num-conversations` | Number of conversations to process | 200 |
+| `--max-seqs` | Hard cap on concurrent sequences | **32** |
+| `--max-output-tokens` | Max output tokens per conversation | **4096** |
+| `--max-graph-size` | Max total tokens per step | **512** |
+| `--pp` | Pipeline parallelism degree | auto |
+| `--gpu-memory-gb` | Total GPU memory for KV budget computation | **80** |
+| `--kv-page-budget` | Explicit KV page budget (overrides auto) | auto |
+| `--resume` | Skip conversations with existing output files | off |
 
 ### Per-step scheduling metadata
 
@@ -331,12 +267,9 @@ The pipeline separates concerns cleanly:
 
 | Dimension | Controlled by |
 |-----------|---------------|
-| Model architecture (experts, layers, top-k) | `collect_traces.py` (GPU, run once) |
-| Dataset (ShareGPT, MMLU, etc.) | `collect_traces.py` (GPU, run once) |
-| Router inputs for predictive prefetching | `collect_traces.py` (GPU, run once) |
-| Batch size / concurrency | `build_trace.py` (CPU, sweep freely) |
-| Request arrival order | `build_trace.py` (CPU, sweep freely) |
-| KV memory budget / preemption | `build_trace.py` (CPU, sweep freely) |
+| Model architecture (experts, layers, top-k) | `collect_batched_traces.py` (GPU, once per cache fraction) |
+| Dataset (ShareGPT, MMLU, etc.) | `collect_batched_traces.py` (GPU, once per cache fraction) |
+| Batch size / concurrency / KV budget | `collect_batched_traces.py` (GPU, tied to cache fraction) |
 | Expert cache size | `policy_simulator.py` (CPU, sweep freely) |
 | Eviction/prefetch policy | `policy_simulator.py` (CPU, sweep freely) |
 
@@ -345,59 +278,37 @@ The pipeline separates concerns cleanly:
 ## End-to-end example (Mixtral-8x7B)
 
 ```bash
-# Phase 1: Collect per-conversation traces (GPU, PP=2, ~30 min for 200 convos)
-VLLM_ENABLE_V1_MULTIPROCESSING=0 python collect_traces.py \
-    --model /path/to/Mixtral-8x7B-Instruct-v0.1 \
-    --dataset ../datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json \
-    --num-conversations 200 \
-    --max-output-tokens 1000 \
-    --pipeline-parallel 2 \
-    --output-dir ../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b
-
-# Phase 2: Build batched trace with chunked prefill (CPU-only, seconds)
-python build_trace.py \
-    --input-dir ../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b \
-    --model-config /path/to/Mixtral-8x7B-Instruct-v0.1/config.json \
-    --cache-fraction 0.5 \
-    --max-seqs 256 --max-graph-size 512 \
-    --output ../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache50pct/batched.json
-
-# Phases 3+4: Policy simulation + GPU replay (all-in-one)
 cd /path/to/src/MoE
+
+# Phase 1: GPU batched collection (one run per cache fraction)
+python trace_construction/collect_batched_traces.py \
+    --model models/Mixtral-8x7B \
+    --dataset datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json \
+    --output-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+    --cache-fraction 0.7 \
+    --num-conversations 200 --max-seqs 32 --pp 2 --resume
+
+# Phase 2: Policy simulation (CPU-only, seconds)
+python scripts/run_all_policies.py --parallel
+
+# Phase 3: GPU replay
 python scripts/batched_replay.py \
-    --model /path/to/Mixtral-8x7B-Instruct-v0.1 \
-    --trace-dir ../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b \
-    --batched-trace .../cache50pct/batched.json \
-    --cache-size 128 \
-    --max-graph-size 512
+    --model models/Mixtral-8x7B \
+    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+    --cache-size 179 --max-graph-size 512
 ```
 
 ---
 
 ## Current traces (Mixtral-8x7B, 200 ShareGPT conversations)
 
-**Phase 1**: 200 conversations traced with PP=2 on 2x H100.
-- Output token distribution: min=27, median=384, max=2576, mean=427
-- Prompt token distribution: min=9, median=34, max=6368, mean=353
+Collected with PP=2 on 2x H100, max_seqs=32, max_output_tokens=4096.
+Three cache fractions: 60%, 70%, 80%.
 
-**Phase 2** (cache_fraction=0.5, max_seqs=128):
+KV budgets (computed by `compute_replay_kv_budget()`):
 
-| Metric | Value |
-|--------|-------|
-| Total steps | 2847 |
-| Avg batch size | 30.05 |
-| Median batch size | 3 |
-| Peak batch size | 128 |
-| IQR | 42 |
-| Preemptions | 0 |
-| Peak KV pages | 5621 |
-
-Memory budget (Mixtral-8x7B, 80 GB GPU):
-- Non-expert model: 2.99 GB
-- Expert cache: 128/256 experts (50%) = 42.0 GB
-- Overhead: 2.5 GB (workspace buffers, CUDA graphs, allocator fragmentation)
-- Available for KV: 32.51 GB = 16,645 pages = 266,320 tokens
-
-With 270K tokens of KV capacity and only ~156K tokens total across all 200
-conversations, the KV budget is never exhausted → 0 preemptions. The bottleneck
-is `max_seqs=128`, not memory.
+| Cache % | Expert slots | Cache GB | KV pages | KV tokens |
+|---------|-------------|----------|----------|-----------|
+| 60% | 153 | 50.2 | 10,444 | 167K |
+| 70% | 179 | 58.7 | 6,076 | 97K |
+| 80% | 204 | 66.9 | 1,876 | 30K |

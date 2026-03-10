@@ -29,7 +29,7 @@ and end-to-end usage.
 | Path | What it covers |
 |------|----------------|
 | [README.md](README.md) | Project overview, sandbox design, models, engine API, performance summary, file index |
-| [offload_1GPU.md](offload_1GPU.md) | Expert offloading research notes, Phases 3-4, memory analysis, benchmarks |
+| [offload_1GPU.md](offload_1GPU.md) | Expert offloading research notes, cache/prefetch policy implementation, memory analysis, benchmarks |
 | [pipeline_parallelism.md](pipeline_parallelism.md) | PP=2 performance analysis, per-layer breakdown, optimization targets |
 | [replay.md](replay.md) | Cache simulation & replay: trace formats, policy simulators, replay controller, prefetch/eviction timing |
 | [vLLM_comparison/README.md](vLLM_comparison/README.md) | Decode, prefill, mixed batch benchmarks vs vLLM; profiling data |
@@ -37,7 +37,7 @@ and end-to-end usage.
 | [benchmarks/README.md](benchmarks/README.md) | Performance benchmarks: kernel timing, e2e latency |
 | [profiling/README.md](profiling/README.md) | Nsight Systems and per-phase kernel profiling |
 | [scripts/README.md](scripts/README.md) | Experiment runners (policy sweeps) |
-| [trace_construction/README.md](trace_construction/README.md) | Trace collection pipeline: per-conversation GPU traces, batched CPU simulator |
+| [trace_construction/README.md](trace_construction/README.md) | Trace collection pipeline: GPU batched collection → policy simulation → GPU replay |
 
 ### For Subagents
 

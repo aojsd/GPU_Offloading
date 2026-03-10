@@ -6,7 +6,7 @@ Run from `src/MoE/`.
 ## Replay Fidelity Requirement
 
 GPU replay MUST faithfully recreate the batch compositions produced by the
-continuous batching simulator (Phase 2). Each replay step must dispatch the
+continuous batching scheduler (step 01). Each replay step must dispatch the
 correct mix of decode sequences, prefill chunks, and continuation chunks at
 their traced token counts. Batch size directly drives:
 
@@ -21,33 +21,25 @@ their traced token counts. Batch size directly drives:
 
 ### `batched_replay.py` — Multi-sequence batched GPU replay (use this)
 
-Runs the full Phase 4 replay: loads per-conversation traces, generates batched
-scheduling with chunked prefill, simulates caching/prefetching policies, and
-replays on GPU with real computation. Manages multiple concurrent sequences
-with `request_id -> seq_id` mapping and mixed decode/prefill/continuation steps.
+Loads precomputed `GPUReplayTrace` files (from `run_all_policies.py`) or
+re-simulates policies on the fly, then replays on GPU with real computation.
+Manages multiple concurrent sequences with `request_id -> seq_id` mapping and
+mixed decode/prefill/continuation steps.
 **This is the only script that faithfully recreates batched compute.**
 
 ```bash
-# Full replay with automatic batch simulation
+# Replay all policies for a cache fraction
 python scripts/batched_replay.py \
-    --model models/Mixtral-8x7B-Instruct-v0.1 \
-    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b \
-    --cache-fraction 0.5 \
-    --max-seqs 256 --max-graph-size 512
-
-# Replay with pre-built batched trace
-python scripts/batched_replay.py \
-    --model models/Mixtral-8x7B-Instruct-v0.1 \
-    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b \
-    --batched-trace path/to/batched.json \
-    --cache-size 128
+    --model models/Mixtral-8x7B \
+    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+    --cache-size 179
 
 # Single policy
 python scripts/batched_replay.py \
-    --model models/Mixtral-8x7B-Instruct-v0.1 \
-    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b \
-    --cache-fraction 0.5 \
-    --policy LRU-Oracle
+    --model models/Mixtral-8x7B \
+    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+    --cache-size 179 \
+    --policies LRU-Oracle
 ```
 
 **CUDA graph sizes:** Replay uses a 20-size set with max gap of 64 tokens:
@@ -75,7 +67,6 @@ python scripts/run_all_policies.py --cache-pct 85
 
 | Script | Phase | Description |
 |--------|-------|-------------|
-| `01_collect_traces.sh` | 1 | Collect per-conversation expert traces (GPU, PP=2) |
-| `02_batch_simulate.sh` | 2 | Run continuous batching simulation for all cache fractions (CPU) |
-| `03_policy_simulate.sh` | 3 | Run all policy simulations via `run_all_policies.py --parallel` (CPU) |
-| `04_gpu_replay.sh` | 4 | Dispatch GPU replay jobs across GPUs via `batched_replay.py` |
+| `01_collect_traces.sh` | 1 | GPU-based batched trace collection per cache fraction (GPU, PP=N) |
+| `02_policy_simulate.sh` | 2 | Run all policy simulations via `run_all_policies.py --parallel` (CPU) |
+| `03_gpu_replay.sh` | 3 | Dispatch GPU replay jobs across GPUs via `batched_replay.py` |

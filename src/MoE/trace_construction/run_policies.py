@@ -6,8 +6,8 @@ StaticFreq-Oracle(max_per_layer=1).
 
 Usage:
     python run_policies.py \
-        --trace ../datasets/.../batched.json \
-        --output-dir ../datasets/.../cache50pct/
+        --trace ../datasets/.../batched_trace.json \
+        --output-dir ../datasets/.../cache70pct/
 """
 import argparse
 import json

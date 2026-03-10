@@ -3,22 +3,22 @@
 Code review conducted 2026-03-07. Updated 2026-03-08 after comprehensive
 per-directory subagent reviews and replay fidelity audit.
 
-Scope: bugs are categorized relative to the experiment pipeline (scripts 01-04).
+Scope: bugs are categorized relative to the experiment pipeline (scripts 01-03).
 
 ---
 
 ## Blocking — FIXED (2026-03-08)
 
 All six blocking bugs fixed. Traces must be re-collected with `torch.compile=True`
-and pipeline re-run (scripts 01-04) before results are valid.
+and pipeline re-run (scripts 01-03) before results are valid.
 
-### B1. `04_gpu_replay.sh` dispatches to `run_all_policies.py`: unfaithful BS=1 replay — FIXED
+### B1. `03_gpu_replay.sh` (was `04_gpu_replay.sh`) dispatched to `run_all_policies.py`: unfaithful BS=1 replay — FIXED
 
 **File:** `scripts/run_all_policies.py:178-179`
 
 GPU replay creates the engine with `max_seqs=1` and replays with a single
 decode sequence, ignoring the multi-sequence batch scheduling metadata from
-`build_trace.py`. `04_gpu_replay.sh` dispatches to `run_all_policies.py`,
+`build_trace.py`. `03_gpu_replay.sh` dispatches to `run_all_policies.py`,
 so the entire experiment pipeline produces unfaithful timing data.
 
 Batch size drives (a) compute kernel duration (attention + MoE scale with BS),
@@ -29,9 +29,9 @@ prefetches to be hidden entirely. The I/O-to-compute ratio — the key metric
 for comparing caching/prefetching policies — is meaningless at BS=1. Expert
 cache transfer counts are correct (from policy simulator), but all timing
 (total_ms, ms/step, io_ms, compute%) is invalid. `batched_replay.py` performs
-faithful multi-sequence replay but is not wired into `04_gpu_replay.sh`.
+faithful multi-sequence replay but is not wired into `03_gpu_replay.sh`.
 
-**Fix:** Wire `04_gpu_replay.sh` to dispatch to `batched_replay.py` instead of
+**Fix:** Wire `03_gpu_replay.sh` to dispatch to `batched_replay.py` instead of
 `run_all_policies.py`, or integrate batched replay into `run_all_policies.py`.
 
 ### B2. Replay and collection use `use_torch_compile=False` — FIXED
@@ -121,9 +121,9 @@ actual trace as warmup (untimed).
 
 ---
 
-## Not in experiment pipeline (scripts 01-04)
+## Not in experiment pipeline (scripts 01-03)
 
-Bugs below affect files outside the scripts 01-04 dependency chain
+Bugs below affect files outside the scripts 01-03 dependency chain
 (`benchmarks/`, `profiling/`, `tests/`, `vLLM_comparison/`), or affect dormant
 code paths in pipeline files (unused CLI flags, unused functions).
 
@@ -145,7 +145,7 @@ crashes silently. Fix: always include 128 in `piecewise_sizes`.
 
 `prefill()` indexes `self.block_table[sid, pg]` with 2D tensor indexing. In PP
 mode, `self.block_table` is a list of per-GPU tensors → `TypeError`. Scripts
-01-04 use `mixed_step()` directly and are unaffected.
+01-03 use `mixed_step()` directly and are unaffected.
 
 ### `run_all_policies.py`: `--dual-gpu` merge reads nonexistent files
 

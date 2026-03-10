@@ -1,9 +1,9 @@
 """Validate batched expert traces against real model routing.
 
-Runs the actual model (PP=2) with the exact batch compositions from Phase 2
+Runs the actual model (PP=2) with the exact batch compositions from Phase 1
 batched traces, recording expert routing at each (step, layer). Compares the
 recorded routing against the trace's expected expert sets to verify that the
-set-union merge in build_trace.py is faithful.
+batch-union routing recorded by collect_batched_traces.py is faithful.
 
 Since routing is per-token-independent (attention is per-sequence, all other ops
 are per-row), validating one cache fraction proves the property for all — but
@@ -13,7 +13,7 @@ Usage:
     python validate_batched_trace.py \
         --model models/Mixtral-8x7B \
         --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b \
-        --cache-pct 50 60 70 80 85 \
+        --cache-pct 60 70 80 \
         --pipeline-parallel 2
 """
 import argparse
@@ -54,16 +54,16 @@ def load_prompt_tokens(traces: list[ConversationTrace],
 def _load_batched_trace(trace_dir, cache_pct):
     """Load a batched trace and extract its scheduling requirements."""
     batched_path = os.path.join(
-        trace_dir, f"cache{cache_pct}pct", "batched.json")
+        trace_dir, f"cache{cache_pct}pct", "batched_trace.json")
     if not os.path.exists(batched_path):
         raise FileNotFoundError(
             f"Batched trace not found: {batched_path}\n"
-            f"Run build_trace.py first (Phase 2).")
+            f"Run collect_batched_traces.py first (Phase 1).")
     at = ActivationTrace.load(batched_path)
     if not at.scheduling:
         raise RuntimeError(
-            f"cache{cache_pct}pct/batched.json has no scheduling metadata. "
-            f"Re-run build_trace.py to generate step_scheduling.")
+            f"cache{cache_pct}pct/batched_trace.json has no scheduling metadata. "
+            f"Re-run collect_batched_traces.py to generate step_scheduling.")
 
     # For validation we need peak concurrent sequences (not the simulator's
     # max_seqs=256) and enough per-slot pages for the longest actual sequence.

@@ -612,16 +612,16 @@ engine.replay_controller = None
 
 For realistic multi-sequence experiments, use `scripts/batched_replay.py`.
 **This is the only replay mode that produces valid timing data.** It faithfully
-recreates the batch compositions from Phase 2 (continuous batching simulator),
+recreates the batch compositions from Phase 1 (GPU batched collection),
 handling the full pipeline: loading batched traces, simulating policies,
 managing request_id→seq_id mapping, and replaying with mixed decode/prefill/
 continuation batches. See [scripts/README.md](scripts/README.md) for usage.
 
 ```bash
 python scripts/batched_replay.py \
-    --model models/Mixtral-8x7B-Instruct-v0.1 \
-    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b \
-    --cache-fraction 0.5 --max-seqs 256 --max-graph-size 512
+    --model models/Mixtral-8x7B \
+    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+    --cache-size 179 --max-graph-size 512
 ```
 
 ### Comparing Policies

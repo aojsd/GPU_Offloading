@@ -2,7 +2,7 @@
 
 Simulation-only tool: generates GPUReplayTrace files consumed by
 batched_replay.py for GPU replay. For GPU replay, use batched_replay.py
-directly or via 04_gpu_replay.sh.
+directly or via 03_gpu_replay.sh.
 
 Usage:
     # Simulate all policies for all cache%:
@@ -31,14 +31,22 @@ from policy_simulator import (
 
 TRACE_BASE = "datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b"
 
-# Ordered highest cache% first for priority
-CONFIGS = [
-    (85, 217),
-    (80, 204),
-    (70, 179),
-    (60, 153),
-    (50, 128),
-]
+# Cache percentages to simulate. cache_size is read from each trace's
+# scheduling config (written by collect_batched_traces.py).
+CACHE_PCTS = [80, 70, 60]
+
+
+def _read_cache_size(pct):
+    """Read cache_size from the batched trace's scheduling config."""
+    trace_path = f"{TRACE_BASE}/cache{pct}pct/batched_trace.json"
+    with open(trace_path) as f:
+        d = json.load(f)
+    cs = d.get('scheduling', {}).get('cache_size')
+    if cs is None:
+        raise ValueError(
+            f"cache_size not found in {trace_path} scheduling config. "
+            f"Re-run collect_batched_traces.py with --cache-fraction.")
+    return cs
 
 CACHE_POLICIES = [
     ("LRU", LRU),
@@ -54,13 +62,14 @@ PREFETCH_POLICIES = [
 ]
 
 
-def _simulate_one_cache_pct(pct, cs):
+def _simulate_one_cache_pct(pct):
     """Simulate all policies for a single cache% and save GPUReplayTrace files.
 
     Returns list of (policy_name, summary_dict) tuples.
     """
+    cs = _read_cache_size(pct)
     trace_dir = f"{TRACE_BASE}/cache{pct}pct"
-    trace_path = f"{trace_dir}/batched.json"
+    trace_path = f"{trace_dir}/batched_trace.json"
     at = ActivationTrace.load(trace_path)
     results = []
 
@@ -95,18 +104,18 @@ def run_simulations(parallel=False):
     all_results = {}
 
     if parallel:
-        with ProcessPoolExecutor(max_workers=len(CONFIGS)) as pool:
+        with ProcessPoolExecutor(max_workers=len(CACHE_PCTS)) as pool:
             futures = {
-                pool.submit(_simulate_one_cache_pct, pct, cs): (pct, cs)
-                for pct, cs in CONFIGS
+                pool.submit(_simulate_one_cache_pct, pct): pct
+                for pct in CACHE_PCTS
             }
             for future in as_completed(futures):
                 pct, cs, results = future.result()
                 all_results[pct] = (cs, results)
     else:
-        for pct, cs in CONFIGS:
-            _, _, results = _simulate_one_cache_pct(pct, cs)
-            all_results[pct] = (cs, results)
+        for pct in CACHE_PCTS:
+            _, _, results = _simulate_one_cache_pct(pct)
+            all_results[pct] = (_read_cache_size(pct), results)
 
     # Print summary table (sorted by cache%)
     for pct in sorted(all_results):
@@ -136,19 +145,16 @@ def run_simulations(parallel=False):
 def main():
     parser = argparse.ArgumentParser(
         description="Policy simulation (CPU-only). For GPU replay, use "
-                    "batched_replay.py or 04_gpu_replay.sh.")
+                    "batched_replay.py or 03_gpu_replay.sh.")
     parser.add_argument("--parallel", action="store_true",
                         help="Run cache%% simulations in parallel processes")
     parser.add_argument("--cache-pct", type=int, default=None,
                         help="Run only this cache%% (default: all)")
     args = parser.parse_args()
 
-    global CONFIGS
+    global CACHE_PCTS
     if args.cache_pct is not None:
-        CONFIGS = [(p, c) for p, c in CONFIGS if p == args.cache_pct]
-        if not CONFIGS:
-            print(f"No matching cache config for {args.cache_pct}%")
-            return
+        CACHE_PCTS = [args.cache_pct]
 
     run_simulations(parallel=args.parallel)
 

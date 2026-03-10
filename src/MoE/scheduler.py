@@ -26,8 +26,12 @@ from typing import Protocol, runtime_checkable
 
 import torch
 
-# Reuse from existing modules
-from trace_construction.build_trace import pages_needed
+
+def pages_needed(seq_len: int, page_size: int) -> int:
+    """KV pages for a sequence of given length."""
+    if seq_len <= 0:
+        return 0
+    return math.ceil(seq_len / page_size)
 
 
 # ---------------------------------------------------------------------------

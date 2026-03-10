@@ -299,31 +299,37 @@ Two workflows: **single-sequence** (simple, for development) and **batched** (re
 
 ### Batched Replay (Recommended for Experiments)
 
-The full pipeline: collect traces → build batch schedule → simulate policies → replay on GPU.
+The full pipeline: collect batched traces → simulate policies → replay on GPU.
 
 ```bash
-# Phase 1: Collect per-conversation traces (GPU, PP=2, once)
-cd src/MoE/trace_construction
-VLLM_ENABLE_V1_MULTIPROCESSING=0 python collect_traces.py \
-    --model models/Mixtral-8x7B-Instruct-v0.1 \
-    --dataset ../datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json \
-    --num-conversations 200 --max-output-tokens 1000 --pipeline-parallel 2 \
-    --output-dir ../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b
+# Phase 1: GPU-based batched trace collection per cache fraction (GPU, PP=N)
+bash scripts/01_collect_traces.sh
 
-# Phase 2: Build batched trace with chunked prefill (CPU-only, seconds)
-python build_trace.py \
-    --input-dir ../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b \
-    --model-config /path/to/Mixtral-8x7B/config.json \
-    --cache-fraction 0.5 --max-seqs 256 --max-graph-size 512 \
-    --output ../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache50pct/batched.json
+# Phase 2: Policy simulation (CPU-only)
+bash scripts/02_policy_simulate.sh
 
-# Phases 3+4: Policy simulation + GPU replay (all-in-one)
+# Phase 3: GPU replay of all policy traces
+bash scripts/03_gpu_replay.sh
+```
+
+Or manually:
+
+```bash
 cd src/MoE
+
+# Phase 1: Collect batched traces (one run per cache fraction)
+python trace_construction/collect_batched_traces.py \
+    --model models/Mixtral-8x7B \
+    --dataset datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json \
+    --output-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+    --cache-fraction 0.7 --num-conversations 200 --max-seqs 32 --pp 2 --resume
+
+# Phases 2+3: Policy simulation + GPU replay
 python scripts/batched_replay.py \
-    --model models/Mixtral-8x7B-Instruct-v0.1 \
-    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b \
-    --batched-trace datasets/.../cache50pct/batched.json \
-    --cache-size 128 --max-graph-size 512
+    --model models/Mixtral-8x7B \
+    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+    --batched-trace datasets/.../cache70pct/batched_trace.json \
+    --cache-size 179 --max-graph-size 512
 ```
 
 See [trace_construction/README.md](trace_construction/README.md) for the full pipeline,
@@ -389,7 +395,7 @@ and GPU memory budget analysis.
 
 | File | Covers |
 |------|--------|
-| [offload_1GPU.md](offload_1GPU.md) | Expert offloading research notes, Phases 3-4 implementation, memory analysis, benchmarks |
+| [offload_1GPU.md](offload_1GPU.md) | Expert offloading research notes, cache/prefetch policy implementation, memory analysis, benchmarks |
 | [pipeline_parallelism.md](pipeline_parallelism.md) | PP=2 performance analysis, per-layer breakdown, optimization targets |
 | [replay.md](replay.md) | Cache simulation & replay: trace formats, policy simulators, replay controller architecture, prefetch/eviction timing |
 
@@ -402,7 +408,7 @@ and GPU memory budget analysis.
 | [benchmarks/](benchmarks/) | [README.md](benchmarks/README.md) | Performance benchmarks: per-layer kernel timing, e2e prefill/mixed latency |
 | [profiling/](profiling/) | [README.md](profiling/README.md) | Nsight Systems and per-phase kernel profiling harnesses |
 | [scripts/](scripts/) | [README.md](scripts/README.md) | Experiment runners (policy sweeps) |
-| [trace_construction/](trace_construction/) | [README.md](trace_construction/README.md) | Trace collection pipeline: per-conversation GPU traces → batched CPU simulator → policy simulation |
+| [trace_construction/](trace_construction/) | [README.md](trace_construction/README.md) | Trace collection pipeline: GPU batched collection → policy simulation → GPU replay |
 
 ### Utility Commands
 

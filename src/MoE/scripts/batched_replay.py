@@ -44,6 +44,7 @@ from build_trace import load_traces, ConversationTrace, compute_kv_budget_from_c
 from policy_simulator import (
     LRU, LFU, Belady, StaticFreq, NoPrefetch, OraclePrefetch, simulate,
 )
+from scheduler import Scheduler
 
 
 CACHE_POLICIES = [
@@ -60,142 +61,6 @@ PREFETCH_POLICIES = [
 ]
 
 
-def load_full_tokens(traces: list[ConversationTrace],
-                     device: torch.device) -> dict[int, torch.Tensor]:
-    """Pre-load full token sequences (prompt + output) keyed by trace index.
-
-    During recompute after preemption, prefill chunks extend past the original
-    prompt into previously-generated output tokens. Using just prompt_token_ids
-    would produce out-of-bounds slices for recompute prefill steps.
-    For non-preempted requests the extra tokens are never accessed.
-    """
-    full_tokens = {}
-    for i, t in enumerate(traces):
-        ids = list(t.prompt_token_ids or [])
-        ids += list(t.output_token_ids or [])
-        if ids:
-            full_tokens[i] = torch.tensor(ids, dtype=torch.long, device=device)
-        else:
-            full_tokens[i] = torch.ones(t.prompt_tokens, dtype=torch.long,
-                                        device=device)
-    return full_tokens
-
-
-def _run_steps(engine, controller, per_conv_traces, full_token_seqs, max_seqs,
-               n_steps):
-    """Run n_steps of batched replay. Returns skipped_admissions count."""
-    free_seq_ids = set(range(max_seqs))
-    request_to_slot: dict[int, int] = {}
-    active_requests: dict[int, dict] = {}
-    skipped_admissions = 0
-
-    with torch.inference_mode():
-        for step in range(n_steps):
-            sched = controller.get_step_scheduling(step)
-            if sched is None:
-                raise RuntimeError(
-                    f"Step {step}: no scheduling metadata. "
-                    f"Batched replay requires traces from build_trace.py.")
-
-            # Process events: completions, admissions
-            for evt in sched.events:
-                if evt['event'] == 'complete':
-                    rid = evt['request_id']
-                    if rid in request_to_slot:
-                        sid = request_to_slot.pop(rid)
-                        engine.free_seq(sid)
-                        free_seq_ids.add(sid)
-                        active_requests.pop(rid, None)
-
-                elif evt['event'] in ('admit', 'force_admit'):
-                    rid = evt['request_id']
-                    if not free_seq_ids:
-                        skipped_admissions += 1
-                        continue
-                    sid = free_seq_ids.pop()
-                    request_to_slot[rid] = sid
-                    if rid not in active_requests:
-                        # Fresh admission — initialize decode counter
-                        active_requests[rid] = {'sid': sid, 'decode_step': 0}
-                    else:
-                        # Readmission after preemption — update slot, preserve
-                        # decode_step so decode resumes at the right token index.
-                        active_requests[rid]['sid'] = sid
-
-                elif evt['event'] == 'preempt':
-                    rid = evt['request_id']
-                    if rid in request_to_slot:
-                        sid = request_to_slot.pop(rid)
-                        engine.free_seq(sid)
-                        free_seq_ids.add(sid)
-                        # active_requests[rid] is kept intentionally: preserves
-                        # decode_step for when the request is readmitted.
-                        # The `if rid not in request_to_slot: continue` guard
-                        # below prevents acting on it while it is unscheduled.
-
-            # Build mixed_step arguments from active_requests metadata
-            decode_sids = []
-            decode_tokens = []
-            prefill_sids = []
-            prefill_tokens = []
-            continuation_sids = []
-            continuation_tokens = []
-            continuation_offsets = []
-
-            for ar in sched.active_requests:
-                rid = ar.request_id
-                if rid not in request_to_slot:
-                    continue
-                sid = request_to_slot[rid]
-                state = active_requests[rid]
-
-                if ar.is_prefill:
-                    chunk_start = ar.prefill_chunk_start
-                    chunk_len = ar.prefill_chunk_length
-                    prompt = full_token_seqs[rid]
-                    chunk_tokens = prompt[chunk_start:chunk_start + chunk_len]
-
-                    if ar.is_continuation:
-                        continuation_sids.append(sid)
-                        continuation_tokens.append(chunk_tokens)
-                        continuation_offsets.append(chunk_start)
-                    else:
-                        prefill_sids.append(sid)
-                        prefill_tokens.append(chunk_tokens)
-                else:
-                    decode_sids.append(sid)
-                    # Use traced output token if available for faithful replay
-                    trace = per_conv_traces[rid]
-                    decode_idx = state['decode_step']
-                    if (trace.output_token_ids is not None
-                            and decode_idx < len(trace.output_token_ids)):
-                        decode_tokens.append(trace.output_token_ids[decode_idx])
-                    else:
-                        decode_tokens.append(1)  # dummy fallback
-                    state['decode_step'] = decode_idx + 1
-
-            # Prepare inputs
-            if decode_tokens:
-                decode_token_tensor = torch.tensor(
-                    decode_tokens, dtype=torch.long, device=engine.device)
-            else:
-                decode_token_tensor = torch.tensor(
-                    [], dtype=torch.long, device=engine.device)
-
-            # Call mixed_step with all three token types
-            engine.mixed_step(
-                decode_seq_ids=decode_sids,
-                decode_token_ids=decode_token_tensor,
-                prefill_seq_ids=prefill_sids,
-                prefill_input_ids=prefill_tokens,
-                continuation_seq_ids=continuation_sids,
-                continuation_input_ids=continuation_tokens,
-                continuation_offsets=continuation_offsets,
-            )
-
-    return skipped_admissions
-
-
 def replay_trace(engine, dm_trace, per_conv_traces, full_token_seqs,
                  max_graph_size, warmup_steps=50, max_steps=None):
     """Run a full batched replay of a GPUReplayTrace.
@@ -204,7 +69,8 @@ def replay_trace(engine, dm_trace, per_conv_traces, full_token_seqs,
         engine: MoEEngine with cache_size set and graphs captured.
         dm_trace: GPUReplayTrace from policy simulation.
         per_conv_traces: List of ConversationTrace objects.
-        prompts: Dict[int, Tensor] of prompt token IDs.
+        full_token_seqs: Dict[int, Tensor] of full token sequences (unused,
+            kept for backward compat — Scheduler builds its own).
         max_graph_size: Max total tokens per step.
         warmup_steps: Number of untimed warmup steps.
 
@@ -215,41 +81,45 @@ def replay_trace(engine, dm_trace, per_conv_traces, full_token_seqs,
     if max_steps is not None:
         total_steps = min(total_steps, max_steps)
     max_seqs = engine.max_seqs
+    page_size = getattr(engine, 'page_size', 16)
+
+    # Build conversations list for Scheduler.replay()
+    conversations = [
+        {'request_idx': i,
+         'prompt_token_ids': list(t.prompt_token_ids or []),
+         'output_token_ids': list(t.output_token_ids or [])}
+        for i, t in enumerate(per_conv_traces)
+    ]
+
+    sched = Scheduler(engine, max_seqs, max_graph_size, page_size)
 
     # --- Warmup pass: replay first N steps with actual trace data ---
     n_warmup = min(warmup_steps, total_steps)
-    engine.reset()
     warmup_ctrl = ReplayController(engine, dm_trace)
-    warmup_ctrl.setup()
-    engine.replay_controller = warmup_ctrl
-    _run_steps(engine, warmup_ctrl, per_conv_traces, full_token_seqs, max_seqs,
-               n_warmup)
-    engine.replay_controller = None
+    sched.replay(conversations, controller=warmup_ctrl,
+                 n_steps=n_warmup, record_tokens=False)
 
     # --- Timed replay: full run from step 0 with fresh controller ---
     engine.reset()
     controller = ReplayController(engine, dm_trace, track_phases=True)
-    controller.setup()
-    engine.replay_controller = controller
 
     torch.cuda.synchronize()
     start_evt = torch.cuda.Event(enable_timing=True)
     end_evt = torch.cuda.Event(enable_timing=True)
     start_evt.record()
 
-    skipped_admissions = _run_steps(
-        engine, controller, per_conv_traces, full_token_seqs, max_seqs, total_steps)
+    replay_result = sched.replay(
+        conversations, controller=controller,
+        n_steps=total_steps, record_tokens=False)
 
     end_evt.record()
     torch.cuda.synchronize()
     total_ms = start_evt.elapsed_time(end_evt)
 
-    engine.replay_controller = None
-
-    if skipped_admissions > 0:
+    if replay_result.skipped_admissions > 0:
         import warnings
         warnings.warn(
-            f"Skipped {skipped_admissions} admissions due to "
+            f"Skipped {replay_result.skipped_admissions} admissions due to "
             f"max_seqs={max_seqs} < trace demand. Results may be invalid.")
 
     # Extract per-phase timing if available
@@ -257,7 +127,7 @@ def replay_trace(engine, dm_trace, per_conv_traces, full_token_seqs,
         'total_ms': total_ms,
         'ms_per_step': total_ms / total_steps,
         'steps': total_steps,
-        'skipped_admissions': skipped_admissions,
+        'skipped_admissions': replay_result.skipped_admissions,
     }
     phases = controller.get_phase_times_ms()
     if phases:
@@ -415,10 +285,6 @@ def run_batched_replay(model_path, batched_trace_path, per_conv_traces,
             _size_usage[covering] += 1
     print(f"Graph coverage: {dict(sorted(_size_usage.items()))}")
 
-    # Pre-load full token sequences (prompt + output) for faithful prefill replay.
-    # Output tokens are needed for recompute prefill after preemption.
-    full_token_seqs = load_full_tokens(per_conv_traces, engine.device)
-
     # Replay each policy
     print(f"\n=== Replay ({warmup_steps}-step warmup + {total_steps}-step "
           f"timed run) ===")
@@ -430,7 +296,7 @@ def run_batched_replay(model_path, batched_trace_path, per_conv_traces,
     for name, dm in dm_traces.items():
         s = dm.summary()
         timing = replay_trace(
-            engine, dm, per_conv_traces, full_token_seqs,
+            engine, dm, per_conv_traces, None,
             max_graph_size, warmup_steps, max_steps,
         )
         print(f"{name:<20s}  {timing['total_ms']:10.1f}  "

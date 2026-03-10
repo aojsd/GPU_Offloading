@@ -28,6 +28,7 @@ from trace_construction.collect_batched_traces import (
     collect_batched,
     extract_next_tokens,
 )
+from scheduler import Scheduler, CollectionResult, ReplayResult
 
 DEFAULT_MODEL = str(
     Path(__file__).resolve().parent.parent / "models" / "OLMoE-1B-7B")
@@ -445,7 +446,7 @@ def test_eos_terminates_early(engine, page_size=16):
 def test_replay_faithfulness(engine, page_size=16):
     """Test 7: Replay with collected tokens reproduces identical expert routing.
 
-    Pipeline: collect_batched → serialize → load → manual replay loop (feeding
+    Pipeline: collect → serialize → load → Scheduler.replay() (feeding
     the collected output tokens back through the engine) → compare expert routing.
     If routing matches, the replay engine sees the same hidden states at every
     layer, confirming token faithfulness.
@@ -460,7 +461,6 @@ def test_replay_faithfulness(engine, page_size=16):
     )
     from gpu_replay_trace import ActivationTrace
     from trace_construction.build_trace import load_traces
-    from trace_recorder import TraceRecorder
 
     # Phase 1: Collect traces (generous budget, no preemption)
     conversations = [
@@ -469,25 +469,26 @@ def test_replay_faithfulness(engine, page_size=16):
          'max_output_tokens': 16}
         for i in range(3)
     ]
-    result = collect_batched(
-        engine, conversations, max_seqs=engine.max_seqs,
-        max_graph_size=512, page_size=page_size)
-    collection_trace = result['trace']
+    sched = Scheduler(engine, max_seqs=engine.max_seqs,
+                      max_graph_size=512, page_size=page_size)
+    collected = sched.collect(conversations)
+    collection_trace = collected.trace
     engine.reset()
     torch.cuda.empty_cache()
 
-    print(f"  Collected: {result['step_count']} steps, "
+    print(f"  Collected: {collected.step_count} steps, "
           f"{len(collection_trace)} trace entries")
 
     # Phase 2: Serialize → load (validates data roundtrip)
     with tempfile.TemporaryDirectory() as d:
+        result = collected.to_dict()
         save_batched_trace(result, d, {'max_seqs': engine.max_seqs})
         manifest_entries = save_conversations(result, d, top_k=2)
         manifest = {
-            'model': 'test', 'num_layers': result['num_layers'],
-            'num_experts': result['num_experts'], 'top_k': 2,
+            'model': 'test', 'num_layers': collected.num_layers,
+            'num_experts': collected.num_experts, 'top_k': 2,
             'total_conversations': len(manifest_entries),
-            'step_count': result['step_count'],
+            'step_count': collected.step_count,
             'scheduling': {'max_seqs': engine.max_seqs},
             'conversations': manifest_entries,
         }
@@ -498,204 +499,54 @@ def test_replay_faithfulness(engine, page_size=16):
         per_conv_traces, _ = load_traces(d)
 
     assert at.scheduling is not None
-    assert len(at.scheduling) == result['step_count']
+    assert len(at.scheduling) == collected.step_count
     print(f"  Loaded: {len(at.scheduling)} scheduling steps, "
           f"{len(per_conv_traces)} conversations")
 
     # Phase 3: Replay — feed collected tokens, record routing
-    recorder = TraceRecorder(engine.num_layers, engine.num_experts)
-    engine.trace_recorder = recorder
-
-    # Build full_token_seqs (prompt + output) for faithful replay
-    full_token_seqs = {}
-    for i, t in enumerate(per_conv_traces):
-        ids = list(t.prompt_token_ids or []) + list(t.output_token_ids or [])
-        full_token_seqs[i] = torch.tensor(
-            ids, dtype=torch.long, device=engine.device)
-
-    free_seq_ids = set(range(engine.max_seqs))
-    request_to_slot: dict[int, int] = {}
-    active_requests: dict[int, dict] = {}
-    replay_output_tokens: dict[int, list] = {i: [] for i in range(len(conversations))}
-    prompt_lens = {i: len(conversations[i]['prompt_token_ids'])
-                   for i in range(len(conversations))}
-
-    with torch.inference_mode():
-        for step_idx in range(len(at.scheduling)):
-            sched = at.scheduling[step_idx]
-
-            # Process events (same logic as _run_steps in batched_replay.py)
-            for evt in sched.events:
-                if evt['event'] == 'complete':
-                    rid = evt['request_id']
-                    if rid in request_to_slot:
-                        sid = request_to_slot.pop(rid)
-                        engine.free_seq(sid)
-                        free_seq_ids.add(sid)
-                        active_requests.pop(rid, None)
-                elif evt['event'] in ('admit', 'force_admit'):
-                    rid = evt['request_id']
-                    sid = free_seq_ids.pop()
-                    request_to_slot[rid] = sid
-                    if rid not in active_requests:
-                        active_requests[rid] = {
-                            'sid': sid, 'decode_step': 0,
-                            'num_computed': 0, 'needs_prefill': True,
-                        }
-                    else:
-                        active_requests[rid]['sid'] = sid
-                        active_requests[rid]['num_computed'] = 0
-                        active_requests[rid]['needs_prefill'] = True
-                elif evt['event'] == 'preempt':
-                    rid = evt['request_id']
-                    if rid in request_to_slot:
-                        sid = request_to_slot.pop(rid)
-                        engine.free_seq(sid)
-                        free_seq_ids.add(sid)
-
-            # Build mixed_step args from scheduling metadata
-            decode_sids = []
-            decode_tokens_list = []
-            prefill_sids = []
-            prefill_input_ids = []
-            prefill_chunk_lengths = []
-            continuation_sids = []
-            continuation_input_ids = []
-            continuation_offsets = []
-            continuation_chunk_lengths = []
-            batch_ar_info = []  # (rid, is_prefill, chunk_length)
-
-            for ar in sched.active_requests:
-                rid = ar.request_id
-                if rid not in request_to_slot:
-                    continue
-                sid = request_to_slot[rid]
-                state = active_requests[rid]
-
-                if ar.is_prefill:
-                    prompt = full_token_seqs[rid]
-                    chunk_tokens = prompt[ar.prefill_chunk_start:
-                                          ar.prefill_chunk_start + ar.prefill_chunk_length]
-                    batch_ar_info.append(
-                        (rid, True, ar.prefill_chunk_length))
-                    if ar.is_continuation:
-                        continuation_sids.append(sid)
-                        continuation_input_ids.append(chunk_tokens)
-                        continuation_offsets.append(ar.prefill_chunk_start)
-                        continuation_chunk_lengths.append(ar.prefill_chunk_length)
-                    else:
-                        prefill_sids.append(sid)
-                        prefill_input_ids.append(chunk_tokens)
-                        prefill_chunk_lengths.append(ar.prefill_chunk_length)
-                else:
-                    batch_ar_info.append((rid, False, 0))
-                    decode_sids.append(sid)
-                    trace = per_conv_traces[rid]
-                    decode_idx = state['decode_step']
-                    if (trace.output_token_ids
-                            and decode_idx < len(trace.output_token_ids)):
-                        decode_tokens_list.append(
-                            trace.output_token_ids[decode_idx])
-                    else:
-                        decode_tokens_list.append(1)
-                    state['decode_step'] = decode_idx + 1
-
-            decode_token_tensor = torch.tensor(
-                decode_tokens_list if decode_tokens_list else [],
-                dtype=torch.long, device=engine.device)
-
-            # Allocate pages before mixed_step (dynamic page mode)
-            if engine._dynamic_pages:
-                for sid in decode_sids:
-                    sl = int(engine._seq_lens_cpu[sid].item())
-                    engine.ensure_pages(sid, (sl + page_size) // page_size)
-                for sid, ids in zip(prefill_sids, prefill_input_ids):
-                    engine.ensure_pages(
-                        sid, math.ceil(len(ids) / page_size))
-                for sid, off, ids in zip(
-                        continuation_sids, continuation_offsets,
-                        continuation_input_ids):
-                    engine.ensure_pages(
-                        sid, math.ceil((off + len(ids)) / page_size))
-
-            logits = engine.mixed_step(
-                decode_seq_ids=decode_sids,
-                decode_token_ids=decode_token_tensor,
-                prefill_seq_ids=prefill_sids,
-                prefill_input_ids=prefill_input_ids,
-                continuation_seq_ids=continuation_sids,
-                continuation_input_ids=continuation_input_ids,
-                continuation_offsets=continuation_offsets,
-            )
-
-            replay_next = extract_next_tokens(
-                logits, len(decode_sids),
-                prefill_chunk_lengths, continuation_chunk_lengths)
-
-            # Mirror advance_state: only append token when prefill
-            # completes or during decode.
-            for tok_idx, (rid, is_pf, chunk_len) in enumerate(
-                    batch_ar_info):
-                if tok_idx >= len(replay_next):
-                    break
-                state = active_requests[rid]
-                if is_pf:
-                    state['num_computed'] += chunk_len
-                    eff_prompt = (prompt_lens[rid]
-                                  + len(replay_output_tokens[rid]))
-                    if state['num_computed'] >= eff_prompt:
-                        state['needs_prefill'] = False
-                        replay_output_tokens[rid].append(
-                            replay_next[tok_idx])
-                        # Sync decode_step: the just-appended token is
-                        # the last model output, which the next decode
-                        # step must feed as input.
-                        state['decode_step'] = len(
-                            replay_output_tokens[rid]) - 1
-                else:
-                    replay_output_tokens[rid].append(
-                        replay_next[tok_idx])
-
-    engine.trace_recorder = None
-    engine.reset()
+    replayed = sched.replay(
+        collected.conversations,
+        scheduling=at.scheduling,
+        record_routing=True, record_tokens=True)
 
     # Phase 4: Compare expert routing
-    replay_trace_data = recorder.trace
     passed = True
 
-    if len(replay_trace_data) != len(collection_trace):
-        print(f"  FAIL: trace length: replay={len(replay_trace_data)} "
+    if len(replayed.trace_data) != len(collection_trace):
+        print(f"  FAIL: trace length: replay={len(replayed.trace_data)} "
               f"vs collection={len(collection_trace)}")
         passed = False
     else:
-        mismatches = 0
-        for i, (rt, ct) in enumerate(zip(replay_trace_data, collection_trace)):
-            if rt['expert_ids'] != ct['expert_ids']:
-                if mismatches < 5:
-                    print(f"  ROUTING MISMATCH step {rt['step']} "
-                          f"layer {rt['layer']}: replay={rt['expert_ids']} "
-                          f"vs collection={ct['expert_ids']}")
-                mismatches += 1
-        if mismatches > 0:
-            print(f"  {mismatches}/{len(collection_trace)} routing mismatches")
+        routing_ok, n_mismatch = replayed.compare_routing(collection_trace)
+        if not routing_ok:
+            # Print first few mismatches for debugging
+            count = 0
+            for i, (rt, ct) in enumerate(
+                    zip(replayed.trace_data, collection_trace)):
+                if rt['expert_ids'] != ct['expert_ids']:
+                    if count < 5:
+                        print(f"  ROUTING MISMATCH step {rt['step']} "
+                              f"layer {rt['layer']}: replay={rt['expert_ids']} "
+                              f"vs collection={ct['expert_ids']}")
+                    count += 1
+            print(f"  {n_mismatch}/{len(collection_trace)} routing mismatches")
             passed = False
         else:
             print(f"  Expert routing: {len(collection_trace)} entries all match")
 
     # Phase 5: Compare output tokens
-    for conv in result['conversations']:
+    tokens_ok, token_mismatches = replayed.compare_tokens(collected)
+    for conv in collected.conversations:
         rid = conv['request_idx']
-        collected = conv['output_token_ids']
-        replayed = replay_output_tokens[rid]
-        # Replay may have fewer tokens (we don't compare completions)
-        n = min(len(collected), len(replayed))
-        if n > 0 and collected[:n] != replayed[:n]:
-            first_diff = next(
-                (j for j in range(n) if collected[j] != replayed[j]), n)
+        collected_toks = conv['output_token_ids']
+        replayed_toks = replayed.output_tokens.get(rid, [])
+        n = min(len(collected_toks), len(replayed_toks))
+        if rid in token_mismatches:
+            first_diff = token_mismatches[rid]
             print(f"  TOKEN MISMATCH conv {conv['conversation_id']}: "
                   f"first diff at token {first_diff} "
-                  f"(collected={collected[first_diff]}, "
-                  f"replayed={replayed[first_diff]})")
+                  f"(collected={collected_toks[first_diff]}, "
+                  f"replayed={replayed_toks[first_diff]})")
             passed = False
         else:
             print(f"  Tokens conv {conv['conversation_id']}: "
@@ -709,8 +560,9 @@ def test_replay_faithfulness_with_preemption(engine, kv_page_budget, page_size=1
     """Test 8: Replay faithfulness under preemption.
 
     Same pipeline as test 7 but with tight KV budget forcing preemptions.
-    Verifies that collect → serialize → load → replay produces identical expert
-    routing and output tokens even when the trace contains preempt/readmit events.
+    Verifies that collect → serialize → load → Scheduler.replay() produces
+    identical expert routing and output tokens even when the trace contains
+    preempt/readmit events.
     """
     print("\n── Test 8: Replay faithfulness with preemption ──")
     print(f"  kv_page_budget: {kv_page_budget}")
@@ -723,28 +575,24 @@ def test_replay_faithfulness_with_preemption(engine, kv_page_budget, page_size=1
     )
     from gpu_replay_trace import ActivationTrace
     from trace_construction.build_trace import load_traces
-    from trace_recorder import TraceRecorder
 
     # Phase 1: Collect with tight budget → must produce preemptions
-    # 12 conversations with increasing prompt lengths (64..240 tokens)
-    # and 256 output tokens each. With tight budget (32 pages = 512 tokens),
-    # this forces heavy preemption and multi-preemption scenarios.
     conversations = [
         {'conversation_id': f'preempt_{i}',
          'prompt_token_ids': list(range(1, 65 + 16 * i)),
          'max_output_tokens': 256}
         for i in range(12)
     ]
-    result = collect_batched(
-        engine, conversations, max_seqs=engine.max_seqs,
-        max_graph_size=512, page_size=page_size)
-    collection_trace = result['trace']
+    sched = Scheduler(engine, max_seqs=engine.max_seqs,
+                      max_graph_size=512, page_size=page_size)
+    collected = sched.collect(conversations)
+    collection_trace = collected.trace
     engine.reset()
     torch.cuda.empty_cache()
 
     total_preemptions = sum(
-        c['num_preemptions'] for c in result['conversations'])
-    print(f"  Collected: {result['step_count']} steps, "
+        c['num_preemptions'] for c in collected.conversations)
+    print(f"  Collected: {collected.step_count} steps, "
           f"{len(collection_trace)} trace entries, "
           f"{total_preemptions} preemptions")
 
@@ -754,16 +602,16 @@ def test_replay_faithfulness_with_preemption(engine, kv_page_budget, page_size=1
 
     # Check preempt events exist in scheduling
     preempt_events = sum(
-        1 for s in result['all_step_scheduling']
+        1 for s in collected.all_step_scheduling
         for e in s.get('events', []) if e['event'] == 'preempt')
     readmit_events = sum(
-        1 for s in result['all_step_scheduling']
+        1 for s in collected.all_step_scheduling
         for e in s.get('events', [])
         if e['event'] in ('admit', 'force_admit')
         and any(
             prev_e['event'] == 'preempt'
             and prev_e['request_id'] == e['request_id']
-            for prev_s in result['all_step_scheduling']
+            for prev_s in collected.all_step_scheduling
             for prev_e in prev_s.get('events', [])
         ))
     print(f"  Scheduling: {preempt_events} preempt events, "
@@ -771,16 +619,17 @@ def test_replay_faithfulness_with_preemption(engine, kv_page_budget, page_size=1
 
     # Phase 2: Serialize → load
     with tempfile.TemporaryDirectory() as d:
+        result = collected.to_dict()
         save_batched_trace(result, d, {
             'max_seqs': engine.max_seqs,
             'kv_page_budget': kv_page_budget,
         })
         manifest_entries = save_conversations(result, d, top_k=2)
         manifest = {
-            'model': 'test', 'num_layers': result['num_layers'],
-            'num_experts': result['num_experts'], 'top_k': 2,
+            'model': 'test', 'num_layers': collected.num_layers,
+            'num_experts': collected.num_experts, 'top_k': 2,
             'total_conversations': len(manifest_entries),
-            'step_count': result['step_count'],
+            'step_count': collected.step_count,
             'scheduling': {'max_seqs': engine.max_seqs},
             'conversations': manifest_entries,
         }
@@ -791,7 +640,7 @@ def test_replay_faithfulness_with_preemption(engine, kv_page_budget, page_size=1
         per_conv_traces, _ = load_traces(d)
 
     assert at.scheduling is not None
-    assert len(at.scheduling) == result['step_count']
+    assert len(at.scheduling) == collected.step_count
 
     # Verify scheduling has preemption events after roundtrip
     loaded_preempt_events = sum(
@@ -802,203 +651,44 @@ def test_replay_faithfulness_with_preemption(engine, kv_page_budget, page_size=1
     assert loaded_preempt_events == preempt_events
 
     # Phase 3: Replay — feed collected tokens, record routing
-    recorder = TraceRecorder(engine.num_layers, engine.num_experts)
-    engine.trace_recorder = recorder
-
-    full_token_seqs = {}
-    for i, t in enumerate(per_conv_traces):
-        ids = list(t.prompt_token_ids or []) + list(t.output_token_ids or [])
-        full_token_seqs[i] = torch.tensor(
-            ids, dtype=torch.long, device=engine.device)
-
-    free_seq_ids = set(range(engine.max_seqs))
-    request_to_slot: dict[int, int] = {}
-    active_requests: dict[int, dict] = {}
-    replay_output_tokens: dict[int, list] = {
-        i: [] for i in range(len(conversations))}
-    replay_preemptions: dict[int, int] = {
-        i: 0 for i in range(len(conversations))}
-    # Track prefill progress to mirror advance_state token-appending
-    prompt_lens = {i: len(conversations[i]['prompt_token_ids'])
-                   for i in range(len(conversations))}
-
-    with torch.inference_mode():
-        for step_idx in range(len(at.scheduling)):
-            sched = at.scheduling[step_idx]
-
-            for evt in sched.events:
-                if evt['event'] == 'complete':
-                    rid = evt['request_id']
-                    if rid in request_to_slot:
-                        sid = request_to_slot.pop(rid)
-                        engine.free_seq(sid)
-                        free_seq_ids.add(sid)
-                        active_requests.pop(rid, None)
-                elif evt['event'] in ('admit', 'force_admit'):
-                    rid = evt['request_id']
-                    sid = free_seq_ids.pop()
-                    request_to_slot[rid] = sid
-                    if rid not in active_requests:
-                        active_requests[rid] = {
-                            'sid': sid, 'decode_step': 0,
-                            'num_computed': 0, 'needs_prefill': True,
-                        }
-                    else:
-                        active_requests[rid]['sid'] = sid
-                        # Readmission: reset prefill progress for recompute
-                        active_requests[rid]['num_computed'] = 0
-                        active_requests[rid]['needs_prefill'] = True
-                elif evt['event'] == 'preempt':
-                    rid = evt['request_id']
-                    replay_preemptions[rid] += 1
-                    if rid in request_to_slot:
-                        sid = request_to_slot.pop(rid)
-                        engine.free_seq(sid)
-                        free_seq_ids.add(sid)
-
-            # Build mixed_step args
-            decode_sids = []
-            decode_tokens_list = []
-            prefill_sids = []
-            prefill_input_ids = []
-            prefill_chunk_lengths = []
-            continuation_sids = []
-            continuation_input_ids = []
-            continuation_offsets = []
-            continuation_chunk_lengths = []
-            # Track which rids are prefill vs decode in batch order
-            batch_ar_info = []  # (rid, is_prefill, chunk_length)
-
-            for ar in sched.active_requests:
-                rid = ar.request_id
-                if rid not in request_to_slot:
-                    continue
-                sid = request_to_slot[rid]
-                state = active_requests[rid]
-
-                if ar.is_prefill:
-                    prompt = full_token_seqs[rid]
-                    chunk_tokens = prompt[ar.prefill_chunk_start:
-                                          ar.prefill_chunk_start
-                                          + ar.prefill_chunk_length]
-                    batch_ar_info.append(
-                        (rid, True, ar.prefill_chunk_length))
-                    if ar.is_continuation:
-                        continuation_sids.append(sid)
-                        continuation_input_ids.append(chunk_tokens)
-                        continuation_offsets.append(ar.prefill_chunk_start)
-                        continuation_chunk_lengths.append(
-                            ar.prefill_chunk_length)
-                    else:
-                        prefill_sids.append(sid)
-                        prefill_input_ids.append(chunk_tokens)
-                        prefill_chunk_lengths.append(ar.prefill_chunk_length)
-                else:
-                    batch_ar_info.append((rid, False, 0))
-                    decode_sids.append(sid)
-                    trace = per_conv_traces[rid]
-                    decode_idx = state['decode_step']
-                    if (trace.output_token_ids
-                            and decode_idx < len(trace.output_token_ids)):
-                        decode_tokens_list.append(
-                            trace.output_token_ids[decode_idx])
-                    else:
-                        decode_tokens_list.append(1)
-                    state['decode_step'] = decode_idx + 1
-
-            decode_token_tensor = torch.tensor(
-                decode_tokens_list if decode_tokens_list else [],
-                dtype=torch.long, device=engine.device)
-
-            # Allocate pages before mixed_step (dynamic page mode)
-            if engine._dynamic_pages:
-                for sid in decode_sids:
-                    sl = int(engine._seq_lens_cpu[sid].item())
-                    engine.ensure_pages(sid, (sl + page_size) // page_size)
-                for sid, ids in zip(prefill_sids, prefill_input_ids):
-                    engine.ensure_pages(
-                        sid, math.ceil(len(ids) / page_size))
-                for sid, off, ids in zip(
-                        continuation_sids, continuation_offsets,
-                        continuation_input_ids):
-                    engine.ensure_pages(
-                        sid, math.ceil((off + len(ids)) / page_size))
-
-            logits = engine.mixed_step(
-                decode_seq_ids=decode_sids,
-                decode_token_ids=decode_token_tensor,
-                prefill_seq_ids=prefill_sids,
-                prefill_input_ids=prefill_input_ids,
-                continuation_seq_ids=continuation_sids,
-                continuation_input_ids=continuation_input_ids,
-                continuation_offsets=continuation_offsets,
-            )
-
-            replay_next = extract_next_tokens(
-                logits, len(decode_sids),
-                prefill_chunk_lengths, continuation_chunk_lengths)
-
-            # Mirror advance_state: only append token when prefill
-            # completes or during decode. Intermediate prefill chunks
-            # produce tokens that the collection discards.
-            for tok_idx, (rid, is_pf, chunk_len) in enumerate(
-                    batch_ar_info):
-                if tok_idx >= len(replay_next):
-                    break
-                state = active_requests[rid]
-                if is_pf:
-                    state['num_computed'] += chunk_len
-                    eff_prompt = (prompt_lens[rid]
-                                  + len(replay_output_tokens[rid]))
-                    if state['num_computed'] >= eff_prompt:
-                        state['needs_prefill'] = False
-                        replay_output_tokens[rid].append(
-                            replay_next[tok_idx])
-                        # Sync decode_step: the just-appended token is
-                        # the last model output, which the next decode
-                        # step must feed as input. Its index in
-                        # output_token_ids is len-1 after append.
-                        state['decode_step'] = len(
-                            replay_output_tokens[rid]) - 1
-                else:
-                    replay_output_tokens[rid].append(
-                        replay_next[tok_idx])
-
-    engine.trace_recorder = None
-    engine.reset()
+    replayed = sched.replay(
+        collected.conversations,
+        scheduling=at.scheduling,
+        record_routing=True, record_tokens=True)
 
     # Phase 4: Compare expert routing
-    replay_trace_data = recorder.trace
     passed = True
 
-    if len(replay_trace_data) != len(collection_trace):
-        print(f"  FAIL: trace length: replay={len(replay_trace_data)} "
+    if len(replayed.trace_data) != len(collection_trace):
+        print(f"  FAIL: trace length: replay={len(replayed.trace_data)} "
               f"vs collection={len(collection_trace)}")
         passed = False
     else:
-        mismatches = 0
-        for i, (rt, ct) in enumerate(zip(replay_trace_data, collection_trace)):
-            if rt['expert_ids'] != ct['expert_ids']:
-                if mismatches < 5:
-                    print(f"  ROUTING MISMATCH step {rt['step']} "
-                          f"layer {rt['layer']}: replay={rt['expert_ids']} "
-                          f"vs collection={ct['expert_ids']}")
-                mismatches += 1
-        if mismatches > 0:
-            print(f"  {mismatches}/{len(collection_trace)} routing mismatches")
+        routing_ok, n_mismatch = replayed.compare_routing(collection_trace)
+        if not routing_ok:
+            count = 0
+            for i, (rt, ct) in enumerate(
+                    zip(replayed.trace_data, collection_trace)):
+                if rt['expert_ids'] != ct['expert_ids']:
+                    if count < 5:
+                        print(f"  ROUTING MISMATCH step {rt['step']} "
+                              f"layer {rt['layer']}: replay={rt['expert_ids']} "
+                              f"vs collection={ct['expert_ids']}")
+                    count += 1
+            print(f"  {n_mismatch}/{len(collection_trace)} routing mismatches")
             passed = False
         else:
             print(f"  Expert routing: {len(collection_trace)} entries all match")
 
     # Phase 5: Compare output tokens
-    for conv in result['conversations']:
+    tokens_ok, token_mismatches = replayed.compare_tokens(collected)
+    for conv in collected.conversations:
         rid = conv['request_idx']
-        collected = conv['output_token_ids']
-        replayed = replay_output_tokens[rid]
-        n = min(len(collected), len(replayed))
-        if n > 0 and collected[:n] != replayed[:n]:
-            first_diff = next(
-                (j for j in range(n) if collected[j] != replayed[j]), n)
+        collected_toks = conv['output_token_ids']
+        replayed_toks = replayed.output_tokens.get(rid, [])
+        n = min(len(collected_toks), len(replayed_toks))
+        if rid in token_mismatches:
+            first_diff = token_mismatches[rid]
             print(f"  TOKEN MISMATCH conv {conv['conversation_id']}: "
                   f"first diff at token {first_diff}")
             passed = False
@@ -1009,10 +699,10 @@ def test_replay_faithfulness_with_preemption(engine, kv_page_budget, page_size=1
                   f"(preemptions={preempt_count})")
 
     # Phase 6: Verify preemption counts match
-    for conv in result['conversations']:
+    for conv in collected.conversations:
         rid = conv['request_idx']
         collected_p = conv['num_preemptions']
-        replayed_p = replay_preemptions[rid]
+        replayed_p = replayed.preemptions.get(rid, 0)
         if collected_p != replayed_p:
             print(f"  PREEMPTION COUNT MISMATCH conv {conv['conversation_id']}: "
                   f"collected={collected_p}, replay saw={replayed_p}")
@@ -1149,215 +839,46 @@ def test_seq_len_consistency(engine, kv_page_budget, page_size=16):
 # Full pipeline: collect → simulate → offloaded replay
 # ---------------------------------------------------------------------------
 
-def _build_full_token_seqs(conversations_result, device):
-    """Build prompt+output token tensors keyed by request_idx."""
-    seqs = {}
-    for conv in conversations_result:
-        rid = conv['request_idx']
-        ids = list(conv['prompt_token_ids']) + list(conv['output_token_ids'])
-        seqs[rid] = torch.tensor(ids, dtype=torch.long, device=device)
-    return seqs
-
-
 def _offloaded_replay(engine, dm_trace, collection_result, page_size):
-    """Replay a GPUReplayTrace on an offloading engine, capturing output tokens.
+    """Replay a GPUReplayTrace on an offloading engine via Scheduler.replay().
 
     The engine must have been created with cache_size (offloading mode).
     ReplayController manages expert loading/unloading via PCIe transfers.
 
-    Returns dict[request_id, list[int]] of output tokens per conversation.
+    Returns ReplayResult.
     """
     from replay_controller import ReplayController
 
-    full_token_seqs = _build_full_token_seqs(
-        collection_result['conversations'], engine.device)
-
-    # Build lightweight per-conv objects for decode token lookup
-    class _ConvTokens:
-        def __init__(self, output_token_ids):
-            self.output_token_ids = output_token_ids
-    per_conv = {
-        conv['request_idx']: _ConvTokens(conv['output_token_ids'])
-        for conv in collection_result['conversations']
-    }
-
-    engine.reset()
-    controller = ReplayController(engine, dm_trace)
-    controller.setup()
-    engine.replay_controller = controller
-
     max_seqs = engine.max_seqs
-    free_seq_ids = set(range(max_seqs))
-    request_to_slot: dict[int, int] = {}
-    active_requests: dict[int, dict] = {}
-    output_tokens: dict[int, list] = {
-        conv['request_idx']: []
-        for conv in collection_result['conversations']
-    }
-    # Track prefill progress to mirror advance_state token-appending
-    prompt_lens = {
-        conv['request_idx']: len(conv['prompt_token_ids'])
-        for conv in collection_result['conversations']
-    }
+    sched = Scheduler(engine, max_seqs=max_seqs,
+                      max_graph_size=512, page_size=page_size)
+    controller = ReplayController(engine, dm_trace)
 
-    with torch.inference_mode():
-        for step in range(len(dm_trace.steps)):
-            sched = controller.get_step_scheduling(step)
-            if sched is None:
-                break
+    if isinstance(collection_result, CollectionResult):
+        convs = collection_result.conversations
+    else:
+        convs = collection_result['conversations']
 
-            # Process events
-            for evt in sched.events:
-                if evt['event'] == 'complete':
-                    rid = evt['request_id']
-                    if rid in request_to_slot:
-                        sid = request_to_slot.pop(rid)
-                        engine.free_seq(sid)
-                        free_seq_ids.add(sid)
-                        active_requests.pop(rid, None)
-                elif evt['event'] in ('admit', 'force_admit'):
-                    rid = evt['request_id']
-                    if not free_seq_ids:
-                        continue
-                    sid = free_seq_ids.pop()
-                    request_to_slot[rid] = sid
-                    if rid not in active_requests:
-                        active_requests[rid] = {
-                            'sid': sid, 'decode_step': 0,
-                            'num_computed': 0, 'needs_prefill': True,
-                        }
-                    else:
-                        active_requests[rid]['sid'] = sid
-                        # Readmission: reset prefill progress for recompute
-                        active_requests[rid]['num_computed'] = 0
-                        active_requests[rid]['needs_prefill'] = True
-                elif evt['event'] == 'preempt':
-                    rid = evt['request_id']
-                    if rid in request_to_slot:
-                        sid = request_to_slot.pop(rid)
-                        engine.free_seq(sid)
-                        free_seq_ids.add(sid)
-
-            # Build mixed_step args
-            decode_sids = []
-            decode_tokens_list = []
-            prefill_sids = []
-            prefill_input_ids = []
-            prefill_chunk_lengths = []
-            cont_sids = []
-            cont_input_ids = []
-            cont_offsets = []
-            cont_chunk_lengths = []
-            # Track which rids are prefill vs decode in batch order
-            batch_ar_info = []  # (rid, is_prefill, chunk_length)
-
-            for ar in sched.active_requests:
-                rid = ar.request_id
-                if rid not in request_to_slot:
-                    continue
-                sid = request_to_slot[rid]
-                state = active_requests[rid]
-
-                if ar.is_prefill:
-                    tokens = full_token_seqs[rid]
-                    chunk = tokens[ar.prefill_chunk_start:
-                                   ar.prefill_chunk_start
-                                   + ar.prefill_chunk_length]
-                    batch_ar_info.append(
-                        (rid, True, ar.prefill_chunk_length))
-                    if ar.is_continuation:
-                        cont_sids.append(sid)
-                        cont_input_ids.append(chunk)
-                        cont_offsets.append(ar.prefill_chunk_start)
-                        cont_chunk_lengths.append(ar.prefill_chunk_length)
-                    else:
-                        prefill_sids.append(sid)
-                        prefill_input_ids.append(chunk)
-                        prefill_chunk_lengths.append(ar.prefill_chunk_length)
-                else:
-                    batch_ar_info.append((rid, False, 0))
-                    decode_sids.append(sid)
-                    ct = per_conv[rid]
-                    di = state['decode_step']
-                    if ct.output_token_ids and di < len(ct.output_token_ids):
-                        decode_tokens_list.append(ct.output_token_ids[di])
-                    else:
-                        decode_tokens_list.append(1)
-                    state['decode_step'] = di + 1
-
-            decode_tensor = torch.tensor(
-                decode_tokens_list if decode_tokens_list else [],
-                dtype=torch.long, device=engine.device)
-
-            # Allocate pages before mixed_step (dynamic page mode)
-            if engine._dynamic_pages:
-                for sid in decode_sids:
-                    sl = int(engine._seq_lens_cpu[sid].item())
-                    engine.ensure_pages(sid, (sl + page_size) // page_size)
-                for sid, ids in zip(prefill_sids, prefill_input_ids):
-                    engine.ensure_pages(
-                        sid, math.ceil(len(ids) / page_size))
-                for sid, off, ids in zip(
-                        cont_sids, cont_offsets, cont_input_ids):
-                    engine.ensure_pages(
-                        sid, math.ceil((off + len(ids)) / page_size))
-
-            logits = engine.mixed_step(
-                decode_seq_ids=decode_sids,
-                decode_token_ids=decode_tensor,
-                prefill_seq_ids=prefill_sids,
-                prefill_input_ids=prefill_input_ids,
-                continuation_seq_ids=cont_sids,
-                continuation_input_ids=cont_input_ids,
-                continuation_offsets=cont_offsets,
-            )
-
-            replay_next = extract_next_tokens(
-                logits, len(decode_sids),
-                prefill_chunk_lengths, cont_chunk_lengths)
-
-            # Mirror advance_state: only append token when prefill
-            # completes or during decode. Intermediate prefill chunks
-            # produce tokens that the collection discards.
-            for tok_idx, (rid, is_pf, chunk_len) in enumerate(
-                    batch_ar_info):
-                if tok_idx >= len(replay_next):
-                    break
-                state = active_requests[rid]
-                if is_pf:
-                    state['num_computed'] += chunk_len
-                    eff_prompt = (prompt_lens[rid]
-                                  + len(output_tokens[rid]))
-                    if state['num_computed'] >= eff_prompt:
-                        state['needs_prefill'] = False
-                        output_tokens[rid].append(
-                            replay_next[tok_idx])
-                        # Sync decode_step: the just-appended token is
-                        # the last model output, which the next decode
-                        # step must feed as input. Its index in
-                        # output_token_ids is len-1 after append.
-                        state['decode_step'] = len(
-                            output_tokens[rid]) - 1
-                else:
-                    output_tokens[rid].append(
-                        replay_next[tok_idx])
-
-    engine.replay_controller = None
-    engine.reset()
-    return output_tokens
+    return sched.replay(
+        convs, controller=controller, record_tokens=True)
 
 
-def _compare_tokens(label, collection_result, replay_tokens):
-    """Compare output tokens from replay against collection. Returns passed."""
+def _compare_tokens(label, collection_result, replay_result):
+    """Compare output tokens from ReplayResult against collection. Returns passed."""
+    if isinstance(collection_result, CollectionResult):
+        convs = collection_result.conversations
+    else:
+        convs = collection_result['conversations']
+
+    tokens_ok, mismatches = replay_result.compare_tokens(collection_result)
     passed = True
-    for conv in collection_result['conversations']:
+    for conv in convs:
         rid = conv['request_idx']
         collected = conv['output_token_ids']
-        replayed = replay_tokens[rid]
+        replayed = replay_result.output_tokens.get(rid, [])
         n = min(len(collected), len(replayed))
-        if n > 0 and collected[:n] != replayed[:n]:
-            first_diff = next(
-                (j for j in range(n) if collected[j] != replayed[j]), n)
+        if rid in mismatches:
+            first_diff = mismatches[rid]
             print(f"  {label} TOKEN MISMATCH conv {conv['conversation_id']}: "
                   f"first diff at token {first_diff} "
                   f"(collected={collected[first_diff]}, "

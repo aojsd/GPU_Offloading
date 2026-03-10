@@ -60,23 +60,28 @@ PREFETCH_POLICIES = [
 ]
 
 
-def load_prompt_tokens(traces: list[ConversationTrace],
-                       device: torch.device) -> dict[int, torch.Tensor]:
-    """Pre-load all prompt token tensors keyed by trace index."""
-    prompts = {}
+def load_full_tokens(traces: list[ConversationTrace],
+                     device: torch.device) -> dict[int, torch.Tensor]:
+    """Pre-load full token sequences (prompt + output) keyed by trace index.
+
+    During recompute after preemption, prefill chunks extend past the original
+    prompt into previously-generated output tokens. Using just prompt_token_ids
+    would produce out-of-bounds slices for recompute prefill steps.
+    For non-preempted requests the extra tokens are never accessed.
+    """
+    full_tokens = {}
     for i, t in enumerate(traces):
-        if t.prompt_token_ids is not None:
-            prompts[i] = torch.tensor(t.prompt_token_ids, dtype=torch.long,
-                                      device=device)
+        ids = list(t.prompt_token_ids or [])
+        ids += list(t.output_token_ids or [])
+        if ids:
+            full_tokens[i] = torch.tensor(ids, dtype=torch.long, device=device)
         else:
-            # Fallback: dummy tokens (won't produce correct output, but
-            # timing will be representative since computation is real)
-            prompts[i] = torch.ones(t.prompt_tokens, dtype=torch.long,
-                                    device=device)
-    return prompts
+            full_tokens[i] = torch.ones(t.prompt_tokens, dtype=torch.long,
+                                        device=device)
+    return full_tokens
 
 
-def _run_steps(engine, controller, per_conv_traces, prompts, max_seqs,
+def _run_steps(engine, controller, per_conv_traces, full_token_seqs, max_seqs,
                n_steps):
     """Run n_steps of batched replay. Returns skipped_admissions count."""
     free_seq_ids = set(range(max_seqs))
@@ -109,16 +114,24 @@ def _run_steps(engine, controller, per_conv_traces, prompts, max_seqs,
                         continue
                     sid = free_seq_ids.pop()
                     request_to_slot[rid] = sid
-                    active_requests[rid] = {
-                        'sid': sid,
-                        'decode_step': 0,
-                    }
+                    if rid not in active_requests:
+                        # Fresh admission — initialize decode counter
+                        active_requests[rid] = {'sid': sid, 'decode_step': 0}
+                    else:
+                        # Readmission after preemption — update slot, preserve
+                        # decode_step so decode resumes at the right token index.
+                        active_requests[rid]['sid'] = sid
 
-                elif evt['event'] in ('preempt', 'readmit', 'force_readmit'):
-                    assert False, (
-                        f"Step {step}: unexpected event '{evt['event']}'. "
-                        f"No-preemption policy should prevent this."
-                    )
+                elif evt['event'] == 'preempt':
+                    rid = evt['request_id']
+                    if rid in request_to_slot:
+                        sid = request_to_slot.pop(rid)
+                        engine.free_seq(sid)
+                        free_seq_ids.add(sid)
+                        # active_requests[rid] is kept intentionally: preserves
+                        # decode_step for when the request is readmitted.
+                        # The `if rid not in request_to_slot: continue` guard
+                        # below prevents acting on it while it is unscheduled.
 
             # Build mixed_step arguments from active_requests metadata
             decode_sids = []
@@ -139,7 +152,7 @@ def _run_steps(engine, controller, per_conv_traces, prompts, max_seqs,
                 if ar.is_prefill:
                     chunk_start = ar.prefill_chunk_start
                     chunk_len = ar.prefill_chunk_length
-                    prompt = prompts[rid]
+                    prompt = full_token_seqs[rid]
                     chunk_tokens = prompt[chunk_start:chunk_start + chunk_len]
 
                     if ar.is_continuation:
@@ -183,7 +196,7 @@ def _run_steps(engine, controller, per_conv_traces, prompts, max_seqs,
     return skipped_admissions
 
 
-def replay_trace(engine, dm_trace, per_conv_traces, prompts,
+def replay_trace(engine, dm_trace, per_conv_traces, full_token_seqs,
                  max_graph_size, warmup_steps=50, max_steps=None):
     """Run a full batched replay of a GPUReplayTrace.
 
@@ -209,7 +222,7 @@ def replay_trace(engine, dm_trace, per_conv_traces, prompts,
     warmup_ctrl = ReplayController(engine, dm_trace)
     warmup_ctrl.setup()
     engine.replay_controller = warmup_ctrl
-    _run_steps(engine, warmup_ctrl, per_conv_traces, prompts, max_seqs,
+    _run_steps(engine, warmup_ctrl, per_conv_traces, full_token_seqs, max_seqs,
                n_warmup)
     engine.replay_controller = None
 
@@ -225,7 +238,7 @@ def replay_trace(engine, dm_trace, per_conv_traces, prompts,
     start_evt.record()
 
     skipped_admissions = _run_steps(
-        engine, controller, per_conv_traces, prompts, max_seqs, total_steps)
+        engine, controller, per_conv_traces, full_token_seqs, max_seqs, total_steps)
 
     end_evt.record()
     torch.cuda.synchronize()
@@ -402,8 +415,9 @@ def run_batched_replay(model_path, batched_trace_path, per_conv_traces,
             _size_usage[covering] += 1
     print(f"Graph coverage: {dict(sorted(_size_usage.items()))}")
 
-    # Pre-load prompt tokens
-    prompts = load_prompt_tokens(per_conv_traces, engine.device)
+    # Pre-load full token sequences (prompt + output) for faithful prefill replay.
+    # Output tokens are needed for recompute prefill after preemption.
+    full_token_seqs = load_full_tokens(per_conv_traces, engine.device)
 
     # Replay each policy
     print(f"\n=== Replay ({warmup_steps}-step warmup + {total_steps}-step "
@@ -416,7 +430,7 @@ def run_batched_replay(model_path, batched_trace_path, per_conv_traces,
     for name, dm in dm_traces.items():
         s = dm.summary()
         timing = replay_trace(
-            engine, dm, per_conv_traces, prompts,
+            engine, dm, per_conv_traces, full_token_seqs,
             max_graph_size, warmup_steps, max_steps,
         )
         print(f"{name:<20s}  {timing['total_ms']:10.1f}  "

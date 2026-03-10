@@ -2883,6 +2883,10 @@ class MoEEngine:
         """Number of allocated pages (dynamic mode only)."""
         return self.total_pages - len(self._free_pages)
 
+    def seq_pages(self, seq_id: int) -> int:
+        """Number of pages currently allocated for seq_id."""
+        return len(self._seq_page_list[seq_id])
+
     # ── CUDA Graph Support ────────────────────────────────────────────
 
     def _full_decode_graph_body(self, token_ids, positions, slot_mapping, decode_wrapper):

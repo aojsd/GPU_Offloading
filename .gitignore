@@ -13,6 +13,7 @@ src/MoE/models/*
 # Datasets (downloaded via datasets/download.sh)
 src/MoE/datasets/*
 !src/MoE/datasets/download.sh
+!src/MoE/datasets/calc_avg_layer_experts.py
 
 # Personal CLAUDE.md
 CLAUDE.md

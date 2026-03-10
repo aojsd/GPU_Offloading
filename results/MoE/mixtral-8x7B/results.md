@@ -25,11 +25,19 @@ Workload: 200 ShareGPT conversations (198 for 60% due to prompt filter), continu
 batching with greedy admission, LIFO preemption with recompute, dynamic page allocation.
 `max_seqs=32`, `max_graph_size=512`, `max_output_tokens=4096`.
 
-| Cache% | Cached Experts | Steps | KV Budget (pages) | Avg Batch Size | Peak Batch Size | Preemptions |
-|--------|---------------|-------|--------------------|----------------|-----------------|-------------|
-| 60%    | 153           | 4370  | 10,444             | 19.0           | 32              | 0           |
-| 70%    | 179           | 4400  | 6,076              | 19.3           | 32              | 0           |
-| 80%    | 204           | 4387  | 1,876              | 19.1           | 32              | 111         |
+| Cache% | Cached Experts | Steps | KV Budget (pages) | Avg Batch | Peak Batch | Preemptions | Avg Experts/Layer |
+|--------|---------------|-------|--------------------|-----------|------------|-------------|-------------------|
+| 60%    | 153           | 4370  | 10,444             | 19.0      | 32         | 0           | 6.14              |
+| 70%    | 179           | 4400  | 6,076              | 19.3      | 32         | 0           | 6.11              |
+| 80%    | 204           | 4387  | 1,876              | 19.1      | 32         | 111         | 6.27              |
+
+#### Per-Step Compute Breakdown (ms, averaged across No-Prefetch runs)
+
+| Cache% | setup | stage1 | attention | stage4a | stage4b | finish | **Total Compute** |
+|--------|-------|--------|-----------|---------|---------|--------|-------------------|
+| 60%    | 0.65  | 2.58   | 1.27      | 1.37    | 28.73   | 0.11   | **34.71**         |
+| 70%    | 0.65  | 2.57   | 1.36      | 1.37    | 28.90   | 0.11   | **34.96**         |
+| 80%    | 0.67  | 2.71   | 1.41      | 1.42    | 31.22   | 0.11   | **37.53**         |
 
 ### GPU Replay: Wall-Clock Timing + Transfer Counts
 
@@ -68,7 +76,7 @@ batching with greedy admission, LIFO preemption with recompute, dynamic page all
 <tr><td>Oracle(1)</td><td>1064.19</td><td>3.8%</td><td>587,934</td><td>121,864</td><td>709,798</td></tr>
 <tr class="policy-border">
   <td rowspan="3">LRU</td>
-  <td>None</td><td></td><td></td><td>800,246</td><td>0</td><td>800,246</td>
+  <td>None</td><td>1200.67</td><td></td><td>800,246</td><td>0</td><td>800,246</td>
 </tr>
 <tr><td>Oracle</td><td></td><td></td><td>0</td><td>800,246</td><td>800,246</td></tr>
 <tr><td>Oracle(1)</td><td></td><td></td><td>674,972</td><td>125,274</td><td>800,246</td></tr>
@@ -94,7 +102,7 @@ batching with greedy admission, LIFO preemption with recompute, dynamic page all
 <tr><td>Oracle(1)</td><td>1019.40</td><td>4.0%</td><td>568,843</td><td>114,964</td><td>683,807</td></tr>
 <tr class="policy-border">
   <td rowspan="3">LRU</td>
-  <td>None</td><td></td><td></td><td>787,822</td><td>0</td><td>787,822</td>
+  <td>None</td><td>1175.26</td><td></td><td>787,822</td><td>0</td><td>787,822</td>
 </tr>
 <tr><td>Oracle</td><td></td><td></td><td>0</td><td>787,822</td><td>787,822</td></tr>
 <tr><td>Oracle(1)</td><td></td><td></td><td>669,004</td><td>118,818</td><td>787,822</td></tr>

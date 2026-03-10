@@ -18,7 +18,7 @@ and pipeline re-run (scripts 01-03) before results are valid.
 
 GPU replay creates the engine with `max_seqs=1` and replays with a single
 decode sequence, ignoring the multi-sequence batch scheduling metadata from
-`build_trace.py`. `03_gpu_replay.sh` dispatches to `run_all_policies.py`,
+`trace_utils.py`. `03_gpu_replay.sh` dispatches to `run_all_policies.py`,
 so the entire experiment pipeline produces unfaithful timing data.
 
 Batch size drives (a) compute kernel duration (attention + MoE scale with BS),
@@ -36,7 +36,7 @@ faithful multi-sequence replay but is not wired into `03_gpu_replay.sh`.
 
 ### B2. Replay and collection use `use_torch_compile=False` — FIXED
 
-**Files:** `scripts/batched_replay.py:352`, `trace_construction/collect_traces.py:186,201,216`
+**Files:** `scripts/batched_replay.py:352`, `trace_construction/collect_batched_traces.py`
 
 Both replay and trace collection hardcode `use_torch_compile=False`. Without
 compile, Triton fusions for RMSNorm + residual + RoPE are disabled, and each
@@ -64,13 +64,13 @@ the research question).
 
 ### B3. Memory budget mismatch causes silent batch shrinkage — FIXED
 
-**File:** `scripts/batched_replay.py:297-306 vs trace_construction/build_trace.py:563`
+**File:** `scripts/batched_replay.py:297-306 vs trace_construction/trace_utils.py`
 
 `batched_replay.py` computes graph overhead as `sum(graph_sizes) * 100_000 * 96
 * 1.2` ≈ **17 GB** for the compact set, plus 2.5 GB fixed = **19.6 GB** total.
-`build_trace.py` uses only **2.5 GB** fixed overhead. This ~17 GB discrepancy
+`trace_utils.py` uses only **2.5 GB** fixed overhead. This ~17 GB discrepancy
 causes `batched_replay.py` to compute a much lower `max_seqs` than
-`build_trace.py` used. When `max_seqs < trace_peak_seqs`, admit events are
+`trace_utils.py` used. When `max_seqs < trace_peak_seqs`, admit events are
 silently skipped (line 151-153: `if not free_seq_ids: continue`), and the
 `if rid not in request_to_slot: continue` guard (line 178) silently drops those
 requests from each step. The batch becomes smaller than prescribed — fewer
@@ -155,9 +155,9 @@ The `--dual-gpu` code path reads `cache{pct}pct/replay_results.json` but
 `run_gpu_replay()` saves to `cache{pct}pct-{name}.json`. Merge silently
 produces `{}`. Not triggered in normal pipeline.
 
-### `build_trace.py`: `request_id` mismatch when using `--indices`
+### `trace_utils.py`: `request_id` mismatch when using `--indices`
 
-**File:** `trace_construction/build_trace.py:308,337 vs 369`
+**File:** `trace_construction/trace_utils.py`
 
 Admit events use local index as `request_id`; complete events use mapped index.
 Mismatch only when `--indices` is passed. Normal pipeline does not use
@@ -210,6 +210,6 @@ Only checks `dm.validate()` passes, never asserts actual eviction behavior.
 - `profiling/`, `benchmarks/` docstrings: stale `python tests/...` paths
 - `profile_phases.py`: hardcoded "20 steps, 5 warmup" in generated markdown
 - `trace_construction/README.md`: documents `max_seqs=128` but default is 256
-- `collect_traces.py`: `output_tokens` vs `output_token_ids` off-by-one
+- `collect_batched_traces.py`: `output_tokens` vs `output_token_ids` off-by-one
 - `vLLM_comparison/README.md`: scripts table omits `accuracy_analysis.py`
 - `run_all_policies.py`: comment says "3 dirnames" but does 2

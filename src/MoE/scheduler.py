@@ -1071,7 +1071,7 @@ def load_full_tokens(traces, device: torch.device) -> dict[int, torch.Tensor]:
     For non-preempted requests the extra tokens are never accessed.
 
     Args:
-        traces: list of ConversationTrace objects (from build_trace.load_traces).
+        traces: list of ConversationTrace objects (from trace_utils.load_traces).
         device: torch device to place tensors on.
     """
     full_tokens = {}
@@ -1212,7 +1212,7 @@ def save_conversations(result: dict, output_dir: str,
     """Write per-conversation JSON files. Returns manifest entry list.
 
     Files are written to <output_dir>/requests/<conversation_id>.json
-    matching the ConversationTrace.load() format from build_trace.py.
+    matching the ConversationTrace.load() format from trace_utils.py.
     trace: [] because batch-union routing cannot be attributed per-conversation.
     """
     requests_dir = os.path.join(output_dir, 'requests')

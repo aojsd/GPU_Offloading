@@ -43,7 +43,7 @@ PREFILL_CHUNK_SIZE = 256
 def run_single_conversation(engine, prompt_ids, max_output, page_size=16):
     """Reference single-conversation collection using direct mixed_step calls.
 
-    Mirrors collect_traces.py flow: chunked prefill (256-token chunks) + decode.
+    Mirrors collect_batched_traces.py flow: chunked prefill (256-token chunks) + decode.
     Returns list of output token IDs.
     """
     device = engine.device
@@ -460,7 +460,7 @@ def test_replay_faithfulness(engine, page_size=16):
         save_batched_trace, save_conversations,
     )
     from gpu_replay_trace import ActivationTrace
-    from trace_construction.build_trace import load_traces
+    from trace_construction.trace_utils import load_traces
 
     # Phase 1: Collect traces (generous budget, no preemption)
     conversations = [
@@ -574,7 +574,7 @@ def test_replay_faithfulness_with_preemption(engine, kv_page_budget, page_size=1
         save_batched_trace, save_conversations,
     )
     from gpu_replay_trace import ActivationTrace
-    from trace_construction.build_trace import load_traces
+    from trace_construction.trace_utils import load_traces
 
     # Phase 1: Collect with tight budget → must produce preemptions
     conversations = [

@@ -1287,7 +1287,7 @@ class TestSerializationFormat:
             save_batched_trace, save_conversations,
         )
         from gpu_replay_trace import ActivationTrace
-        from trace_construction.build_trace import load_traces
+        from trace_construction.trace_utils import load_traces
 
         result = {
             'num_layers': 2,
@@ -1554,7 +1554,7 @@ class TestEndToEndPipeline:
         with open(_os.path.join(output_dir, 'manifest.json'), 'w') as f:
             _json.dump(manifest_data, f)
 
-        from trace_construction.build_trace import load_traces
+        from trace_construction.trace_utils import load_traces
         traces, _ = load_traces(output_dir)
         assert len(traces) == 2
         # c0 has output tokens, c1 has empty (preempted before decode)

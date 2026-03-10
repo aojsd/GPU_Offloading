@@ -1,10 +1,10 @@
-"""Tests for trace_construction/build_trace.py — continuous batching simulator.
+"""Tests for trace_construction/trace_utils.py — continuous batching simulator.
 
 CPU-only tests using synthetic per-conversation traces. No GPU or model needed.
 
 Tests use the fixed-chunk prefill semantics: each prefill chunk is a separate
-trace step (matching collect_traces.py per-chunk expert routing), and convo_step
-advances per chunk.
+trace step (matching collect_batched_traces.py per-chunk expert routing), and
+convo_step advances per chunk.
 """
 import json
 import math
@@ -18,7 +18,7 @@ MOE_DIR = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, MOE_DIR)
 sys.path.insert(0, os.path.join(MOE_DIR, 'trace_construction'))
 
-from build_trace import (
+from trace_utils import (
     ConversationTrace, PREFILL_CHUNK_SIZE, simulate_batch, pages_needed,
     compute_memory_budget, load_traces,
 )
@@ -30,7 +30,7 @@ def make_convo_trace(conv_id, prompt_tokens, output_tokens,
                      prefill_chunk_size=PREFILL_CHUNK_SIZE):
     """Create a synthetic ConversationTrace with per-chunk prefill steps.
 
-    Matches the format produced by collect_traces.py: each 256-token prefill
+    Matches the format produced by collect_batched_traces.py: each 256-token prefill
     chunk is a separate step with its own expert routing.
     """
     steps = []
@@ -280,7 +280,7 @@ class TestFixedChunkPrefill(unittest.TestCase):
         """convo_step should advance by 1 for each prefill chunk.
 
         Each chunk uses its own trace step's expert routing (per-chunk
-        routing from collect_traces.py).
+        routing from collect_batched_traces.py).
         """
         # 600-token prompt: 3 chunks (256, 256, 88)
         traces = [make_convo_trace("c0", prompt_tokens=600, output_tokens=5)]

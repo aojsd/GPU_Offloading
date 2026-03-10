@@ -155,6 +155,44 @@ When KV budget is exhausted, the scheduler preempts the most recently admitted
 request (LIFO). Preempted requests are re-queued and readmitted when budget
 frees up, with recompute prefill from the beginning of the sequence.
 
+**Departure from `trace_utils.py`:** The older `trace_utils.py:simulate_batch()`
+uses full-sequence page pre-allocation (reserves all pages at admission) with no
+preemption. The new `collect_batched_traces.py` uses greedy incremental allocation
+with LIFO preemption. This produces higher peak concurrency (more requests admitted
+before pages exhaust) and different scheduling decisions (preempted requests get
+different expert routing on recompute due to different batch composition).
+`trace_utils.py` remains useful for fast CPU-only parameter sweeps without GPU.
+
+### Integration pitfalls
+
+Hard-won issues encountered during GPU integration of the scheduler:
+
+| # | Pitfall | Resolution |
+|---|---------|------------|
+| 5 | **Dual `seq_len` bookkeeping**: scheduler tracks `req.seq_len`, engine tracks `_seq_lens_cpu[slot]`. | Engine is authoritative. Scheduler's `req.seq_len` is only for page accounting. |
+| 7 | **Continuation offsets** must equal `engine._seq_lens_cpu[slot]`, not `req.prefill_chunk_start`. | Read `engine._seq_lens_cpu[slot].item()` when building `continuation_offsets`. |
+| 9 | **Zero-budget prefill zombies**: when decode tokens fill the token budget, running prefills get `scheduled_chunk=0` and hold resources without progress. | Preempt running prefills with `scheduled_chunk=0`. |
+| 11 | **Per-batch expert union**: `TraceRecorder` records the union of all expert IDs across the batch, not per-conversation. | Sufficient for batched trace format. Per-conversation attribution would require extending `TraceRecorder` with a token-to-request mapping. |
+| 12 | **`torch.compile` recompute divergence**: after preemption, recomputed predictions may differ from the non-preempted case due to different batch composition and graph sizes. | Expected, not a bug. `advance_state()` appends whatever the compiled model actually predicts, keeping `output_token_ids` self-consistent with the compiled model's output. |
+| 19 | **Intermediate prefill tokens discarded**: only append output token on final prefill chunk. | Track `num_computed` per request. See [replay.md](../replay.md) for full derivation. |
+| 20 | **`decode_step` desync after recompute**: first decode after recompute feeds stale token. | Sync `decode_step = len(output_tokens) - 1` after prefill completion. See [replay.md](../replay.md). |
+
+### PP=2 collection memory feasibility
+
+| Component | Per GPU (PP=2) |
+|-----------|---------------|
+| Model weights | ~27.5 GB |
+| CUDA graphs (20 sizes, shared pool) | ~1.7 GB |
+| KV cache (kv_page_budget=14,848, 50% cache) | ~14.6 GB |
+| Overhead | ~2 GB |
+| **Total** | **~45.8 GB** |
+| **Free on H100** | **~34 GB** |
+
+With dynamic page allocation, `max_seqs=256` is cheap (only block_table index
+memory, no KV pre-allocation). The `kv_page_budget` limits total pages in use.
+Greedy admission allows higher peak concurrency than `trace_utils.py`'s
+conservative pre-allocation; preemption handles overflow.
+
 ### Parameters
 
 | Parameter | Description | Default |
@@ -207,6 +245,7 @@ loop to manage KV cache and batch composition. Each entry contains:
 | `complete` | Before step compute | Free KV slot, return `seq_id` to pool |
 | `admit` | Before step compute | Allocate `seq_id` from free pool |
 | `force_admit` | Deadlock recovery | Same as `admit` |
+| `preempt` | Before step compute | Free KV slot, preserve `active_requests[rid]` with `decode_step` |
 
 **Data flow:** `step_scheduling` is parsed by `ActivationTrace.from_flat_trace()`
 into `ActivationTrace.scheduling: list[StepScheduling]`. Policy simulators
@@ -234,8 +273,8 @@ propagate it to `StepTrace.scheduling` in the `GPUReplayTrace`. The
     "max_graph_size": 512,
     "prefill_chunk_size": 256,
     "num_conversations": 200,
-    "preemption_policy": "none",
-    "page_allocation": "full_sequence"
+    "preemption_policy": "lifo_recompute",
+    "page_allocation": "incremental"
   },
   "statistics": {
     "total_steps": 2727,
@@ -251,9 +290,9 @@ Loadable by `ActivationTrace.from_flat_trace(data)` or `ActivationTrace.load(pat
 ### KV cache budget model
 
 Uses **block-based page accounting** matching the engine's paged attention:
-- Each request pre-allocates `ceil((prompt_tokens + output_tokens) / page_size)` pages.
-- Total budget in pages, not tokens.
-- Admit only if `total_preallocated_pages + full_sequence_pages <= kv_page_budget`.
+- Pages allocated incrementally on demand (greedy, not pre-allocated for full sequence).
+- At admission, only checks that the first prefill chunk fits in free pages.
+- Total budget in pages, not tokens. Preemption handles overflow.
 
 Memory-first mode inverts the equation: given `cache_fraction` and
 `gpu_memory_gb`, computes the KV page budget from remaining memory after

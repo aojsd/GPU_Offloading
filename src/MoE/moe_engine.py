@@ -289,6 +289,8 @@ class MoEEngine:
         # seq_lens, FlashInfer — per-GPU when PP, single tensors otherwise
         self._attn_scale = 1.0 / math.sqrt(self.head_dim)
         self.max_pages_per_seq = math.ceil(max_seq_len / page_size)
+        # Dynamic page allocation: decouple physical page count from
+        # per-sequence pre-allocation. Less than 1% overhead vs static.
         self._dynamic_pages = kv_page_budget is not None
         if self._dynamic_pages:
             self.total_pages = kv_page_budget
@@ -304,7 +306,8 @@ class MoEEngine:
             self._v_scale = [torch.tensor(1.0, dtype=torch.float32, device=d)
                              for d in self.pp_devices]
 
-            # KV cache: per-layer, on layer's GPU
+            # KV cache: [total_pages, page_size, num_kv_heads, head_dim] per layer.
+            # Layout required by reshape_and_cache_flash.
             self.k_cache = [
                 torch.zeros(self.total_pages, page_size,
                             self.num_kv_heads, self.head_dim,
@@ -318,7 +321,10 @@ class MoEEngine:
                 for l in range(self.num_layers)
             ]
 
-            # Block table: replicated on each GPU
+            # Block table: maps (seq_id, virtual_page_idx) → physical page.
+            # Static mode: identity mapping (seq i gets contiguous pages).
+            # Dynamic mode: initialized to -1, pages assigned by alloc_pages().
+            # Replicated on each GPU for PP.
             if self._dynamic_pages:
                 bt = torch.full((max_seqs, self.max_pages_per_seq),
                                 -1, dtype=torch.int32)
@@ -358,7 +364,8 @@ class MoEEngine:
             self._v_scale = torch.tensor(1.0, dtype=torch.float32,
                                          device=device)
 
-            # KV cache: per-layer list on single device
+            # KV cache: [total_pages, page_size, num_kv_heads, head_dim] per layer.
+            # Layout required by reshape_and_cache_flash.
             self.k_cache = [
                 torch.zeros(self.total_pages, page_size,
                             self.num_kv_heads, self.head_dim,
@@ -372,7 +379,9 @@ class MoEEngine:
                 for _ in range(self.num_layers)
             ]
 
-            # Block table
+            # Block table: maps (seq_id, virtual_page_idx) → physical page.
+            # Static mode: identity mapping (seq i gets contiguous pages).
+            # Dynamic mode: initialized to -1, pages assigned by alloc_pages().
             if self._dynamic_pages:
                 self.block_table = torch.full(
                     (max_seqs, self.max_pages_per_seq), -1,
@@ -813,6 +822,7 @@ class MoEEngine:
         if not hasattr(self, '_prefill_cuda_graphs'):
             self._prefill_cuda_graphs = {}
 
+        # fullgraph=False: see comment in capture_mixed_cuda_graphs()
         forward_fn = self._full_mixed_graph_body
         if use_torch_compile:
             forward_fn = torch.compile(forward_fn, fullgraph=False)
@@ -1641,7 +1651,10 @@ class MoEEngine:
                 q_decode, (self.k_cache[layer], self.v_cache[layer]))
             decode_out = decode_out.reshape(D, H)
 
-            # Prefill tokens [D:]: FA3 self-attention on freshly computed Q/K/V
+            # Prefill tokens [D:]: FA3 (stateless) instead of FlashInfer —
+            # FlashInfer's fmha_varlen_plan() allocates fresh GPU tensors per
+            # call, so addresses baked into a CUDA graph get freed by the next
+            # plan() call.
             N_pf = N - D
             q_pf = q[D:].reshape(N_pf, self.num_heads, self.head_dim)
             k_pf = k_write[D:]
@@ -1665,7 +1678,7 @@ class MoEEngine:
             attn_out = attn_out.reshape(D, H)
 
         else:
-            # Pure prefill
+            # Pure prefill — FA3 (stateless), same reason as mixed path above
             N_pf = N
             q_pf = q.reshape(N_pf, self.num_heads, self.head_dim)
             k_pf = k_write
@@ -1963,7 +1976,19 @@ class MoEEngine:
     # ── Piecewise CUDA Graph Capture & Replay ────────────────────────
 
     def _create_intermediate_buffers(self, N, device):
-        """Create intermediate buffers for piecewise CUDA graph capture."""
+        """Create intermediate buffers for piecewise CUDA graph capture.
+
+        Data flow between stages (per layer):
+          Stage 1:  token_ids → q/k/v_buf (QKV + RoPE + KV cache write)
+          Stage 2:  q_buf → attn_out_buf (decode attention, eager)
+          Stage 3:  q_buf → attn_out_buf (prefill attention, eager)
+          Stage 4a: attn_out_buf + residual_buf → moe_input_buf,
+                    moe_residual_buf, topk_weights_buf, topk_ids_buf
+                    (O proj + residual + norm + router)
+          [CPU break: offload engine inspects routing, loads experts]
+          Stage 4b: moe_input_buf + topk → hidden_buf (MoE + residual)
+        hidden_buf becomes residual_buf for the next layer.
+        """
         total_kv_slots = self.total_pages * self.page_size
         return {
             'q_buf': torch.zeros(N, self.num_heads, self.head_dim,
@@ -2038,7 +2063,10 @@ class MoEEngine:
         else:
             graph_pool = torch.cuda.graph_pool_handle()
 
-        # Optionally compile stage functions
+        # Compile stage functions. fullgraph=False because FlashInfer and
+        # fused_moe contain ops Dynamo can't trace. The resulting graph
+        # breaks add overhead (~32 enter/exit per forward), but CUDA graph
+        # capture on top eliminates it entirely.
         stage1_fn = self._layer_stage1_pre_attn
         stage4a_fn = self._layer_stage4a_router
         stage4b_fn = self._layer_stage4b_moe

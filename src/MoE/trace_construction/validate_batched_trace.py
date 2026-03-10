@@ -34,7 +34,7 @@ import moe_engine as _moe_engine_mod  # noqa: F401 — glibc patches
 from moe_engine import MoEEngine
 from trace_recorder import TraceRecorder
 from gpu_replay_trace import ActivationTrace
-from build_trace import load_traces, ConversationTrace
+from trace_utils import load_traces, ConversationTrace
 
 
 def load_prompt_tokens(traces: list[ConversationTrace],

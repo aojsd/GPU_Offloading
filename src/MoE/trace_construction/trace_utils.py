@@ -1,30 +1,16 @@
-"""Build batched ActivationTrace from per-conversation expert traces (legacy).
+"""Trace data utilities and legacy CPU-only batch simulator.
 
-NOTE: This is the legacy CPU-only batch simulator. The active pipeline uses
-collect_batched_traces.py (Phase 1) which does GPU-based batched collection
-directly. This file is retained for its load_traces() and ConversationTrace
-utilities used by other scripts.
+Provides:
+- ConversationTrace: per-conversation expert trace loaded from JSON.
+- load_traces(): load all conversation traces + manifest from a directory.
+- simulate_batch(): CPU-only continuous batching simulator (legacy, no preemption).
+- compute_memory_budget(): compute expert cache budget from KV usage + model config.
+- pages_needed(), PREFILL_CHUNK_SIZE: shared constants.
 
-Original purpose: simulate continuous batching offline (CPU-only) to produce a
-batched trace. Uses fixed 256-token prefill chunks, max_graph_size=512 as the
-single token budget, block-based KV accounting, and no-preemption page
-pre-allocation.
-
-Two modes:
-  1. Memory-first (recommended): fix expert cache fraction, maximize KV usage.
-     python build_trace.py \
-         --input-dir traces/mixtral-8x7b \
-         --model-config models/Mixtral-8x7B/config.json \
-         --cache-fraction 0.5 \
-         --output traces/mixtral-8x7b/cache50pct/batched.json
-
-  2. Legacy: target a batch size or explicit KV page budget.
-     python build_trace.py \
-         --input-dir traces/ \
-         --target-batch-size 16 \
-         --output batched_bs16.json
+The active pipeline uses collect_batched_traces.py (GPU-based batched collection)
+for Phase 1. simulate_batch() is retained for fast CPU-only parameter sweeps
+and is exercised by test_trace_construction.py.
 """
-import argparse
 import json
 import math
 import os
@@ -38,7 +24,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 MOE_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(MOE_DIR))
 
-# Fixed prefill chunk size — must match collect_traces.py and batched_replay.py.
+# Fixed prefill chunk size — must match collect_batched_traces.py and batched_replay.py.
 # All prefill is done in 256-token chunks (last chunk <= 256).
 PREFILL_CHUNK_SIZE = 256
 
@@ -175,7 +161,7 @@ def simulate_batch(
 
     Prefill uses fixed chunk sizes (default 256 tokens, last chunk <= 256).
     Each chunk maps to one convo_step in the per-conversation trace, matching
-    how collect_traces.py records per-chunk expert routing. The token budget
+    how collect_batched_traces.py records per-chunk expert routing. The token budget
     is max_graph_size (default 512), which is the single cap on total tokens
     per step (decode + prefill).
 
@@ -348,7 +334,7 @@ def simulate_batch(
 
         # 4. Record: union of all scheduled requests' expert selections.
         #    Each prefill chunk maps to its own convo_step (per-chunk routing
-        #    from collect_traces.py). Skip requests with scheduled_chunk=0.
+        #    from collect_batched_traces.py). Skip requests with scheduled_chunk=0.
         step_experts = [set() for _ in range(num_layers)]
         for req in running:
             if req.scheduled_chunk > 0 and req.convo_step < len(req.trace.steps):
@@ -540,64 +526,6 @@ def _parse_model_config(model_config_path: str, dtype_bytes: int = 2) -> dict:
     }
 
 
-def compute_kv_budget_from_cache(
-    model_config_path: str,
-    cache_fraction: float,
-    page_size: int = 16,
-    gpu_memory_gb: float = 80.0,
-    overhead_gb: float = 2.5,
-    dtype_bytes: int = 2,
-) -> dict:
-    """Compute KV page budget given a fixed expert cache fraction.
-
-    Memory allocation: GPU = non_expert_model + expert_cache + KV_cache + overhead.
-    KV gets whatever remains after fixing the other components.
-
-    Returns dict with memory breakdown and computed kv_page_budget.
-    """
-    mc = _parse_model_config(model_config_path, dtype_bytes)
-    kv_ppl = mc['kv_per_page_per_layer'](page_size)
-
-    cache_size = int(mc['total_experts'] * cache_fraction)
-    cache_bytes = cache_size * mc['expert_bytes']
-
-    gpu_bytes = int(gpu_memory_gb * 1024**3)
-    overhead_bytes = int(overhead_gb * 1024**3)
-
-    avail_kv = gpu_bytes - mc['non_expert_bytes'] - cache_bytes - overhead_bytes
-    if avail_kv < 0:
-        import warnings
-        warnings.warn(
-            f"Expert cache ({cache_size} slots = {cache_bytes / 1024**3:.1f} GB) + "
-            f"non-expert model ({mc['non_expert_bytes'] / 1024**3:.1f} GB) + "
-            f"overhead ({overhead_gb} GB) = "
-            f"{(mc['non_expert_bytes'] + cache_bytes + overhead_bytes) / 1024**3:.1f} GB "
-            f"exceeds GPU memory ({gpu_memory_gb} GB) by "
-            f"{-avail_kv / 1024**3:.2f} GB. "
-            f"cache_fraction={cache_fraction} is infeasible for replay on this GPU. "
-            f"Max feasible cache_size: "
-            f"{(gpu_bytes - mc['non_expert_bytes'] - overhead_bytes) // mc['expert_bytes']}"
-        )
-    kv_page_budget = max(0, int(avail_kv / (kv_ppl * mc['num_layers'])))
-
-    return {
-        'model': mc['model_name'],
-        'gpu_memory_gb': gpu_memory_gb,
-        'non_expert_model_gb': round(mc['non_expert_bytes'] / 1024**3, 2),
-        'expert_cache_size': cache_size,
-        'total_experts': mc['total_experts'],
-        'cache_fraction': cache_fraction,
-        'expert_cache_gb': round(cache_bytes / 1024**3, 2),
-        'per_expert_mb': round(mc['expert_bytes'] / 1024**2, 2),
-        'all_experts_gb': round(mc['total_experts'] * mc['expert_bytes'] / 1024**3, 2),
-        'overhead_gb': overhead_gb,
-        'available_for_kv_gb': round(avail_kv / 1024**3, 2),
-        'kv_page_budget': kv_page_budget,
-        'kv_capacity_tokens': kv_page_budget * page_size,
-        'page_size': page_size,
-    }
-
-
 def compute_memory_budget(
     model_config_path: str,
     peak_pages: int,
@@ -639,210 +567,3 @@ def compute_memory_budget(
             if mc['total_experts'] > 0 else 0,
         'peak_pages': peak_pages,
     }
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Build batched ActivationTrace from per-conversation traces")
-    parser.add_argument("--input-dir", type=str, required=True,
-                        help="Directory with per-conversation trace JSON files")
-    parser.add_argument("--output", type=str, default=None,
-                        help="Output batched ActivationTrace JSON path "
-                             "(auto-generated if not specified)")
-    parser.add_argument("--model-config", type=str, default=None,
-                        help="Path to model config.json (required for --cache-fraction)")
-    parser.add_argument("--page-size", type=int, default=16,
-                        help="KV cache page size in tokens")
-    parser.add_argument("--gpu-memory-gb", type=float, default=80.0,
-                        help="Total GPU memory in GB")
-
-    # Mode 1: memory-first (recommended)
-    parser.add_argument("--cache-fraction", type=float, default=None,
-                        help="Expert cache as fraction of total experts (e.g. 0.5). "
-                             "KV budget = remaining GPU memory. Requires --model-config.")
-
-    # Mode 2: legacy batch-size targeting
-    parser.add_argument("--target-batch-size", type=int, default=None,
-                        help="Target average concurrent sequences (legacy mode)")
-    parser.add_argument("--max-seq-len", type=int, default=4096,
-                        help="Max sequence length for KV budget computation (legacy)")
-    parser.add_argument("--kv-page-budget", type=int, default=None,
-                        help="Explicit KV page budget (overrides other modes)")
-
-    # Shared
-    parser.add_argument("--max-seqs", type=int, default=256,
-                        help="Max concurrent sequences (default: 256, matches vLLM)")
-    parser.add_argument("--max-graph-size", type=int, default=512,
-                        help="Max total tokens per step / CUDA graph "
-                             "(default: 512)")
-    parser.add_argument("--prefill-chunk-size", type=int, default=PREFILL_CHUNK_SIZE,
-                        help=f"Fixed prefill chunk size (default: {PREFILL_CHUNK_SIZE})")
-
-    parser.add_argument("--indices", type=int, nargs='+', default=None,
-                        help="Select specific conversation indices from manifest")
-    parser.add_argument("--summary", type=str, default=None,
-                        help="Optional path for summary JSON")
-    args = parser.parse_args()
-
-    # Validate mode
-    if args.cache_fraction is not None and not args.model_config:
-        parser.error("--cache-fraction requires --model-config")
-
-    max_graph_size = args.max_graph_size
-
-    # Load traces
-    print(f"Loading traces from {args.input_dir}")
-    traces, manifest = load_traces(args.input_dir)
-    print(f"Loaded {len(traces)} conversation traces")
-
-    # Filter to selected indices if specified
-    original_indices = None
-    if args.indices is not None:
-        original_indices = args.indices
-        traces = [traces[i] for i in args.indices]
-        print(f"Selected {len(traces)} conversations by index: {args.indices}")
-
-    if not traces:
-        print("Error: no traces found")
-        sys.exit(1)
-
-    # Compute KV page budget based on mode
-    max_seqs = args.max_seqs
-    memory_info = None
-
-    if args.kv_page_budget is not None:
-        # Explicit budget overrides everything
-        kv_page_budget = args.kv_page_budget
-
-    elif args.cache_fraction is not None:
-        # Memory-first mode: fix expert cache, maximize KV
-        memory_info = compute_kv_budget_from_cache(
-            args.model_config,
-            args.cache_fraction,
-            args.page_size,
-            args.gpu_memory_gb,
-        )
-        kv_page_budget = memory_info['kv_page_budget']
-
-        print(f"\nMemory-first mode ({memory_info['model']}, "
-              f"{memory_info['gpu_memory_gb']} GB GPU):")
-        print(f"  Non-expert model: {memory_info['non_expert_model_gb']} GB")
-        print(f"  Expert cache: {memory_info['expert_cache_size']} / "
-              f"{memory_info['total_experts']} experts "
-              f"({memory_info['cache_fraction']*100:.0f}%) = "
-              f"{memory_info['expert_cache_gb']} GB")
-        print(f"  Overhead: {memory_info['overhead_gb']} GB")
-        print(f"  Available for KV: {memory_info['available_for_kv_gb']} GB")
-        if memory_info['available_for_kv_gb'] < 0:
-            print(f"  WARNING: Expert cache exceeds GPU memory! "
-                  f"cache_fraction={args.cache_fraction} is infeasible for "
-                  f"GPU replay. Batch simulation will still run (CPU-only), "
-                  f"but the resulting trace cannot be replayed on a "
-                  f"{memory_info['gpu_memory_gb']} GB GPU.")
-        print(f"  KV page budget: {kv_page_budget} pages "
-              f"({memory_info['kv_capacity_tokens']} tokens)")
-
-    else:
-        # Legacy mode: target batch size
-        target_bs = args.target_batch_size or 16
-        max_seqs = target_bs
-        peak_lens = sorted(t.prompt_tokens + t.output_tokens for t in traces)
-        max_actual = peak_lens[-1]
-        seq_len_for_budget = min(max_actual, args.max_seq_len)
-        pages_per_seq = math.ceil(seq_len_for_budget / args.page_size)
-        kv_page_budget = target_bs * pages_per_seq
-        print(f"Actual peak seq len: {max_actual} tokens "
-              f"(median: {peak_lens[len(peak_lens)//2]})")
-
-    print(f"Max seqs: {max_seqs}")
-    print(f"Max graph size: {max_graph_size}")
-    print(f"Prefill chunk size: {args.prefill_chunk_size}")
-    print(f"KV page budget: {kv_page_budget} pages "
-          f"({kv_page_budget * args.page_size} tokens capacity)")
-
-    # Run simulation
-    print("\nRunning continuous batching simulation...")
-    result = simulate_batch(
-        traces, kv_page_budget, args.page_size,
-        max_seqs=max_seqs,
-        max_graph_size=max_graph_size,
-        prefill_chunk_size=args.prefill_chunk_size,
-        original_indices=original_indices,
-    )
-
-    # Attach memory info if available
-    if memory_info:
-        result['memory'] = memory_info
-    elif args.model_config:
-        budget = compute_memory_budget(
-            args.model_config,
-            result['statistics']['peak_pages_used'],
-            args.page_size,
-            args.gpu_memory_gb,
-        )
-        result['memory_budget'] = budget
-
-    stats = result['statistics']
-    print(f"\nSimulation results:")
-    print(f"  Total steps: {stats['total_steps']}")
-    print(f"  Batch size:  avg={stats['avg_batch_size']}, "
-          f"median={stats['median_batch_size']}, "
-          f"std={stats['std_batch_size']}")
-    print(f"               min={stats['min_batch_size']}, "
-          f"p25={stats['p25_batch_size']}, "
-          f"p75={stats['p75_batch_size']}, "
-          f"max={stats['peak_batch_size']}")
-    print(f"               IQR={stats['iqr_batch_size']}")
-    print(f"  Peak pages:  {stats['peak_pages_used']}")
-
-    # Count chunked prefill steps
-    chunked_steps = 0
-    for ss in result['step_scheduling']:
-        for ar in ss['active_requests']:
-            if ar['is_continuation']:
-                chunked_steps += 1
-                break
-    print(f"  Steps with continuations: {chunked_steps}")
-
-    # Auto-generate output path if not specified
-    if args.output is None:
-        if args.cache_fraction is not None:
-            pct = int(args.cache_fraction * 100)
-            cache_dir = os.path.join(args.input_dir, f"cache{pct}pct")
-            os.makedirs(cache_dir, exist_ok=True)
-            output = os.path.join(cache_dir, "batched.json")
-        elif max_seqs is not None:
-            output = os.path.join(args.input_dir, f"batched_bs{max_seqs}.json")
-        else:
-            output = os.path.join(args.input_dir, "batched.json")
-    else:
-        output = args.output
-
-    os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
-    with open(output, 'w') as f:
-        json.dump(result, f)
-    print(f"\nSaved batched trace to {output}")
-    print(f"  ({len(result['trace'])} flat entries, "
-          f"{stats['total_steps']} steps)")
-
-    # Optional summary
-    if args.summary:
-        summary = {
-            'scheduling': result['scheduling'],
-            'statistics': stats,
-        }
-        if 'memory' in result:
-            summary['memory'] = result['memory']
-        elif 'memory_budget' in result:
-            summary['memory_budget'] = result['memory_budget']
-        with open(args.summary, 'w') as f:
-            json.dump(summary, f, indent=2)
-        print(f"Saved summary to {args.summary}")
-
-
-if __name__ == "__main__":
-    main()

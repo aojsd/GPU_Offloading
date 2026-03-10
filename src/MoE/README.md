@@ -74,23 +74,35 @@ compute for that layer (~0.27 ms). Data movement policy is everything.
 
 | Phase | Hardware | Model | Purpose |
 |-------|----------|-------|---------|
-| 1. Trace collection | 2 GPUs, PP=2 | Full 32L Mixtral | Capture expert routing with correct computation (chunked prefill) |
-| 2. Batch simulation | CPU only | — | Simulate continuous batching schedule |
-| 3. Policy simulation | CPU only | — | Simulate cache/prefetch policies |
-| 4. GPU replay | 1 GPU, offloading | Full 32L Mixtral | Experts loaded from host on demand — this is the experiment |
+| 1. Trace collection | 2 GPUs, PP=2 | Full 32L Mixtral | Continuous batching on GPU; capture expert routing and batch metadata |
+| 2. Policy simulation | CPU only | — | Simulate cache/prefetch policies on collected traces |
+| 3. GPU replay | 1 GPU, offloading | Full 32L Mixtral | Replay with expert offloading — this is the experiment |
 
 Trace collection uses PP=2 because the full 32L model doesn't fit on a single GPU
 without offloading. Traces are collected using the same engine and kernels
 (piecewise CUDA graphs, FlashInfer decode attention) that replay uses, guaranteeing
 token-for-token match with greedy decoding and exact expert routing.
 
+**Realism over convenience:** Trace collection runs real continuous batching on
+GPU with vLLM V1-style scheduling (greedy admission, LIFO preemption with
+recompute) rather than collecting single-sequence traces and simulating batching
+offline. This costs one GPU collection run per cache fraction (~20-30 min each)
+but is necessary because `torch.compile` + Inductor generates different Triton
+kernels for different graph sizes, and batch composition determines graph size.
+Expert routing therefore depends on the scheduling state — traces collected at
+BS=1 do not match the routing a real batched system would produce. By collecting
+under realistic scheduling conditions, the expert access patterns in the trace
+faithfully reflect the routing that would occur during actual serving.
+
 Replay runs on a single GPU with expert offloading — measuring the performance
 impact of different caching/prefetching policies is the entire point.
 
 **Replay fidelity requirement:** GPU replay MUST faithfully recreate the batch
-compositions produced by the continuous batching simulator (Phase 2). This means
-each replay step must dispatch the correct number of decode sequences, prefill
-chunks, and continuation chunks at their traced token counts. Only `scripts/batched_replay.py` performs faithful multi-sequence replay.
+compositions from Phase 1 trace collection. Each replay step must dispatch the
+correct number of decode sequences, prefill chunks, and continuation chunks at
+their traced token counts, and feed the exact token sequences recorded during
+collection. This ensures expert routing during replay matches collection exactly.
+Only `scripts/batched_replay.py` performs faithful multi-sequence replay.
 
 ### Data Movement Trace Format
 
@@ -147,7 +159,7 @@ Layer L (L > 0):
 6. **Trace Format & Replay Controller** (complete): `GPUReplayTrace` with unified cache, `ReplayController` with optimized prefetch timing. See [replay.md](replay.md).
 7. **Policy Simulation** (complete): Orthogonal `CachePolicy` × `PrefetchPolicy` decomposition. Cache policies: LRU, Belady (MIN), LFU (windowed), StaticFreq (global oracle). Prefetch policies: NoPrefetch, OraclePrefetch. See [replay.md](replay.md).
 8. **Pipeline Parallelism** (complete): Mixtral-8x7B-32L across 2x H100. Per-layer compute matches single-GPU baseline exactly. See [pipeline_parallelism.md](pipeline_parallelism.md).
-9. **Trace Construction** (complete): Two-phase pipeline — collect per-conversation traces (GPU, once), then build batched traces via continuous batching simulator (CPU, sweep freely). Fixed 256-token prefill chunks, `max_graph_size=512` as single token budget, full-sequence page pre-allocation (no preemption). See [trace_construction/README.md](trace_construction/README.md).
+9. **Trace Construction** (complete): GPU-based batched trace collection with real continuous batching (vLLM V1-style scheduling, greedy admission, LIFO preemption with recompute, dynamic page allocation). One run per cache fraction produces an `ActivationTrace` with expert routing and scheduling metadata. See [trace_construction/README.md](trace_construction/README.md).
 10. **Multi-Sequence Batched Replay** (complete): `scripts/batched_replay.py` replays batched `GPUReplayTrace` on GPU with full multi-sequence computation. request_id→seq_id free pool, three-way dispatch (decode/new-prefill/continuation), CUDA event timing. See [scripts/README.md](scripts/README.md).
 
 ---

@@ -39,7 +39,7 @@ import moe_engine as _moe_engine_mod  # noqa: F401 — glibc patches
 from moe_engine import MoEEngine
 from replay_controller import ReplayController
 from gpu_replay_trace import ActivationTrace, GPUReplayTrace
-from build_trace import load_traces, ConversationTrace
+from trace_utils import load_traces, ConversationTrace
 from policy_simulator import (
     LRU, LFU, Belady, StaticFreq, NoPrefetch, OraclePrefetch, simulate,
 )
@@ -170,7 +170,7 @@ def run_batched_replay(model_path, batched_trace_path, per_conv_traces,
                    256, 288, 320, 352, 384, 448, 512]
     graph_sizes = [s for s in graph_sizes if s <= max_graph_size]
 
-    # Read memory budget from trace metadata (set by build_trace.py's
+    # Read memory budget from trace metadata (set by collect_batched_traces.py's
     # simulate_batch). This ensures replay uses exactly the same max_seqs
     # and KV budget as the batch simulator, avoiding silent batch shrinkage.
     trace_sched = at.scheduling_config or {}

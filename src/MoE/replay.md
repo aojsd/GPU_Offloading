@@ -57,7 +57,7 @@ ActivationTrace:
     num_layers:  int
     num_experts: int
     steps:       list[list[list[int]]]               # steps[step][layer] = [expert_ids]
-    scheduling:  Optional[list[StepScheduling]]       # per-step batch metadata (from build_trace.py)
+    scheduling:  Optional[list[StepScheduling]]       # per-step batch metadata (from trace_utils.py)
 ```
 
 When loaded from a batched trace (via `ActivationTrace.from_flat_trace()` or
@@ -452,7 +452,7 @@ time in demand-load-only configurations.
 ### Scheduling Metadata — Multi-Sequence Replay
 
 When the `GPUReplayTrace` is produced from a batched `ActivationTrace` (via
-`build_trace.py` → policy simulator), each `StepTrace` carries optional
+`collect_batched_traces.py` → policy simulator), each `StepTrace` carries optional
 `StepScheduling` metadata describing the batch composition and scheduling events.
 
 **This metadata is the ground truth for faithful replay.** The GPU replay loop
@@ -462,16 +462,74 @@ their traced token counts. Without this, compute kernel durations and prefetch
 overlap windows do not reflect realistic serving, making policy timing
 comparisons invalid.
 
-**No-preemption policy:** Since replay is trace-driven (output lengths known in
-advance), pages for the full sequence (prompt + output) are pre-allocated at
-admission. No request is ever preempted or readmitted. Events are limited to
-`complete`, `admit`, and `force_admit`.
+**Preemption support:** Traces produced by `collect_batched_traces.py` may
+contain `preempt` events (LIFO preemption with recompute). Replay must handle:
+
+1. **`preempt` event**: Free the slot (`engine.free_seq(sid)`, return to
+   `free_seq_ids`), but preserve `active_requests[rid]` with its `decode_step`
+   counter. Decode resumes from where it left off after recompute prefill.
+2. **Readmission** (`admit` for an existing `rid`): Assign a new slot, reset
+   `num_computed = 0` and `needs_prefill = True`, but do NOT reset `decode_step`.
+3. **`full_token_ids`** for prefill tokens: Recompute prefills have
+   `prefill_chunk_start` extending past the original prompt into previously
+   generated output tokens. Load `full_token_ids` (= `prompt_token_ids +
+   output_token_ids`, pre-concatenated in per-conversation JSON) instead of
+   just `prompt_token_ids`.
+
+For non-preemption traces, chunks never exceed the prompt length, so
+`full_token_ids` is backwards-compatible.
+
+### Replay Token Semantics (Preemption Handling)
+
+Correct replay requires mirroring the token-appending protocol used during
+collection (`Scheduler.advance_state()`). Two bugs arise if this isn't done:
+
+**Bug 1 — Intermediate prefill tokens must be discarded.** `advance_state()`
+only appends a token to `output_token_ids` when the FINAL prefill chunk
+completes (`num_computed_tokens >= effective_prompt_len`). Intermediate chunk
+predictions are discarded. A naive replay that appends from every step produces
+extra tokens, misaligning all subsequent comparisons. Fix: track `num_computed`
+per request; only append when `num_computed >= prompt_len + len(output_tokens)`.
+
+**Bug 2 — `decode_step` must sync after prefill completion.** `decode_step`
+indexes into `output_token_ids` for the next decode input. After recompute
+prefill, `advance_state()` appends a new token but `decode_step` still points
+to the pre-preemption index — off by one. Fix: after any prefill completion
+(initial or recompute), set `decode_step = len(output_tokens[rid]) - 1`.
+For initial prefill this is a no-op (sets 0); for recompute after K decode
+steps it correctly sets K+1.
+
+**Correct replay loop:**
+```python
+for tok_idx, (rid, is_prefill, chunk_len) in enumerate(batch_ar_info):
+    state = active_requests[rid]
+    if is_prefill:
+        state['num_computed'] += chunk_len
+        eff_prompt = prompt_lens[rid] + len(output_tokens[rid])
+        if state['num_computed'] >= eff_prompt:
+            state['needs_prefill'] = False
+            output_tokens[rid].append(model_output[tok_idx])
+            state['decode_step'] = len(output_tokens[rid]) - 1  # sync!
+    else:
+        output_tokens[rid].append(model_output[tok_idx])
+```
+
+**Readmission reset** (on `admit` for a previously-seen rid):
+```python
+active_requests[rid]['num_computed'] = 0
+active_requests[rid]['needs_prefill'] = True
+# DO NOT reset decode_step — synced at prior prefill completion
+```
+
+Reference implementations: `tests/test_gpu_integration.py` tests 7-10
+(replay faithfulness with and without preemption, including offloaded replay
+with real PCIe expert swapping).
 
 Each `StepScheduling` contains:
 - `active_requests`: list of `RequestScheduling` — per-request metadata including
   `request_id`, `seq_len`, `is_prefill`, `prefill_chunk_start`,
   `prefill_chunk_length`, `is_continuation`.
-- `events`: list of scheduling events (`complete`, `admit`).
+- `events`: list of scheduling events (`complete`, `admit`, `preempt`).
 
 **Token type dispatch** (from `RequestScheduling`):
 - `is_prefill=False` → decode (1 token, FlashInfer paged-KV attention)
@@ -536,7 +594,7 @@ Measured on H100 80 GB with Mixtral-8x7B (profiled with `cache_size=1` and
 | Allocator fragmentation | 0.21 GB | 4.1 GB |
 | **Total fixed overhead** | **3.59 GB** | **7.5 GB** |
 
-The `compute_kv_budget_from_cache()` function in `build_trace.py` uses
+The `compute_replay_kv_budget()` function in `collect_batched_traces.py` uses
 `overhead_gb=2.5` on top of the computed `non_expert_bytes` (~3.0 GB), giving a
 total fixed budget of ~5.5 GB. This leaves room for both the steady-state
 allocator overhead and moderate KV cache.

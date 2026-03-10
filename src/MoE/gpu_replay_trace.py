@@ -356,7 +356,7 @@ class ActivationTrace:
                          as 'step{s}_layer{l}' with shape [n_tokens, hidden_dim]
                          in float16. None when not recorded.
         scheduling:      Optional per-step scheduling metadata from
-                         build_trace.py's continuous batching simulator.
+                         trace_utils.py's continuous batching simulator.
     """
     num_layers: int
     num_experts: int
@@ -374,7 +374,7 @@ class ActivationTrace:
         Args:
             trace_data: Dict with keys 'num_layers', 'num_experts', 'trace'
                 where trace is a list of {step, layer, expert_ids} dicts.
-                Optionally includes 'step_scheduling' from build_trace.py.
+                Optionally includes 'step_scheduling' from trace_utils.py.
             router_inputs_path: Optional path to companion .npz file with
                 router inputs.
 

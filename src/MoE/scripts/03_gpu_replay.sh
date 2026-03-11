@@ -29,8 +29,24 @@ POLICY_GROUPS=(
 )
 GROUP_NAMES=("SF" "Belady" "LFU" "LRU")
 
-# Cache percentages in priority order
-CACHE_PCTS=(80 70 60)
+# Cache percentages: auto-detect from existing trace directories
+CACHE_PCTS=()
+for d in "$TRACE_BASE"/cache*pct; do
+    [ -d "$d" ] || continue
+    [ -f "$d/batched_trace.json" ] || continue
+    pct="${d##*/}"            # cache80pct
+    pct="${pct#cache}"        # 80pct
+    pct="${pct%pct}"          # 80
+    CACHE_PCTS+=("$pct")
+done
+# Sort descending (highest cache% first = fastest jobs first)
+IFS=$'\n' CACHE_PCTS=($(printf '%s\n' "${CACHE_PCTS[@]}" | sort -rn)); unset IFS
+if [ ${#CACHE_PCTS[@]} -eq 0 ]; then
+    echo "ERROR: No trace directories found in $TRACE_BASE/cache*pct/"
+    echo "Run scripts/01_collect_traces.sh first."
+    exit 1
+fi
+echo "Cache percentages: ${CACHE_PCTS[*]}"
 
 # Results directory for resume checking
 RESULTS_TMP="../../results/MoE/mixtral-8x7B/tmp"

@@ -49,6 +49,7 @@ DATASETS_DIR="${DATASETS_DIR:-$(auto_detect_dir "$REPO_ROOT/src/MoE/datasets" 2>
 # Build optional volume arguments — only mount if the directory exists
 VOLUME_ARGS=()
 VOLUME_ARGS+=(-v "$REPO_ROOT:$CONTAINER_WORKSPACE")
+VOLUME_ARGS+=(-v /tmp:/tmp)
 
 if [ -n "$MODELS_DIR" ] && [ -d "$MODELS_DIR" ]; then
     # Mount at the same host path so existing symlinks resolve inside the container

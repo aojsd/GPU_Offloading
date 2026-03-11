@@ -31,9 +31,26 @@ from policy_simulator import (
 
 TRACE_BASE = "datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b"
 
-# Cache percentages to simulate. cache_size is read from each trace's
-# scheduling config (written by collect_batched_traces.py).
-CACHE_PCTS = [80, 70, 60]
+
+def _auto_detect_cache_pcts():
+    """Auto-detect cache percentages from existing trace directories."""
+    import glob
+    pcts = []
+    for d in sorted(glob.glob(f"{TRACE_BASE}/cache*pct")):
+        base = os.path.basename(d)
+        # Extract number from e.g. "cache70pct"
+        try:
+            pct = int(base.replace("cache", "").replace("pct", ""))
+            if os.path.exists(os.path.join(d, "batched_trace.json")):
+                pcts.append(pct)
+        except ValueError:
+            continue
+    return sorted(pcts, reverse=True)  # highest first
+
+
+# Cache percentages to simulate. Auto-detected from Phase 1 output dirs,
+# or overridden via --cache-pct CLI arg.
+CACHE_PCTS = _auto_detect_cache_pcts() or [80, 70, 60]
 
 
 def _read_cache_size(pct):

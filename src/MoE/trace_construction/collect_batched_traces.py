@@ -253,6 +253,10 @@ def main():
                         help="Max concurrent sequences (default: 32)")
     parser.add_argument("--pp", type=int, default=1,
                         help="Pipeline parallel size for collection (default: 1)")
+    parser.add_argument("--experts-per-layer", type=int, default=None,
+                        help="Experts per layer for offloading during collection. "
+                             "Mutually exclusive with --pp > 1. Enables single-GPU "
+                             "collection for large models (e.g. Mixtral on GH200).")
     parser.add_argument("--gpu-memory-gb", type=float, default=80.0,
                         help="Target GPU memory for replay budget (default: 80)")
     parser.add_argument("--kv-page-budget", type=int, default=None,
@@ -277,8 +281,13 @@ def main():
     top_k = cfg.get("num_experts_per_tok") or cfg.get("num_experts_per_topk")
     model_name = Path(args.model).name
     pp_size = args.pp
+    epl = args.experts_per_layer
 
-    print(f"Model: {model_name} ({num_layers}L, {num_experts}E, top-{top_k})")
+    if epl is not None and pp_size > 1:
+        raise ValueError("--experts-per-layer and --pp > 1 are mutually exclusive")
+
+    mode_str = f"epl={epl}" if epl is not None else f"pp={pp_size}"
+    print(f"Model: {model_name} ({num_layers}L, {num_experts}E, top-{top_k}, {mode_str})")
 
     # Compute KV budget for single-GPU replay scenario
     mem = compute_replay_kv_budget(
@@ -365,17 +374,20 @@ def main():
           f"(actual_max={actual_max}, kv_cap={kv_capacity_tokens})")
 
     # Create engine
-    print(f"Loading model (pp={pp_size}, max_seqs={args.max_seqs}, "
+    print(f"Loading model ({mode_str}, max_seqs={args.max_seqs}, "
           f"kv_page_budget={kv_page_budget})...")
     t0 = time.time()
-    engine = MoEEngine(
-        args.model,
+    engine_kwargs = dict(
         max_seqs=args.max_seqs,
         max_seq_len=max_seq_len,
-        pipeline_parallel_size=pp_size,
         kv_page_budget=kv_page_budget,
         use_torch_compile=True,
     )
+    if epl is not None:
+        engine_kwargs['experts_per_layer'] = epl
+    else:
+        engine_kwargs['pipeline_parallel_size'] = pp_size
+    engine = MoEEngine(args.model, **engine_kwargs)
     print(f"Engine created in {time.time() - t0:.1f}s")
 
     # Capture CUDA graphs — stop on OOM

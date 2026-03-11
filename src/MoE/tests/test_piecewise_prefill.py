@@ -144,7 +144,8 @@ def main():
     cfg_path = Path(model_path) / "config.json"
     with open(cfg_path) as f:
         cfg = json.load(f)
-    E = cfg.get("num_local_experts", cfg.get("num_experts", 8))
+    E = (cfg.get("n_routed_experts") or cfg.get("num_local_experts")
+         or cfg.get("num_experts", 8))
     print(f"Total experts: {E}")
 
     # Choose partial offloading budget

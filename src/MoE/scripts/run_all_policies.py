@@ -29,7 +29,9 @@ from policy_simulator import (
     LRU, LFU, Belady, StaticFreq, NoPrefetch, OraclePrefetch, simulate,
 )
 
-TRACE_BASE = "datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b"
+_DEFAULT_MODEL = "models/Mixtral-8x7B"
+_DEFAULT_MODEL_TAG = "mixtral-8x7b"
+TRACE_BASE = f"datasets/ShareGPT_Vicuna/expert_traces/{_DEFAULT_MODEL_TAG}"
 
 
 def _auto_detect_cache_pcts():
@@ -167,9 +169,19 @@ def main():
                         help="Run cache%% simulations in parallel processes")
     parser.add_argument("--cache-pct", type=int, default=None,
                         help="Run only this cache%% (default: all)")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Path to model directory (used to derive trace "
+                             "base directory, default: models/Mixtral-8x7B)")
     args = parser.parse_args()
 
-    global CACHE_PCTS
+    global CACHE_PCTS, TRACE_BASE
+    if args.model is not None:
+        import os
+        model_tag = os.path.basename(args.model).lower()
+        TRACE_BASE = f"datasets/ShareGPT_Vicuna/expert_traces/{model_tag}"
+        # Re-detect cache_pcts from new TRACE_BASE
+        CACHE_PCTS = _auto_detect_cache_pcts() or [80, 70, 60]
+
     if args.cache_pct is not None:
         CACHE_PCTS = [args.cache_pct]
 

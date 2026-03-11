@@ -364,6 +364,7 @@ class ActivationTrace:
     router_inputs: Optional[str] = None
     scheduling: Optional[list[StepScheduling]] = None
     scheduling_config: Optional[dict] = None
+    first_moe_layer: int = 0  # layers < this are dense (no experts)
 
     @staticmethod
     def from_flat_trace(trace_data: dict,
@@ -389,7 +390,9 @@ class ActivationTrace:
             return ActivationTrace(num_layers, num_experts, [],
                                    router_inputs=router_inputs_path,
                                    scheduling_config=trace_data.get(
-                                       'scheduling', None))
+                                       'scheduling', None),
+                                   first_moe_layer=trace_data.get(
+                                       'first_moe_layer', 0))
 
         max_step = max(entry['step'] for entry in flat)
         steps = [[[] for _ in range(num_layers)]
@@ -406,10 +409,13 @@ class ActivationTrace:
 
         scheduling_config = trace_data.get('scheduling', None)
 
+        first_moe_layer = trace_data.get('first_moe_layer', 0)
+
         return ActivationTrace(num_layers, num_experts, steps,
                                router_inputs=router_inputs_path,
                                scheduling=scheduling,
-                               scheduling_config=scheduling_config)
+                               scheduling_config=scheduling_config,
+                               first_moe_layer=first_moe_layer)
 
     @staticmethod
     def load(path: str) -> 'ActivationTrace':
@@ -443,6 +449,8 @@ class ActivationTrace:
             'trace': flat_trace,
             'transfers': [],
         }
+        if self.first_moe_layer != 0:
+            data['first_moe_layer'] = self.first_moe_layer
         if self.scheduling is not None:
             data['step_scheduling'] = [s.to_dict() for s in self.scheduling]
         with open(path, 'w') as f:

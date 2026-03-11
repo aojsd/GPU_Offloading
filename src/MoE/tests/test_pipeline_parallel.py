@@ -295,7 +295,8 @@ def test_trace_collection(model_path):
     with open(Path(model_path) / "config.json") as f:
         cfg = json.load(f)
     num_layers = cfg["num_hidden_layers"]
-    num_experts = cfg.get("num_experts") or cfg.get("num_local_experts")
+    num_experts = (cfg.get("n_routed_experts") or cfg.get("num_experts")
+                   or cfg.get("num_local_experts"))
 
     recorder = TraceRecorder(num_layers=num_layers, num_experts=num_experts)
     engine.trace_recorder = recorder
@@ -322,8 +323,10 @@ def test_trace_collection(model_path):
             next_tok = logits[0].argmax().unsqueeze(0)
 
     trace = recorder.trace
-    # Prefill = step 0 (num_layers entries) + decode steps 1..n_decode
-    expected_entries = (1 + n_decode) * num_layers
+    # Prefill = step 0 + decode steps 1..n_decode; dense layers are skipped
+    first_moe = getattr(engine, 'first_k_dense_replace', 0)
+    num_moe_layers = num_layers - first_moe
+    expected_entries = (1 + n_decode) * num_moe_layers
     print(f"\n  Trace entries: {len(trace)} (expected {expected_entries})")
     assert len(trace) == expected_entries, \
         f"Expected {expected_entries} trace entries, got {len(trace)}"
@@ -339,15 +342,16 @@ def test_trace_collection(model_path):
     steps_seen = [e['step'] for e in trace]
     assert steps_seen == sorted(steps_seen), "Steps not monotonic"
 
-    # Check that step 0 has all layers
+    # Check that step 0 has all MoE layers (dense layers are not recorded)
     step0_layers = [e['layer'] for e in trace if e['step'] == 0]
-    assert step0_layers == list(range(num_layers)), \
+    expected_layers = list(range(first_moe, num_layers))
+    assert step0_layers == expected_layers, \
         f"Step 0 missing layers: {step0_layers}"
 
     print("  Structure:     OK (step, layer, expert_ids present)")
     print("  Expert range:  OK (all within [0, {})".format(num_experts))
     print("  Monotonicity:  OK")
-    print("  Step 0 layers: OK (0..{})".format(num_layers - 1))
+    print("  Step 0 layers: OK ({0}..{1})".format(first_moe, num_layers - 1))
 
     # Timing: run 5 conversations, measure rate
     t0 = time.time()

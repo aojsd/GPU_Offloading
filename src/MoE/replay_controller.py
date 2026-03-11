@@ -172,6 +172,14 @@ class ReplayController:
         self.num_layers = engine.num_layers
         self.num_experts = engine.num_experts
 
+        # Dense layers have no experts (router[l] is None for MLA models).
+        # For non-MLA models, router is a stacked tensor so router[l] returns
+        # a 2D tensor (never None) — frozenset is empty, guards are no-ops.
+        self._dense_layers = frozenset(
+            l for l in range(engine.num_layers)
+            if isinstance(engine.router, list) and engine.router[l] is None
+        )
+
         # Async transfer infrastructure
         self._transfer_stream = torch.cuda.Stream(device=self.device)
         self._prefetch_done_event = torch.cuda.Event()
@@ -251,28 +259,33 @@ class ReplayController:
     def process_layer_replay(self, layer, topk_ids_buf, n_tokens):
         """Called after stage4a (routing known).
 
-        1. Wait for async prefetches targeting this layer
-        2. Copy expert_map_abs[layer] → expert_map_buf
-        3. Execute demand_loads (blocking on compute stream)
-        4. Re-copy expert_map_abs → expert_map_buf (updated by transfers)
+        1. Set base expert_map for this layer (MoE layers only)
+        2. Wait for async prefetches targeting this layer
+        3. Execute demand_loads (blocking on compute stream, MoE only)
+        4. Re-copy expert_map (updated by demand loads, MoE only)
         5. Issue prefetches for layer+1 (async, overlaps with stage4b)
+
+        Dense layers (no experts) skip expert_map operations but still
+        dispatch prefetches for layer+1 so timing is preserved.
         """
         step_trace = self.trace.steps[self._current_step]
         layer_trace = step_trace.layers[layer]
 
-        # Step 1: sync prefetches targeting this layer (must complete before
+        is_moe = layer not in self._dense_layers
+
+        # Step 1: set base expert map (MoE layers only)
+        if is_moe:
+            self.expert_map_buf.copy_(self.expert_map_abs[layer])
+
+        # Step 2: sync prefetches targeting this layer (must complete before
         # we read expert_map_abs, which prefetches write to on the transfer
         # stream via _execute_transfer)
         if self._has_prefetches:
             torch.cuda.current_stream().wait_event(
                 self._prefetch_done_event)
 
-        # Step 2: set base expert map for this layer (now race-free —
-        # all prefetch writes to expert_map_abs are visible after sync)
-        self.expert_map_buf.copy_(self.expert_map_abs[layer])
-
-        # Step 3: demand loads (blocking, on compute stream)
-        if layer_trace.demand_loads:
+        # Step 3: demand loads (blocking, on compute stream, MoE only)
+        if is_moe and layer_trace.demand_loads:
             if self._track_io:
                 io_start = torch.cuda.Event(enable_timing=True)
                 io_end = torch.cuda.Event(enable_timing=True)
@@ -283,11 +296,15 @@ class ReplayController:
                 io_end.record()
                 self._demand_event_pairs.append((io_start, io_end))
 
-        # Step 4: re-copy expert_map (may have been updated by transfers)
-        self.expert_map_buf.copy_(self.expert_map_abs[layer])
+        # Step 4: re-copy expert_map (may have been updated by demand loads,
+        # MoE only)
+        if is_moe:
+            self.expert_map_buf.copy_(self.expert_map_abs[layer])
 
         # Step 5: issue prefetches for next layer (async, before stage4b)
-        # These overlap with stage4b of THIS layer + stages 1-4a of NEXT
+        # These overlap with stage4b of THIS layer + stages 1-4a of NEXT.
+        # Must be issued even when THIS layer is dense (e.g. layer 0 dense,
+        # layer 1 needs prefetch).
         self._has_prefetches = False
         if layer + 1 < self.num_layers:
             next_layer_trace = step_trace.layers[layer + 1]

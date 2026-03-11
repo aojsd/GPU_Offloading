@@ -25,6 +25,61 @@ from vllm.v1.attention.backends.flashinfer import (
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 
+def _yarn_get_mscale(scale: float, mscale_coeff: float) -> float:
+    if scale <= 1.0:
+        return 1.0
+    return 0.1 * mscale_coeff * math.log(scale) + 1.0
+
+
+def _yarn_find_correction_dim(beta, rope_dim, theta, max_pos):
+    return (rope_dim * math.log(max_pos / (beta * 2 * math.pi))) / (
+        2 * math.log(theta))
+
+
+def rope_mla(q_pe, k_pe, cos_sin_cache, positions):
+    """Apply RoPE to only the rope dimensions of Q and K in MLA.
+
+    Uses GPT-J / interleaved convention (pairs dim 2i with dim 2i+1),
+    NOT NeoX half-split. vLLM sets is_neox_style=False for DeepSeek-V2.
+
+    Args:
+        q_pe: [N, num_heads * qk_rope_head_dim]
+        k_pe: [N, qk_rope_head_dim] (single "head" before broadcast)
+        cos_sin_cache: [max_seq, qk_rope_head_dim] — first half cos, second half sin
+        positions: [N]
+    Returns:
+        q_pe_rot: same shape as q_pe
+        k_pe_rot: same shape as k_pe
+    """
+    orig_dtype = q_pe.dtype
+    N = q_pe.shape[0]
+    rope_dim = k_pe.shape[-1]
+    half = rope_dim // 2
+    cos = cos_sin_cache[positions.long(), :half]   # [N, half]
+    sin = cos_sin_cache[positions.long(), half:]   # [N, half]
+
+    # Interleaved rotation: pair dim 2i with dim 2i+1
+    def _rotate_interleaved(x, cos_t, sin_t):
+        """x: [..., rope_dim], cos_t/sin_t: [..., half]"""
+        x_even = x[..., 0::2]  # [..., half]
+        x_odd = x[..., 1::2]   # [..., half]
+        out_even = x_even * cos_t - x_odd * sin_t
+        out_odd = x_even * sin_t + x_odd * cos_t
+        return torch.stack([out_even, out_odd], dim=-1).flatten(-2)
+
+    # K: [N, rope_dim] — single virtual head
+    k_rot = _rotate_interleaved(k_pe.float(), cos, sin)
+
+    # Q: [N, num_heads * rope_dim] — reshape to per-head, broadcast cos/sin
+    num_heads = q_pe.shape[-1] // rope_dim
+    q_f = q_pe.float().view(N, num_heads, rope_dim)
+    cos_h = cos.unsqueeze(1)  # [N, 1, half]
+    sin_h = sin.unsqueeze(1)
+    q_rot = _rotate_interleaved(q_f, cos_h, sin_h)
+
+    return q_rot.reshape(N, -1).to(orig_dtype), k_rot.to(orig_dtype)
+
+
 def rope_pytorch(q, k, cos_sin_cache, positions, num_heads, head_dim,
                  num_kv_heads=None):
     """Pure PyTorch NeoX-style RoPE — fully compilable by torch.compile.
@@ -224,8 +279,11 @@ class MoEEngine:
         self.num_heads = cfg["num_attention_heads"]
         self.num_kv_heads = cfg["num_key_value_heads"]
         self.head_dim = self.hidden_size // self.num_heads
-        # Expert count: OLMoE uses "num_experts", Mixtral uses "num_local_experts"
-        self.num_experts = cfg.get("num_experts") or cfg.get("num_local_experts")
+        # Expert count: OLMoE uses "num_experts", Mixtral uses "num_local_experts",
+        # DeepSeek-V2 uses "n_routed_experts"
+        self.num_experts = (cfg.get("n_routed_experts")
+                            or cfg.get("num_local_experts")
+                            or cfg.get("num_experts"))
         self.top_k = cfg.get("num_experts_per_tok") or cfg.get("num_experts_per_topk")
         self.rope_theta = cfg.get("rope_theta", 10000.0)
         self.vocab_size = cfg["vocab_size"]
@@ -236,14 +294,49 @@ class MoEEngine:
         # Match that behavior: renormalize unless explicitly set to False.
         self.norm_topk_prob = cfg.get("norm_topk_prob", True)
 
+        # MLA (Multi-head Latent Attention) detection
+        self.is_mla = "kv_lora_rank" in cfg
+
+        if self.is_mla:
+            self.kv_lora_rank = cfg["kv_lora_rank"]                # 512
+            self.qk_nope_head_dim = cfg["qk_nope_head_dim"]        # 128
+            self.qk_rope_head_dim = cfg["qk_rope_head_dim"]        # 64
+            self.v_head_dim = cfg["v_head_dim"]                     # 128
+            self.q_lora_rank = cfg.get("q_lora_rank")               # None for V2-Lite
+            self.first_k_dense_replace = cfg.get("first_k_dense_replace", 0)  # 1
+            self.n_shared_experts = cfg.get("n_shared_experts", 0)  # 2
+            self.moe_intermediate_size = cfg.get("moe_intermediate_size",
+                                                  self.intermediate_size)  # 1408
+            self.rope_scaling_config = cfg.get("rope_scaling")       # YaRN config dict
+            self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim  # 192
+            self.routed_scaling_factor = cfg.get("routed_scaling_factor", 1.0)
+
+            # Forward-compat guard: DS-V3 uses grouped top-k (n_group=8) which is
+            # fundamentally different routing. Block unsupported configs early.
+            if cfg.get("n_group", 1) > 1:
+                raise NotImplementedError(
+                    f"Grouped top-k routing (n_group={cfg['n_group']}) not yet supported. "
+                    "DS-V2-Lite uses n_group=1 (standard greedy top-k).")
+
+            # Pre-compute sm_scale with mscale² correction (vLLM-verified formula)
+            mscale_all_dim_coeff = float(self.rope_scaling_config.get("mscale_all_dim", 0))
+            factor = self.rope_scaling_config["factor"]
+            mscale_val = _yarn_get_mscale(factor, mscale_all_dim_coeff)
+            self._mla_sm_scale = (self.qk_head_dim ** -0.5) * mscale_val * mscale_val
+        else:
+            self.first_k_dense_replace = 0
+            self.n_shared_experts = 0
+            self.moe_intermediate_size = self.intermediate_size
+            self.rope_scaling_config = None
+
         # Unsupported features — raise early rather than produce wrong results
         if cfg.get("sliding_window") is not None:
             raise NotImplementedError(
                 f"Sliding window attention (window={cfg['sliding_window']}) is not "
                 f"yet implemented.")
-        if cfg.get("rope_scaling") is not None:
+        if cfg.get("rope_scaling") is not None and not self.is_mla:
             raise NotImplementedError(
-                f"RoPE scaling ({cfg['rope_scaling']}) is not yet implemented.")
+                f"RoPE scaling ({cfg['rope_scaling']}) is only implemented for MLA models.")
 
         # Pipeline parallelism setup (now that num_layers is known)
         self.pp_size = self._pipeline_parallel_size
@@ -298,7 +391,8 @@ class MoEEngine:
 
         if self.pp_size > 1:
             # Per-GPU replicated small tensors
-            self.cos_sin_cache = [self._build_rope_cache().to(d)
+            build_fn = self._build_yarn_rope_cache if self.is_mla else self._build_rope_cache
+            self.cos_sin_cache = [build_fn().to(d)
                                   for d in self.pp_devices]
             self._k_scale = [torch.tensor(1.0, dtype=torch.float32, device=d)
                              for d in self.pp_devices]
@@ -307,18 +401,44 @@ class MoEEngine:
 
             # KV cache: [total_pages, page_size, num_kv_heads, head_dim] per layer.
             # Layout required by reshape_and_cache_flash.
-            self.k_cache = [
-                torch.zeros(self.total_pages, page_size,
-                            self.num_kv_heads, self.head_dim,
-                            dtype=dtype, device=self.pp_layer_device[l])
-                for l in range(self.num_layers)
-            ]
-            self.v_cache = [
-                torch.zeros(self.total_pages, page_size,
-                            self.num_kv_heads, self.head_dim,
-                            dtype=dtype, device=self.pp_layer_device[l])
-                for l in range(self.num_layers)
-            ]
+            if self.is_mla:
+                total_kv_slots = self.total_pages * self.page_size
+                self._scratch_slot = total_kv_slots  # index for sentinel writes
+                self.ckv_flat = [
+                    torch.zeros(total_kv_slots + 1, self.kv_lora_rank, dtype=dtype,
+                                device=self.pp_layer_device[l])
+                    for l in range(self.num_layers)
+                ]
+                self.kpe_flat = [
+                    torch.zeros(total_kv_slots + 1, self.qk_rope_head_dim, dtype=dtype,
+                                device=self.pp_layer_device[l])
+                    for l in range(self.num_layers)
+                ]
+                self.ckv_cache = [
+                    f[:total_kv_slots].view(self.total_pages, self.page_size, self.kv_lora_rank)
+                    for f in self.ckv_flat
+                ]
+                self.kpe_cache = [
+                    f[:total_kv_slots].view(self.total_pages, self.page_size, self.qk_rope_head_dim)
+                    for f in self.kpe_flat
+                ]
+                self.k_cache = None
+                self.v_cache = None
+            else:
+                self.k_cache = [
+                    torch.zeros(self.total_pages, page_size,
+                                self.num_kv_heads, self.head_dim,
+                                dtype=dtype, device=self.pp_layer_device[l])
+                    for l in range(self.num_layers)
+                ]
+                self.v_cache = [
+                    torch.zeros(self.total_pages, page_size,
+                                self.num_kv_heads, self.head_dim,
+                                dtype=dtype, device=self.pp_layer_device[l])
+                    for l in range(self.num_layers)
+                ]
+                self.ckv_flat = None
+                self.kpe_flat = None
 
             # Block table: maps (seq_id, virtual_page_idx) → physical page.
             # Static mode: identity mapping (seq i gets contiguous pages).
@@ -348,16 +468,31 @@ class MoEEngine:
                 torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=d)
                 for d in self.pp_devices
             ]
-            self._decode_wrappers = [
-                BatchDecodeWithPagedKVCacheWrapper(
-                    wb, kv_layout="NHD", use_cuda_graph=False)
-                for wb in self._workspace_bufs
-            ]
-            # Alias for prefill graph capture (always uses GPU 0)
-            self._decode_wrapper = self._decode_wrappers[0]
+            if self.is_mla:
+                from flashinfer.mla import BatchMLAPagedAttentionWrapper as MLAWrapper
+                self._mla_wrappers = [
+                    MLAWrapper(wb, use_cuda_graph=False)
+                    for wb in self._workspace_bufs
+                ]
+                self._mla_decode_wrapper = self._mla_wrappers[0]  # alias for prefill graph capture
+                self._decode_wrapper = None
+                self._decode_wrappers = None
+            else:
+                self._decode_wrappers = [
+                    BatchDecodeWithPagedKVCacheWrapper(
+                        wb, kv_layout="NHD", use_cuda_graph=False)
+                    for wb in self._workspace_bufs
+                ]
+                # Alias for prefill graph capture (always uses GPU 0)
+                self._decode_wrapper = self._decode_wrappers[0]
+                self._mla_decode_wrapper = None
+                self._mla_wrappers = None
         else:
             # Single-GPU path (original)
-            self.cos_sin_cache = self._build_rope_cache().to(device)
+            if self.is_mla:
+                self.cos_sin_cache = self._build_yarn_rope_cache().to(device)
+            else:
+                self.cos_sin_cache = self._build_rope_cache().to(device)
             self._k_scale = torch.tensor(1.0, dtype=torch.float32,
                                          device=device)
             self._v_scale = torch.tensor(1.0, dtype=torch.float32,
@@ -365,18 +500,44 @@ class MoEEngine:
 
             # KV cache: [total_pages, page_size, num_kv_heads, head_dim] per layer.
             # Layout required by reshape_and_cache_flash.
-            self.k_cache = [
-                torch.zeros(self.total_pages, page_size,
-                            self.num_kv_heads, self.head_dim,
-                            dtype=dtype, device=device)
-                for _ in range(self.num_layers)
-            ]
-            self.v_cache = [
-                torch.zeros(self.total_pages, page_size,
-                            self.num_kv_heads, self.head_dim,
-                            dtype=dtype, device=device)
-                for _ in range(self.num_layers)
-            ]
+            if self.is_mla:
+                total_kv_slots = self.total_pages * self.page_size
+                self._scratch_slot = total_kv_slots  # index for sentinel writes
+                self.ckv_flat = [
+                    torch.zeros(total_kv_slots + 1, self.kv_lora_rank, dtype=dtype,
+                                device=device)
+                    for _ in range(self.num_layers)
+                ]
+                self.kpe_flat = [
+                    torch.zeros(total_kv_slots + 1, self.qk_rope_head_dim, dtype=dtype,
+                                device=device)
+                    for _ in range(self.num_layers)
+                ]
+                self.ckv_cache = [
+                    f[:total_kv_slots].view(self.total_pages, self.page_size, self.kv_lora_rank)
+                    for f in self.ckv_flat
+                ]
+                self.kpe_cache = [
+                    f[:total_kv_slots].view(self.total_pages, self.page_size, self.qk_rope_head_dim)
+                    for f in self.kpe_flat
+                ]
+                self.k_cache = None
+                self.v_cache = None
+            else:
+                self.k_cache = [
+                    torch.zeros(self.total_pages, page_size,
+                                self.num_kv_heads, self.head_dim,
+                                dtype=dtype, device=device)
+                    for _ in range(self.num_layers)
+                ]
+                self.v_cache = [
+                    torch.zeros(self.total_pages, page_size,
+                                self.num_kv_heads, self.head_dim,
+                                dtype=dtype, device=device)
+                    for _ in range(self.num_layers)
+                ]
+                self.ckv_flat = None
+                self.kpe_flat = None
 
             # Block table: maps (seq_id, virtual_page_idx) → physical page.
             # Static mode: identity mapping (seq i gets contiguous pages).
@@ -404,8 +565,17 @@ class MoEEngine:
             # FlashInfer workspace (128 MB)
             self._workspace_buf = torch.zeros(
                 128 * 1024 * 1024, dtype=torch.uint8, device=device)
-            self._decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-                self._workspace_buf, kv_layout="NHD", use_cuda_graph=False)
+            if self.is_mla:
+                from flashinfer.mla import BatchMLAPagedAttentionWrapper as MLAWrapper
+                self._mla_decode_wrapper = MLAWrapper(
+                    self._workspace_buf, use_cuda_graph=False)
+                self._mla_wrappers = None
+                self._decode_wrapper = None
+            else:
+                self._decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                    self._workspace_buf, kv_layout="NHD", use_cuda_graph=False)
+                self._mla_decode_wrapper = None
+                self._mla_wrappers = None
 
         # Dynamic page allocation pool
         if self._dynamic_pages:
@@ -532,20 +702,30 @@ class MoEEngine:
         # Per-layer weights
         self.input_layernorm = []
         self.post_attn_layernorm = []
-        self.q_proj = []
-        self.k_proj = []
-        self.v_proj = []
         self.o_proj = []
-        self.q_norm = []
-        self.k_norm = []
         self.router = []
+        if self.is_mla:
+            self.kv_a_proj = []        # [576, 2048] per layer
+            self.kv_a_layernorm = []   # [512] per layer
+            self.kv_b_proj = []        # [4096, 512] per layer
+            self.W_UK_T = []           # [num_heads, qk_nope_head_dim, kv_lora_rank] per layer
+            self.W_UV = []             # [num_heads, kv_lora_rank, v_head_dim] per layer
+            self.q_proj = []
+            self.k_proj = None  # signal to skip in QKV fusion
+            self.v_proj = None
+        else:
+            self.q_proj = []
+            self.k_proj = []
+            self.v_proj = []
+            self.q_norm = []
+            self.k_norm = []
 
         # Detect Q/K norm from first layer's weights
         self.has_qk_norm = f"model.layers.0.self_attn.q_norm.weight" in weights
 
         # Expert weight storage depends on mode
         if offloading:
-            I = self.intermediate_size
+            I = self.moe_intermediate_size
             H = self.hidden_size
             E = self.num_experts
 
@@ -605,6 +785,12 @@ class MoEEngine:
             self.w1 = []
             self.w2 = []
 
+        if self.is_mla:
+            self.dense_w1 = []  # [2*dense_I, H] per dense layer (fused gate+up)
+            self.dense_w2 = []  # [H, dense_I] per dense layer
+            self.shared_w1 = [] # [2*shared_total_I, H] per MoE layer (fused, both shared experts)
+            self.shared_w2 = [] # [H, shared_total_I] per MoE layer
+
         for l in range(self.num_layers):
             p = f"model.layers.{l}"
             # Per-layer device: layer's GPU when PP, else self.device
@@ -615,98 +801,211 @@ class MoEEngine:
                 weights.pop(f"{p}.input_layernorm.weight").to(layer_dev))
             self.post_attn_layernorm.append(
                 weights.pop(f"{p}.post_attention_layernorm.weight").to(layer_dev))
-            self.q_proj.append(
-                weights.pop(f"{p}.self_attn.q_proj.weight").to(layer_dev))
-            self.k_proj.append(
-                weights.pop(f"{p}.self_attn.k_proj.weight").to(layer_dev))
-            self.v_proj.append(
-                weights.pop(f"{p}.self_attn.v_proj.weight").to(layer_dev))
             self.o_proj.append(
                 weights.pop(f"{p}.self_attn.o_proj.weight").to(layer_dev))
-            if self.has_qk_norm:
-                self.q_norm.append(
-                    weights.pop(f"{p}.self_attn.q_norm.weight").to(layer_dev))
-                self.k_norm.append(
-                    weights.pop(f"{p}.self_attn.k_norm.weight").to(layer_dev))
-            # Router key: OLMoE uses "mlp.gate", Mixtral uses "block_sparse_moe.gate"
-            router_key = f"{p}.mlp.gate.weight"
-            if router_key not in weights:
-                router_key = f"{p}.block_sparse_moe.gate.weight"
-            self.router.append(weights.pop(router_key).to(layer_dev))
 
-            # Fuse expert weights: w1 = [E, 2*I, H], w2 = down [E, H, I]
-            # Triton fused_experts: w1 = cat(gate, up)
-            # Key format: OLMoE: "mlp.experts.{e}", Mixtral: "block_sparse_moe.experts.{e}"
-            w1_list, w2_list = [], []
-            for e in range(self.num_experts):
-                expert_prefix = f"{p}.mlp.experts.{e}"
-                if f"{expert_prefix}.gate_proj.weight" not in weights:
-                    expert_prefix = f"{p}.block_sparse_moe.experts.{e}"
-                # OLMoE: gate_proj/up_proj/down_proj; Mixtral: w1/w3/w2
-                if f"{expert_prefix}.gate_proj.weight" in weights:
+            if self.is_mla:
+                # MLA attention projections
+                self.q_proj.append(
+                    weights.pop(f"{p}.self_attn.q_proj.weight").to(layer_dev))
+                self.kv_a_proj.append(
+                    weights.pop(f"{p}.self_attn.kv_a_proj_with_mqa.weight").to(layer_dev))
+                self.kv_a_layernorm.append(
+                    weights.pop(f"{p}.self_attn.kv_a_layernorm.weight").to(layer_dev))
+                kv_b = weights.pop(f"{p}.self_attn.kv_b_proj.weight").to(layer_dev)
+                self.kv_b_proj.append(kv_b)
+
+                # Weight absorption: extract W_UK and W_UV from kv_b_proj
+                H_mla = self.num_heads
+                P = self.qk_nope_head_dim  # 128
+                V = self.v_head_dim         # 128
+                C = self.kv_lora_rank       # 512
+                kv_b_reshaped = kv_b.view(H_mla, P + V, C)  # [16, 256, 512]
+                W_UK = kv_b_reshaped[:, :P, :]               # [16, 128, 512]
+                W_UV_raw = kv_b_reshaped[:, P:, :]           # [16, 128, 512]
+                self.W_UK_T.append(W_UK.contiguous())  # [H, P=128, C=512]
+                self.W_UV.append(W_UV_raw.transpose(1, 2).contiguous())  # [H, C=512, V=128]
+            else:
+                # Standard QKV — UNCHANGED
+                self.q_proj.append(
+                    weights.pop(f"{p}.self_attn.q_proj.weight").to(layer_dev))
+                self.k_proj.append(
+                    weights.pop(f"{p}.self_attn.k_proj.weight").to(layer_dev))
+                self.v_proj.append(
+                    weights.pop(f"{p}.self_attn.v_proj.weight").to(layer_dev))
+                if self.has_qk_norm:
+                    self.q_norm.append(
+                        weights.pop(f"{p}.self_attn.q_norm.weight").to(layer_dev))
+                    self.k_norm.append(
+                        weights.pop(f"{p}.self_attn.k_norm.weight").to(layer_dev))
+
+            # MLP / expert loading: 3-way branch
+            is_dense = self.is_mla and l < self.first_k_dense_replace
+
+            if is_dense:
+                # Dense layer: single SwiGLU MLP, no router, no experts
+                gate = weights.pop(f"{p}.mlp.gate_proj.weight").to(layer_dev)
+                up = weights.pop(f"{p}.mlp.up_proj.weight").to(layer_dev)
+                down = weights.pop(f"{p}.mlp.down_proj.weight").to(layer_dev)
+                self.dense_w1.append(torch.cat([gate, up], dim=0))  # [2*dense_I, H]
+                self.dense_w2.append(down)                           # [H, dense_I]
+                self.shared_w1.append(None)
+                self.shared_w2.append(None)
+                self.router.append(None)
+                if offloading:
+                    moe_I = self.moe_intermediate_size
+                    self.w1_cpu.append(torch.zeros(E, 2 * moe_I, self.hidden_size).pin_memory())
+                    self.w2_cpu.append(torch.zeros(E, self.hidden_size, moe_I).pin_memory())
+                    self.expert_map_abs.append(torch.full((E,), -1, dtype=torch.int32, device=self.device))
+                    if self.experts_per_layer is not None:
+                        self.w1.append(None)
+                        self.w2.append(None)
+                        self.expert_map.append(torch.full((E,), -1, dtype=torch.int32, device=self.device))
+                else:
+                    self.w1.append(None)
+                    self.w2.append(None)
+                print(f"  Layer {l}: dense MLP (intermediate={self.intermediate_size})")
+
+            elif self.is_mla:
+                # MoE layer with shared + routed experts
+                self.dense_w1.append(None)
+                self.dense_w2.append(None)
+
+                # Shared experts
+                sp = f"{p}.mlp.shared_experts"
+                shared_gate = weights.pop(f"{sp}.gate_proj.weight").to(layer_dev)
+                shared_up = weights.pop(f"{sp}.up_proj.weight").to(layer_dev)
+                shared_down = weights.pop(f"{sp}.down_proj.weight").to(layer_dev)
+                self.shared_w1.append(torch.cat([shared_gate, shared_up], dim=0))
+                self.shared_w2.append(shared_down)
+
+                # Router
+                self.router.append(weights.pop(f"{p}.mlp.gate.weight").to(layer_dev))
+
+                # Routed experts (same as existing, using moe_intermediate_size)
+                w1_list, w2_list = [], []
+                for e in range(self.num_experts):
+                    expert_prefix = f"{p}.mlp.experts.{e}"
                     gate = weights.pop(f"{expert_prefix}.gate_proj.weight")
                     up = weights.pop(f"{expert_prefix}.up_proj.weight")
                     down = weights.pop(f"{expert_prefix}.down_proj.weight")
+                    w1_list.append(torch.cat([gate, up], dim=0))
+                    w2_list.append(down)
+
+                if offloading:
+                    w1_full = torch.stack(w1_list).pin_memory()
+                    w2_full = torch.stack(w2_list).pin_memory()
+                    self.w1_cpu.append(w1_full)
+                    self.w2_cpu.append(w2_full)
+
+                    if self.experts_per_layer is not None:
+                        base = l * experts_per_layer
+                        copy_n = min(experts_per_layer, E)
+                        for slot in range(copy_n):
+                            self.w1_buf[base + slot].copy_(w1_full[slot])
+                            self.w2_buf[base + slot].copy_(w2_full[slot])
+                        self.w1.append(self.w1_buf[base : base + experts_per_layer])
+                        self.w2.append(self.w2_buf[base : base + experts_per_layer])
+                        emap_rel = torch.full((E,), -1, dtype=torch.int32, device=self.device)
+                        for slot in range(copy_n):
+                            emap_rel[slot] = slot
+                        self.expert_map.append(emap_rel)
+                        emap_abs = torch.full((E,), -1, dtype=torch.int32, device=self.device)
+                        for slot in range(copy_n):
+                            emap_abs[slot] = base + slot
+                        self.expert_map_abs.append(emap_abs)
+                    else:
+                        emap_abs = torch.full((E,), -1, dtype=torch.int32, device=self.device)
+                        self.expert_map_abs.append(emap_abs)
+                        print(f"  Layer {l}: w1_cpu {w1_full.shape} (unified cache, no pre-load)")
                 else:
-                    gate = weights.pop(f"{expert_prefix}.w1.weight")
-                    up = weights.pop(f"{expert_prefix}.w3.weight")
-                    down = weights.pop(f"{expert_prefix}.w2.weight")
-                w1_list.append(torch.cat([gate, up], dim=0))
-                w2_list.append(down)
+                    self.w1.append(torch.stack(w1_list).to(layer_dev))
+                    self.w2.append(torch.stack(w2_list).to(layer_dev))
+                    print(f"  Layer {l}: w1 {self.w1[-1].shape}, "
+                          f"w2 {self.w2[-1].shape}"
+                          f"{f' ({layer_dev})' if self.pp_size > 1 else ''}")
 
-            if offloading:
-                # Stack on CPU and pin for fast DMA transfers
-                w1_full = torch.stack(w1_list).pin_memory()  # [E, 2*I, H]
-                w2_full = torch.stack(w2_list).pin_memory()  # [E, H, I]
-                self.w1_cpu.append(w1_full)
-                self.w2_cpu.append(w2_full)
-
-                if self.experts_per_layer is not None:
-                    # Per-layer mode: populate buffer with initial experts
-                    base = l * experts_per_layer
-                    copy_n = min(experts_per_layer, E)
-                    for slot in range(copy_n):
-                        self.w1_buf[base + slot].copy_(w1_full[slot])
-                        self.w2_buf[base + slot].copy_(w2_full[slot])
-
-                    # Per-layer views (zero-copy into unified buffer)
-                    self.w1.append(
-                        self.w1_buf[base : base + experts_per_layer])
-                    self.w2.append(
-                        self.w2_buf[base : base + experts_per_layer])
-
-                    # Relative expert_map: first experts_per_layer → 0..N-1
-                    emap_rel = torch.full((E,), -1, dtype=torch.int32,
-                                          device=self.device)
-                    for slot in range(copy_n):
-                        emap_rel[slot] = slot
-                    self.expert_map.append(emap_rel)
-
-                    # Absolute expert_map
-                    emap_abs = torch.full((E,), -1, dtype=torch.int32,
-                                          device=self.device)
-                    for slot in range(copy_n):
-                        emap_abs[slot] = base + slot
-                    self.expert_map_abs.append(emap_abs)
-
-                    print(f"  Layer {l}: w1_cpu {w1_full.shape}, "
-                          f"view [{base}:{base+experts_per_layer}] in "
-                          f"unified buffer, expert_map "
-                          f"[{copy_n} resident / {E} total]")
-                else:
-                    # Unified cache mode: don't pre-load experts.
-                    # ReplayController.setup() populates the buffer.
-                    emap_abs = torch.full((E,), -1, dtype=torch.int32,
-                                          device=self.device)
-                    self.expert_map_abs.append(emap_abs)
-                    print(f"  Layer {l}: w1_cpu {w1_full.shape} "
-                          f"(unified cache, no pre-load)")
             else:
-                self.w1.append(torch.stack(w1_list).to(layer_dev))
-                self.w2.append(torch.stack(w2_list).to(layer_dev))
-                print(f"  Layer {l}: w1 {self.w1[-1].shape}, "
-                      f"w2 {self.w2[-1].shape}"
-                      f"{f' ({layer_dev})' if self.pp_size > 1 else ''}")
+                # ORIGINAL code path for OLMoE/Mixtral (UNCHANGED)
+                # Router key: OLMoE uses "mlp.gate", Mixtral uses "block_sparse_moe.gate"
+                router_key = f"{p}.mlp.gate.weight"
+                if router_key not in weights:
+                    router_key = f"{p}.block_sparse_moe.gate.weight"
+                self.router.append(weights.pop(router_key).to(layer_dev))
+
+                # Fuse expert weights: w1 = [E, 2*I, H], w2 = down [E, H, I]
+                # Triton fused_experts: w1 = cat(gate, up)
+                # Key format: OLMoE: "mlp.experts.{e}", Mixtral: "block_sparse_moe.experts.{e}"
+                w1_list, w2_list = [], []
+                for e in range(self.num_experts):
+                    expert_prefix = f"{p}.mlp.experts.{e}"
+                    if f"{expert_prefix}.gate_proj.weight" not in weights:
+                        expert_prefix = f"{p}.block_sparse_moe.experts.{e}"
+                    # OLMoE: gate_proj/up_proj/down_proj; Mixtral: w1/w3/w2
+                    if f"{expert_prefix}.gate_proj.weight" in weights:
+                        gate = weights.pop(f"{expert_prefix}.gate_proj.weight")
+                        up = weights.pop(f"{expert_prefix}.up_proj.weight")
+                        down = weights.pop(f"{expert_prefix}.down_proj.weight")
+                    else:
+                        gate = weights.pop(f"{expert_prefix}.w1.weight")
+                        up = weights.pop(f"{expert_prefix}.w3.weight")
+                        down = weights.pop(f"{expert_prefix}.w2.weight")
+                    w1_list.append(torch.cat([gate, up], dim=0))
+                    w2_list.append(down)
+
+                if offloading:
+                    # Stack on CPU and pin for fast DMA transfers
+                    w1_full = torch.stack(w1_list).pin_memory()  # [E, 2*I, H]
+                    w2_full = torch.stack(w2_list).pin_memory()  # [E, H, I]
+                    self.w1_cpu.append(w1_full)
+                    self.w2_cpu.append(w2_full)
+
+                    if self.experts_per_layer is not None:
+                        # Per-layer mode: populate buffer with initial experts
+                        base = l * experts_per_layer
+                        copy_n = min(experts_per_layer, E)
+                        for slot in range(copy_n):
+                            self.w1_buf[base + slot].copy_(w1_full[slot])
+                            self.w2_buf[base + slot].copy_(w2_full[slot])
+
+                        # Per-layer views (zero-copy into unified buffer)
+                        self.w1.append(
+                            self.w1_buf[base : base + experts_per_layer])
+                        self.w2.append(
+                            self.w2_buf[base : base + experts_per_layer])
+
+                        # Relative expert_map: first experts_per_layer → 0..N-1
+                        emap_rel = torch.full((E,), -1, dtype=torch.int32,
+                                              device=self.device)
+                        for slot in range(copy_n):
+                            emap_rel[slot] = slot
+                        self.expert_map.append(emap_rel)
+
+                        # Absolute expert_map
+                        emap_abs = torch.full((E,), -1, dtype=torch.int32,
+                                              device=self.device)
+                        for slot in range(copy_n):
+                            emap_abs[slot] = base + slot
+                        self.expert_map_abs.append(emap_abs)
+
+                        print(f"  Layer {l}: w1_cpu {w1_full.shape}, "
+                              f"view [{base}:{base+experts_per_layer}] in "
+                              f"unified buffer, expert_map "
+                              f"[{copy_n} resident / {E} total]")
+                    else:
+                        # Unified cache mode: don't pre-load experts.
+                        # ReplayController.setup() populates the buffer.
+                        emap_abs = torch.full((E,), -1, dtype=torch.int32,
+                                              device=self.device)
+                        self.expert_map_abs.append(emap_abs)
+                        print(f"  Layer {l}: w1_cpu {w1_full.shape} "
+                              f"(unified cache, no pre-load)")
+                else:
+                    self.w1.append(torch.stack(w1_list).to(layer_dev))
+                    self.w2.append(torch.stack(w2_list).to(layer_dev))
+                    print(f"  Layer {l}: w1 {self.w1[-1].shape}, "
+                          f"w2 {self.w2[-1].shape}"
+                          f"{f' ({layer_dev})' if self.pp_size > 1 else ''}")
 
         del weights
         torch.cuda.empty_cache()
@@ -718,23 +1017,42 @@ class MoEEngine:
         # Shape verification
         assert self.embed_tokens.shape == (self.vocab_size, self.hidden_size)
         assert self.lm_head.shape == (self.vocab_size, self.hidden_size)
-        if offloading:
+        if self.is_mla:
+            moe_I = self.moe_intermediate_size
+            if not offloading:
+                first_moe = self.first_k_dense_replace
+                assert self.w1[first_moe].shape == (self.num_experts, 2 * moe_I, self.hidden_size)
+                assert self.w2[first_moe].shape == (self.num_experts, self.hidden_size, moe_I)
+        elif offloading:
             if self.experts_per_layer is not None:
                 experts_per_layer = self.experts_per_layer
-                assert self.w1[0].shape == (experts_per_layer, 2 * self.intermediate_size, self.hidden_size)
-                assert self.w2[0].shape == (experts_per_layer, self.hidden_size, self.intermediate_size)
+                assert self.w1[0].shape == (experts_per_layer, 2 * self.moe_intermediate_size, self.hidden_size)
+                assert self.w2[0].shape == (experts_per_layer, self.hidden_size, self.moe_intermediate_size)
                 assert self.w1_buf.shape[0] == self.num_layers * experts_per_layer + self.scratchpad_slots
             else:
                 assert self.w1_buf.shape[0] == self.cache_size
-            assert self.w1_cpu[0].shape == (self.num_experts, 2 * self.intermediate_size, self.hidden_size)
+            assert self.w1_cpu[0].shape == (self.num_experts, 2 * self.moe_intermediate_size, self.hidden_size)
         else:
-            assert self.w1[0].shape == (self.num_experts, 2 * self.intermediate_size, self.hidden_size)
-            assert self.w2[0].shape == (self.num_experts, self.hidden_size, self.intermediate_size)
+            assert self.w1[0].shape == (self.num_experts, 2 * self.moe_intermediate_size, self.hidden_size)
+            assert self.w2[0].shape == (self.num_experts, self.hidden_size, self.moe_intermediate_size)
 
         # Stack per-layer weights into single tensors for indexed access.
         # When PP > 1, weights are on different GPUs — keep as lists.
         # self.foo[layer] works identically for both lists and stacked tensors.
-        if self.pp_size > 1:
+        if self.is_mla:
+            if self.pp_size == 1:
+                self.input_layernorm = torch.stack(self.input_layernorm)
+                self.post_attn_layernorm = torch.stack(self.post_attn_layernorm)
+                self.q_proj = torch.stack(self.q_proj)          # [L, 3072, 2048]
+                self.kv_a_proj = torch.stack(self.kv_a_proj)    # [L, 576, 2048]
+                self.kv_a_layernorm = torch.stack(self.kv_a_layernorm)  # [L, 512]
+                self.kv_b_proj = torch.stack(self.kv_b_proj)    # [L, 4096, 512]
+                self.o_proj = torch.stack(self.o_proj)           # [L, 2048, 2048]
+                self.W_UK_T = torch.stack(self.W_UK_T)          # [L, H, P, C]
+                self.W_UV = torch.stack(self.W_UV)              # [L, H, C, V]
+            # PP: keep as lists (weights on different GPUs can't be stacked)
+            self.qkv_proj = None  # Not used for MLA
+        elif self.pp_size > 1:
             # Fuse QKV per-layer (keep as list since weights span GPUs)
             self.qkv_proj = [
                 torch.cat([q, k, v], dim=0)
@@ -766,6 +1084,58 @@ class MoEEngine:
         positions = torch.arange(self.max_seq_len, dtype=torch.float32)
         angles = torch.outer(positions, inv_freq)
         return torch.cat([torch.cos(angles), torch.sin(angles)], dim=-1)  # [max_seq, head_dim]
+
+    def _build_yarn_rope_cache(self) -> torch.Tensor:
+        """YaRN RoPE cache for MLA (applied only to qk_rope_head_dim dims)."""
+        cfg = self.rope_scaling_config
+        half_dim = self.qk_rope_head_dim // 2  # 32
+
+        # Base frequencies
+        inv_freq = 1.0 / (self.rope_theta ** (
+            torch.arange(0, half_dim, dtype=torch.float32) / half_dim))
+
+        # YaRN correction range
+        scaling_factor = cfg["factor"]
+        beta_fast = cfg.get("beta_fast", 32)
+        beta_slow = cfg.get("beta_slow", 1)
+        original_max_pos = cfg.get("original_max_position_embeddings", 4096)
+
+        # Find correction range (yarn_find_correction_range from vLLM)
+        low = math.floor(_yarn_find_correction_dim(
+            beta_fast, self.qk_rope_head_dim, self.rope_theta, original_max_pos))
+        high = math.ceil(_yarn_find_correction_dim(
+            beta_slow, self.qk_rope_head_dim, self.rope_theta, original_max_pos))
+        low = max(low, 0)
+        high = min(high, half_dim - 1)
+
+        # Linear ramp mask: 0 at low dims (extrapolate/keep original), 1 at high dims (interpolate)
+        if low == high:
+            high = high + 0.001  # vLLM convention: avoid div-by-zero
+        t = torch.arange(half_dim, dtype=torch.float32)
+        mask = ((t - low) / (high - low)).clamp(0, 1)
+
+        # Blend interpolated and original frequencies using YaRN ramp.
+        inv_freq_interp = inv_freq / scaling_factor
+        inv_freq_yarn = inv_freq_interp * mask + inv_freq * (1 - mask)
+
+        # cos/sin mscale correction
+        mscale_coeff = cfg.get("mscale", 1.0)
+        mscale_all_dim_coeff = cfg.get("mscale_all_dim", 0.0)
+        attn_factor = cfg.get("attn_factor", 1.0)
+        if scaling_factor <= 1.0:
+            cos_sin_mscale = 1.0
+        else:
+            cos_sin_mscale = (
+                _yarn_get_mscale(scaling_factor, mscale_coeff)
+                / _yarn_get_mscale(scaling_factor, mscale_all_dim_coeff)
+                * attn_factor
+            )
+
+        positions = torch.arange(self.max_seq_len, dtype=torch.float32)
+        angles = torch.outer(positions, inv_freq_yarn)
+        cos = torch.cos(angles) * cos_sin_mscale
+        sin = torch.sin(angles) * cos_sin_mscale
+        return torch.cat([cos, sin], dim=-1)  # [max_seq_len, qk_rope_head_dim]
 
     # ── Offloading ────────────────────────────────────────────────────
 
@@ -982,11 +1352,82 @@ class MoEEngine:
             self.seq_lens[:B] += 1
         return logits
 
+    def _layer_decode_mla(self, hidden, layer, positions, slot_mapping, mla_wrapper):
+        """Single decode layer for MLA — KV compress + cache write + MLA attention."""
+        B = hidden.shape[0]
+        H = self.hidden_size
+
+        residual = hidden
+        hidden = F.rms_norm(hidden, (H,), self.input_layernorm[layer], self.rms_norm_eps)
+
+        # Q projection: [B, 3072] → q_nope [B, H, P], q_pe [B, H, R]
+        q_full = F.linear(hidden, self.q_proj[layer]).view(B, self.num_heads, self.qk_head_dim)
+        q_nope = q_full[:, :, :self.qk_nope_head_dim]
+        q_pe = q_full[:, :, self.qk_nope_head_dim:]
+
+        # KV compression: [B, 576] → c_kv [B, 512], k_pe [B, 64]
+        kv_a = F.linear(hidden, self.kv_a_proj[layer])
+        c_kv = kv_a[:, :self.kv_lora_rank]
+        k_pe = kv_a[:, self.kv_lora_rank:]
+        c_kv = F.rms_norm(c_kv, (self.kv_lora_rank,), self.kv_a_layernorm[layer],
+                          self.rms_norm_eps)
+
+        # RoPE on PE dims only (interleaved convention)
+        cos_sin = self._get_cos_sin_cache(layer)
+        q_pe_rot, k_pe_rot = rope_mla(q_pe.reshape(B, -1), k_pe, cos_sin, positions)
+        q_pe_rot = q_pe_rot.view(B, self.num_heads, self.qk_rope_head_dim)
+
+        # Write to MLA KV cache (sentinel-safe via torch.where)
+        safe_slots = torch.where(slot_mapping >= 0, slot_mapping, self._scratch_slot)
+        self.ckv_flat[layer][safe_slots] = c_kv
+        self.kpe_flat[layer][safe_slots] = k_pe_rot
+
+        # MLA decode attention via weight absorption
+        q_absorbed = torch.einsum('bhp,hpc->bhc', q_nope, self.W_UK_T[layer])
+        attn_latent = mla_wrapper.run(
+            q_absorbed, q_pe_rot, self.ckv_cache[layer], self.kpe_cache[layer])
+        attn_v = torch.einsum('bhc,hcv->bhv', attn_latent, self.W_UV[layer])
+        attn_out = attn_v.reshape(B, self.num_heads * self.v_head_dim)
+
+        hidden = residual + F.linear(attn_out, self.o_proj[layer])
+
+        residual = hidden
+        hidden = F.rms_norm(hidden, (H,), self.post_attn_layernorm[layer], self.rms_norm_eps)
+
+        if self.router[layer] is None:
+            # Dense SwiGLU MLP (layer 0)
+            gate_up = F.linear(hidden, self.dense_w1[layer])
+            I = self.intermediate_size
+            hidden = F.linear(F.silu(gate_up[:, :I]) * gate_up[:, I:], self.dense_w2[layer])
+        else:
+            # MoE + shared experts
+            router_logits = F.linear(hidden, self.router[layer])
+            routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+            topk_weights, topk_ids = torch.topk(routing_weights, self.top_k, dim=-1)
+            if self.norm_topk_prob:
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            else:
+                topk_weights = topk_weights * self.routed_scaling_factor
+            expert_map = (self.expert_map[layer]
+                          if self.experts_per_layer is not None else None)
+            routed = self._moe_experts(hidden, self.w1[layer], self.w2[layer],
+                                       topk_weights, topk_ids, expert_map)
+            shared_gu = F.linear(hidden, self.shared_w1[layer])
+            shared_I = self.moe_intermediate_size * self.n_shared_experts
+            shared = F.linear(F.silu(shared_gu[:, :shared_I]) * shared_gu[:, shared_I:],
+                              self.shared_w2[layer])
+            hidden = routed + shared
+
+        return residual + hidden
+
     def _layer_decode(self, hidden, layer, positions, slot_mapping, decode_wrapper):
         """Single decode layer — reshape_and_cache_flash + FlashInfer BatchDecode.
 
         Uses rope_pytorch (compilable by torch.compile / Inductor).
         """
+        if self.is_mla:
+            return self._layer_decode_mla(hidden, layer, positions, slot_mapping,
+                                           decode_wrapper)
         B = hidden.shape[0]
         H = self.hidden_size
         kv_dim = self.num_kv_heads * self.head_dim
@@ -1085,6 +1526,160 @@ class MoEEngine:
             num_qo_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim, page_size=self.page_size,
             pos_encoding_mode="NONE", q_data_type=self.dtype)
+
+    def _plan_mla_decode(self, wrapper, B, gpu_idx=None):
+        """Plan FlashInfer MLA decode with current batch metadata.
+
+        CRITICAL: Caller MUST increment self._seq_lens_cpu[:B] += 1 BEFORE
+        calling this method, so FlashInfer includes the current token's KV
+        in attention.
+
+        Args:
+            gpu_idx: For PP mode, which GPU's block_table to use. None for single-GPU.
+        """
+        seq_lens = self._seq_lens_cpu[:B]
+        pages_per_seq = (seq_lens + self.page_size - 1) // self.page_size
+
+        # qo_indptr: [0, 1, 2, ..., B] for decode (1 query token per request)
+        qo_indptr = torch.arange(B + 1, dtype=torch.int32)
+
+        # kv_indptr: cumulative page counts
+        kv_indptr = torch.zeros(B + 1, dtype=torch.int32)
+        kv_indptr[1:] = pages_per_seq.cumsum(0)
+
+        if gpu_idx is not None:
+            bt = self.block_table[gpu_idx]
+            dev = self.pp_devices[gpu_idx]
+        else:
+            bt = self.block_table
+            dev = self.device
+
+        max_pages = pages_per_seq.max().item() if B > 0 else 0
+        if max_pages > 0:
+            page_range = torch.arange(max_pages, dtype=torch.int32)
+            valid = page_range.unsqueeze(0) < pages_per_seq.unsqueeze(1)
+            all_pages = bt[:B, :max_pages].cpu()
+            kv_indices = all_pages[valid].to(torch.int32).to(dev)
+        else:
+            kv_indices = torch.zeros(0, dtype=torch.int32, device=dev)
+
+        kv_len_arr = seq_lens.to(torch.int32)
+
+        wrapper.plan(
+            qo_indptr, kv_indptr, kv_indices, kv_len_arr,
+            num_heads=self.num_heads,
+            head_dim_ckv=self.kv_lora_rank,
+            head_dim_kpe=self.qk_rope_head_dim,
+            page_size=self.page_size,
+            causal=False,
+            sm_scale=self._mla_sm_scale,
+            q_data_type=self.dtype,
+            kv_data_type=self.dtype,
+        )
+
+    def _plan_mla_decode_for_subset(self, wrapper, seq_ids, gpu_idx=None):
+        """Plan FlashInfer MLA decode for a subset of sequence slots.
+
+        Unlike _plan_mla_decode which assumes contiguous [:B] slots,
+        this handles arbitrary slot indices in seq_ids.
+
+        CRITICAL: Caller MUST increment _seq_lens_cpu for each seq_id
+        BEFORE calling this method.
+
+        Args:
+            seq_ids: list[int] — arbitrary slot indices for decode sequences
+            gpu_idx: For PP mode, which GPU's block_table to use. None for single-GPU.
+        """
+        B = len(seq_ids)
+        sid_tensor = torch.tensor(seq_ids, dtype=torch.long)
+        seq_lens = self._seq_lens_cpu[sid_tensor]
+        pages_per_seq = (seq_lens + self.page_size - 1) // self.page_size
+
+        qo_indptr = torch.arange(B + 1, dtype=torch.int32)
+        kv_indptr = torch.zeros(B + 1, dtype=torch.int32)
+        kv_indptr[1:] = pages_per_seq.cumsum(0)
+
+        if gpu_idx is not None:
+            bt = self.block_table[gpu_idx]
+            dev = self.pp_devices[gpu_idx]
+        else:
+            bt = self.block_table
+            dev = self.device
+
+        max_pages = pages_per_seq.max().item() if B > 0 else 0
+        if max_pages > 0:
+            page_range = torch.arange(max_pages, dtype=torch.int32)
+            valid = page_range.unsqueeze(0) < pages_per_seq.unsqueeze(1)
+            all_pages = bt[sid_tensor, :max_pages].cpu()
+            kv_indices = all_pages[valid].to(torch.int32).to(dev)
+        else:
+            kv_indices = torch.zeros(0, dtype=torch.int32, device=dev)
+
+        kv_len_arr = seq_lens.to(torch.int32)
+
+        wrapper.plan(
+            qo_indptr, kv_indptr, kv_indices, kv_len_arr,
+            num_heads=self.num_heads,
+            head_dim_ckv=self.kv_lora_rank,
+            head_dim_kpe=self.qk_rope_head_dim,
+            page_size=self.page_size,
+            causal=False,
+            sm_scale=self._mla_sm_scale,
+            q_data_type=self.dtype,
+            kv_data_type=self.dtype,
+        )
+
+    def _plan_mla_continuation(self, wrapper, cont_seq_ids, cont_chunk_lens,
+                                cont_total_seq_lens, gpu_idx=None):
+        """Plan FlashInfer MLA wrapper for multi-token continuation prefill.
+
+        Like _plan_mla_decode_for_subset but builds qo_indptr from per-sequence
+        chunk lengths (not all-ones) and uses causal=True for correct masking.
+
+        Caller MUST have already written current chunk KV to cache (stage1)
+        and updated _seq_lens_cpu to include current chunk (section 4b).
+        """
+        B = len(cont_seq_ids)
+        if gpu_idx is not None:
+            bt = self.block_table[gpu_idx]
+            dev = self.pp_devices[gpu_idx]
+        else:
+            bt = self.block_table
+            dev = self.device
+
+        # qo_indptr: cumulative chunk lengths (multi-token queries, not all-ones)
+        qo_indptr = torch.zeros(B + 1, dtype=torch.int32)
+        qo_indptr[1:] = torch.tensor(cont_chunk_lens, dtype=torch.int32).cumsum(0)
+
+        # kv: based on total sequence lengths (KV cache includes current chunk)
+        total_sl = torch.tensor(cont_total_seq_lens, dtype=torch.int32)
+        pages_per_seq = (total_sl + self.page_size - 1) // self.page_size
+        kv_indptr = torch.zeros(B + 1, dtype=torch.int32)
+        kv_indptr[1:] = pages_per_seq.cumsum(0)
+
+        sid_tensor = torch.tensor(cont_seq_ids, dtype=torch.long)
+        max_pages = pages_per_seq.max().item() if B > 0 else 0
+        if max_pages > 0:
+            page_range = torch.arange(max_pages, dtype=torch.int32)
+            valid = page_range.unsqueeze(0) < pages_per_seq.unsqueeze(1)
+            all_pages = bt[sid_tensor, :max_pages].cpu()
+            kv_indices = all_pages[valid].to(torch.int32).to(dev)
+        else:
+            kv_indices = torch.zeros(0, dtype=torch.int32, device=dev)
+
+        kv_len_arr = total_sl.to(torch.int32)
+
+        wrapper.plan(
+            qo_indptr.to(dev), kv_indptr.to(dev), kv_indices, kv_len_arr.to(dev),
+            num_heads=self.num_heads,
+            head_dim_ckv=self.kv_lora_rank,
+            head_dim_kpe=self.qk_rope_head_dim,
+            page_size=self.page_size,
+            causal=True,
+            sm_scale=self._mla_sm_scale,
+            q_data_type=self.dtype,
+            kv_data_type=self.dtype,
+        )
 
     # ── Slot-based Prefill ────────────────────────────────────────────
 
@@ -1338,7 +1933,6 @@ class MoEEngine:
         # ── 7. Per-layer piecewise replay ──
         for layer in range(self.num_layers):
             buf = _buf(layer)
-            q_buf = buf['q_buf']
             attn_out_buf = buf['attn_out_buf']
 
             # Cross-GPU transfer at PP boundaries
@@ -1354,17 +1948,45 @@ class MoEEngine:
             # Stage 1: pre-attention (CUDA graph)
             info['stage1_graphs'][layer].replay()
 
-            # Stage 3: FlashInfer prefill with paged KV cache
-            q_pf = q_buf[:C]
-            if pp:
-                gpu_idx = self.pp_layer_gpu[layer]
-                pw = prefill_wrappers[gpu_idx]
+            # Stage 3: attention for continuation chunk
+            if self.is_mla:
+                # MLA continuation: decompress and use FA3 self-attention
+                # (same as stage3a in piecewise; full-prefill path)
+                q_nope_pf = buf['q_nope_buf'][:C]
+                q_pe_pf = buf['q_pe_buf'][:C]
+                c_kv_pf = buf['ckv_buf'][:C]
+                k_pe_pf = buf['kpe_buf'][:C]
+                kv_decompressed = F.linear(c_kv_pf, self.kv_b_proj[layer])
+                kv_reshaped = kv_decompressed.view(C, self.num_heads,
+                                                    self.qk_nope_head_dim + self.v_head_dim)
+                k_nope_pf = kv_reshaped[:, :, :self.qk_nope_head_dim]
+                v_pf = kv_reshaped[:, :, self.qk_nope_head_dim:]
+                k_pe_exp = k_pe_pf.unsqueeze(1).expand(-1, self.num_heads, -1)
+                k_full = torch.cat([k_nope_pf, k_pe_exp], dim=-1)
+                q_full_pf = torch.cat([q_nope_pf, q_pe_pf], dim=-1)
+                dev = self.pp_devices[self.pp_layer_gpu[layer]] if pp else self.device
+                cu_pf = torch.tensor([0, C], dtype=torch.int32, device=dev)
+                pf_out = flash_attn_varlen_func(
+                    q_full_pf.contiguous(), k_full.contiguous(), v_pf.contiguous(),
+                    cu_seqlens_q=cu_pf,
+                    cu_seqlens_k=cu_pf,
+                    max_seqlen_q=C,
+                    max_seqlen_k=C,
+                    softmax_scale=self._mla_sm_scale,
+                    causal=True, fa_version=3)
+                attn_out_buf[:C].copy_(
+                    pf_out.reshape(C, self.num_heads * self.v_head_dim))
             else:
-                pw = pw  # already set above
-            prefill_out = pw.run(
-                q_pf,
-                (self.k_cache[layer], self.v_cache[layer]))
-            attn_out_buf[:C].copy_(prefill_out.reshape(C, H))
+                q_buf = buf['q_buf']
+                q_pf = q_buf[:C]
+                if pp:
+                    gpu_idx = self.pp_layer_gpu[layer]
+                    pw = prefill_wrappers[gpu_idx]
+                # else pw already set above (single-GPU)
+                prefill_out = pw.run(
+                    q_pf,
+                    (self.k_cache[layer], self.v_cache[layer]))
+                attn_out_buf[:C].copy_(prefill_out.reshape(C, H))
 
             # Zero padding region
             if C < graph_N:
@@ -1612,6 +2234,10 @@ class MoEEngine:
             prefill_cu_seqlens: [num_prefill_reqs + 1] int32, for FA3
             prefill_max_seqlen: max prefill seq length
         """
+        if self.is_mla:
+            return self._layer_mixed_mla(hidden, layer, positions, slot_mapping,
+                                          num_decode_tokens,
+                                          prefill_cu_seqlens, prefill_max_seqlen)
         N = hidden.shape[0]
         H = self.hidden_size
         kv_dim = self.num_kv_heads * self.head_dim
@@ -1717,6 +2343,128 @@ class MoEEngine:
 
         return residual + hidden
 
+    def _layer_mixed_mla(self, hidden, layer, positions, slot_mapping,
+                          D, prefill_cu_seqlens, prefill_max_seqlen):
+        """Eager MLA forward for warmup and fallback (no CUDA graphs).
+
+        Args:
+            hidden: [N_total, H]
+            layer: layer index
+            positions: [N_total] int32
+            slot_mapping: [N_total] int64
+            D: num_decode_tokens — hidden[:D] are decode, [D:] are prefill
+            prefill_cu_seqlens: [num_prefill_reqs + 1] int32, for FA3
+            prefill_max_seqlen: max prefill seq length
+        """
+        N, H = hidden.shape[0], self.hidden_size
+
+        # --- Stage 1: RMSNorm + Q proj + KV compress + layernorm + RoPE + cache write ---
+        residual = hidden
+        hidden = F.rms_norm(hidden, (H,), self.input_layernorm[layer], self.rms_norm_eps)
+
+        q_full = F.linear(hidden, self.q_proj[layer]).view(N, self.num_heads, self.qk_head_dim)
+        q_nope = q_full[:, :, :self.qk_nope_head_dim]
+        q_pe = q_full[:, :, self.qk_nope_head_dim:]
+
+        kv_a = F.linear(hidden, self.kv_a_proj[layer])
+        c_kv = kv_a[:, :self.kv_lora_rank]
+        k_pe = kv_a[:, self.kv_lora_rank:]
+        c_kv = F.rms_norm(c_kv, (self.kv_lora_rank,), self.kv_a_layernorm[layer], self.rms_norm_eps)
+
+        cos_sin = self._get_cos_sin_cache(layer)
+        q_pe_rot, k_pe_rot = rope_mla(
+            q_pe.reshape(N, -1), k_pe, cos_sin, positions)
+        q_pe_rot = q_pe_rot.view(N, self.num_heads, self.qk_rope_head_dim)
+
+        safe_slots = torch.where(slot_mapping >= 0, slot_mapping, self._scratch_slot)
+        self.ckv_flat[layer][safe_slots] = c_kv
+        self.kpe_flat[layer][safe_slots] = k_pe_rot
+
+        # --- Stage 2: MLA decode attention (tokens :D) ---
+        if D > 0:
+            if self.pp_size > 1:
+                gpu_idx = self.pp_layer_gpu[layer]
+                mla_wrapper = self._mla_wrappers[gpu_idx]
+            else:
+                mla_wrapper = self._mla_decode_wrapper
+            q_absorbed = torch.einsum('bhp,hpc->bhc', q_nope[:D], self.W_UK_T[layer])
+            attn_latent = mla_wrapper.run(
+                q_absorbed, q_pe_rot[:D], self.ckv_cache[layer], self.kpe_cache[layer])
+            attn_v = torch.einsum('bhc,hcv->bhv', attn_latent, self.W_UV[layer])
+            decode_out = attn_v.reshape(D, self.num_heads * self.v_head_dim)
+
+        # --- Stage 3: MLA prefill attention (tokens D:N) ---
+        N_pf = N - D
+        prefill_out = None
+        if N_pf > 0:
+            q_nope_pf = q_nope[D:]    # [N_pf, H, 128]
+            q_pe_pf = q_pe_rot[D:]    # [N_pf, H, 64]
+            c_kv_pf = c_kv[D:]        # [N_pf, 512]
+            k_pe_pf = k_pe_rot[D:]    # [N_pf, 64]
+
+            # Decompress via kv_b_proj: [N_pf, 512] -> [N_pf, H*(P+V)]
+            kv_decompressed = F.linear(c_kv_pf, self.kv_b_proj[layer])
+            kv_reshaped = kv_decompressed.view(N_pf, self.num_heads,
+                                                self.qk_nope_head_dim + self.v_head_dim)
+            k_nope_pf = kv_reshaped[:, :, :self.qk_nope_head_dim]  # [N_pf, H, 128]
+            v_pf = kv_reshaped[:, :, self.qk_nope_head_dim:]       # [N_pf, H, 128]
+
+            # k_pe broadcast to all heads: [N_pf, 64] -> [N_pf, H, 64]
+            k_pe_expanded = k_pe_pf.unsqueeze(1).expand(-1, self.num_heads, -1)
+            k_full = torch.cat([k_nope_pf, k_pe_expanded], dim=-1)   # [N_pf, H, 192]
+            q_full_pf = torch.cat([q_nope_pf, q_pe_pf], dim=-1)      # [N_pf, H, 192]
+
+            # FA3 on Hopper natively handles Q/K dim=192 vs V dim=128
+            pf_out = flash_attn_varlen_func(
+                q_full_pf.contiguous(), k_full.contiguous(), v_pf.contiguous(),
+                cu_seqlens_q=prefill_cu_seqlens,
+                cu_seqlens_k=prefill_cu_seqlens,
+                max_seqlen_q=prefill_max_seqlen,
+                max_seqlen_k=prefill_max_seqlen,
+                softmax_scale=self._mla_sm_scale,
+                causal=True, fa_version=3)
+            # pf_out: [N_pf, H, V=128]
+            prefill_out = pf_out.reshape(N_pf, self.num_heads * self.v_head_dim)
+
+        # Combine decode and prefill outputs
+        if D > 0 and prefill_out is not None:
+            attn_out = torch.cat([decode_out, prefill_out], dim=0)
+        elif D > 0:
+            attn_out = decode_out
+        else:
+            attn_out = prefill_out
+
+        # --- O projection + residual ---
+        hidden = residual + F.linear(attn_out, self.o_proj[layer])
+
+        # --- Stage 4: Post-attn norm + FFN ---
+        residual = hidden
+        hidden = F.rms_norm(hidden, (H,), self.post_attn_layernorm[layer], self.rms_norm_eps)
+
+        if self.router[layer] is None:
+            # Dense layer: SwiGLU MLP
+            gate_up = F.linear(hidden, self.dense_w1[layer])
+            I = self.intermediate_size
+            hidden = F.linear(F.silu(gate_up[:, :I]) * gate_up[:, I:], self.dense_w2[layer])
+        else:
+            # MoE: router + fused_moe + shared experts
+            router_logits = F.linear(hidden, self.router[layer])
+            routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+            topk_weights, topk_ids = torch.topk(routing_weights, self.top_k, dim=-1)
+            if self.norm_topk_prob:
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            else:
+                topk_weights = topk_weights * self.routed_scaling_factor
+            routed = self._moe_experts(hidden, self.w1[layer], self.w2[layer],
+                                        topk_weights, topk_ids)
+            shared_gu = F.linear(hidden, self.shared_w1[layer])
+            shared_I = self.moe_intermediate_size * self.n_shared_experts
+            shared = F.linear(F.silu(shared_gu[:, :shared_I]) * shared_gu[:, shared_I:],
+                              self.shared_w2[layer])
+            hidden = routed + shared
+
+        return residual + hidden
+
     # ── Piecewise Stage Functions ────────────────────────────────────
 
     def _layer_stage1_pre_attn(self, hidden, positions, slot_mapping, layer,
@@ -1760,6 +2508,49 @@ class MoEEngine:
         v_buf.copy_(v_3d)
         residual_buf.copy_(hidden)
 
+    def _layer_stage1_mla(self, hidden, positions, slot_mapping, layer,
+                           q_nope_buf, q_pe_buf, ckv_buf, kpe_buf, residual_buf):
+        """Stage 1 for MLA: RMSNorm -> Q proj -> KV compress -> KV norm ->
+        RoPE (pe only) -> KV cache write."""
+        N = hidden.shape[0]
+        H = self.hidden_size
+
+        # RMSNorm
+        normed = F.rms_norm(hidden, (H,), self.input_layernorm[layer], self.rms_norm_eps)
+
+        # Q projection: [N, 3072] -> split into q_nope [N, num_heads, P] and q_pe [N, num_heads, R]
+        q_full = F.linear(normed, self.q_proj[layer])  # [N, num_heads*(P+R)]
+        q_full = q_full.view(N, self.num_heads, self.qk_head_dim)  # [N, H, P+R]
+        q_nope = q_full[:, :, :self.qk_nope_head_dim]  # [N, H, P=128]
+        q_pe = q_full[:, :, self.qk_nope_head_dim:]     # [N, H, R=64]
+
+        # KV compression: [N, 576] -> split c_kv [N, 512] and k_pe [N, 64]
+        kv_compressed = F.linear(normed, self.kv_a_proj[layer])  # [N, C+R]
+        c_kv = kv_compressed[:, :self.kv_lora_rank]        # [N, 512]
+        k_pe = kv_compressed[:, self.kv_lora_rank:]         # [N, 64]
+
+        # LayerNorm on compressed KV
+        c_kv_normed = F.rms_norm(c_kv, (self.kv_lora_rank,),
+                                  self.kv_a_layernorm[layer], self.rms_norm_eps)
+
+        # RoPE on pe dimensions only
+        cos_sin = self._get_cos_sin_cache(layer)
+        q_pe_flat = q_pe.reshape(N, -1)  # [N, H*R]
+        q_pe_rot, k_pe_rot = rope_mla(q_pe_flat, k_pe, cos_sin, positions)
+        q_pe_rot = q_pe_rot.view(N, self.num_heads, self.qk_rope_head_dim)
+
+        # Write to MLA KV cache (CUDA-graph safe scatter with sentinel handling)
+        safe_slots = torch.where(slot_mapping >= 0, slot_mapping, self._scratch_slot)
+        self.ckv_flat[layer][safe_slots] = c_kv_normed   # [N, 512]
+        self.kpe_flat[layer][safe_slots] = k_pe_rot       # [N, 64]
+
+        # Output to buffers
+        q_nope_buf.copy_(q_nope)        # [N, H, P=128]
+        q_pe_buf.copy_(q_pe_rot)        # [N, H, R=64]
+        ckv_buf.copy_(c_kv_normed)      # [N, 512]
+        kpe_buf.copy_(k_pe_rot)         # [N, 64]
+        residual_buf.copy_(hidden)
+
     def _layer_stage4a_router(self, attn_out, residual, layer,
                               moe_input_buf, moe_residual_buf,
                               topk_weights_buf, topk_ids_buf):
@@ -1776,11 +2567,17 @@ class MoEEngine:
                             self.rms_norm_eps)
         moe_input_buf.copy_(hidden)
 
+        if self.router[layer] is None:
+            # Dense layer: no routing. topk buffers stay zero (unused).
+            return
+
         router_logits = F.linear(hidden, self.router[layer])
         routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
         topk_weights, topk_ids = torch.topk(routing_weights, self.top_k, dim=-1)
         if self.norm_topk_prob:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        elif self.is_mla:
+            topk_weights = topk_weights * self.routed_scaling_factor
         topk_weights_buf.copy_(topk_weights)
         topk_ids_buf.copy_(topk_ids)
 
@@ -1796,15 +2593,35 @@ class MoEEngine:
         must update expert_map_buf with this layer's absolute map before
         calling this.
         """
+        is_dense = self.is_mla and layer < self.first_k_dense_replace
+
+        if is_dense:
+            # Dense SwiGLU MLP
+            gate_up = F.linear(moe_input_buf, self.dense_w1[layer])
+            I = self.intermediate_size
+            gate, up = gate_up[:, :I], gate_up[:, I:]
+            hidden = F.linear(F.silu(gate) * up, self.dense_w2[layer])
+            hidden_out.copy_(moe_residual_buf + hidden)
+            return
+
         if self.offloading:
             w1, w2 = self.w1_buf, self.w2_buf
             expert_map = self.expert_map_buf
         else:
             w1, w2 = self.w1[layer], self.w2[layer]
             expert_map = None
-        hidden = self._moe_experts(moe_input_buf, w1, w2,
+        routed = self._moe_experts(moe_input_buf, w1, w2,
                                    topk_weights_buf, topk_ids_buf, expert_map)
-        hidden_out.copy_(moe_residual_buf + hidden)
+
+        # Shared experts (MLA only, non-dense layers)
+        if self.is_mla and self.n_shared_experts > 0:
+            shared_gate_up = F.linear(moe_input_buf, self.shared_w1[layer])
+            shared_I = self.moe_intermediate_size * self.n_shared_experts
+            sg, su = shared_gate_up[:, :shared_I], shared_gate_up[:, shared_I:]
+            shared = F.linear(F.silu(sg) * su, self.shared_w2[layer])
+            hidden_out.copy_(moe_residual_buf + routed + shared)
+        else:
+            hidden_out.copy_(moe_residual_buf + routed)
 
     def _full_mixed_graph_body(self, all_token_ids, positions, slot_mapping,
                                num_decode_tokens, decode_wrapper,
@@ -1815,10 +2632,16 @@ class MoEEngine:
         + RoPE between graph-breaking external kernels.
         """
         hidden = F.embedding(all_token_ids, self.embed_tokens)
-        for layer in range(self.num_layers):
-            hidden = self._layer_mixed(hidden, layer, positions, slot_mapping,
-                                       num_decode_tokens, decode_wrapper,
-                                       prefill_cu_seqlens, prefill_max_seqlen)
+        if self.is_mla:
+            for layer in range(self.num_layers):
+                hidden = self._layer_mixed_mla(
+                    hidden, layer, positions, slot_mapping,
+                    num_decode_tokens, prefill_cu_seqlens, prefill_max_seqlen)
+        else:
+            for layer in range(self.num_layers):
+                hidden = self._layer_mixed(hidden, layer, positions, slot_mapping,
+                                           num_decode_tokens, decode_wrapper,
+                                           prefill_cu_seqlens, prefill_max_seqlen)
         hidden = F.rms_norm(hidden, (self.hidden_size,), self.final_norm,
                             self.rms_norm_eps)
         return F.linear(hidden, self.lm_head)
@@ -1923,11 +2746,15 @@ class MoEEngine:
         ]
         positions = torch.cat([decode_positions] + prefill_pos_parts)
 
-        # ── Increment _seq_lens_cpu for decode BEFORE FlashInfer plan ──
+        # ── Increment _seq_lens_cpu for decode BEFORE FlashInfer/MLA plan ──
         if D > 0:
             for sid in decode_seq_ids:
                 self._seq_lens_cpu[sid] += 1
-            self._plan_flashinfer_decode_for_subset(decode_seq_ids)
+            if self.is_mla:
+                self._plan_mla_decode_for_subset(
+                    self._mla_decode_wrapper, decode_seq_ids)
+            else:
+                self._plan_flashinfer_decode_for_subset(decode_seq_ids)
 
         # ── Slot mapping ──
         if D > 0:
@@ -1993,8 +2820,35 @@ class MoEEngine:
           [CPU break: offload engine inspects routing, loads experts]
           Stage 4b: moe_input_buf + topk → hidden_buf (MoE + residual)
         hidden_buf becomes residual_buf for the next layer.
+
+        For MLA models, stage 1 produces q_nope_buf, q_pe_buf, ckv_buf,
+        kpe_buf instead of q_buf/k_buf/v_buf.
         """
         total_kv_slots = self.total_pages * self.page_size
+        if self.is_mla:
+            return {
+                'q_nope_buf': torch.zeros(N, self.num_heads, self.qk_nope_head_dim,
+                                           dtype=self.dtype, device=device),
+                'q_pe_buf': torch.zeros(N, self.num_heads, self.qk_rope_head_dim,
+                                         dtype=self.dtype, device=device),
+                'ckv_buf': torch.zeros(N, self.kv_lora_rank,
+                                        dtype=self.dtype, device=device),
+                'kpe_buf': torch.zeros(N, self.qk_rope_head_dim,
+                                        dtype=self.dtype, device=device),
+                'attn_out_buf': torch.zeros(N, self.num_heads * self.v_head_dim,
+                                             dtype=self.dtype, device=device),
+                'residual_buf': torch.zeros(N, self.hidden_size, dtype=self.dtype, device=device),
+                'hidden_buf': torch.zeros(N, self.hidden_size, dtype=self.dtype, device=device),
+                'moe_input_buf': torch.zeros(N, self.hidden_size, dtype=self.dtype, device=device),
+                'moe_residual_buf': torch.zeros(N, self.hidden_size, dtype=self.dtype, device=device),
+                'topk_weights_buf': torch.zeros(N, self.top_k, dtype=torch.float32, device=device),
+                'topk_ids_buf': torch.zeros(N, self.top_k, dtype=torch.int64, device=device),
+                'static_positions': (torch.arange(N, dtype=torch.int32, device=device)
+                                     % self.max_seq_len),
+                'static_slot_mapping': (torch.arange(N, dtype=torch.long, device=device)
+                                        % total_kv_slots),
+                'static_token_ids': torch.randint(1, 1000, (N,), device=device),
+            }
         return {
             'q_buf': torch.zeros(N, self.num_heads, self.head_dim,
                                  dtype=self.dtype, device=device),
@@ -2072,13 +2926,37 @@ class MoEEngine:
         # fused_moe contain ops Dynamo can't trace. The resulting graph
         # breaks add overhead (~32 enter/exit per forward), but CUDA graph
         # capture on top eliminates it entirely.
-        stage1_fn = self._layer_stage1_pre_attn
+        stage1_fn = (self._layer_stage1_mla if self.is_mla
+                     else self._layer_stage1_pre_attn)
         stage4a_fn = self._layer_stage4a_router
         stage4b_fn = self._layer_stage4b_moe
         if use_torch_compile:
             stage1_fn = torch.compile(stage1_fn, fullgraph=False)
             stage4a_fn = torch.compile(stage4a_fn, fullgraph=False)
             stage4b_fn = torch.compile(stage4b_fn, fullgraph=False)
+
+        def _call_stage1(stage1_fn, buf, layer):
+            """Call stage1_fn with correct signature based on is_mla."""
+            if self.is_mla:
+                stage1_fn(buf['hidden_buf'],
+                          buf['static_positions'],
+                          buf['static_slot_mapping'], layer,
+                          buf['q_nope_buf'], buf['q_pe_buf'],
+                          buf['ckv_buf'], buf['kpe_buf'],
+                          buf['residual_buf'])
+            else:
+                stage1_fn(buf['hidden_buf'],
+                          buf['static_positions'],
+                          buf['static_slot_mapping'], layer,
+                          buf['q_buf'], buf['k_buf'],
+                          buf['v_buf'], buf['residual_buf'])
+
+        def _fill_attn_out_dummy(buf, N):
+            """Fill attn_out_buf with dummy data after stage1 (between stage1 and stage4a)."""
+            if self.is_mla:
+                buf['attn_out_buf'].copy_(buf['q_nope_buf'].reshape(N, -1))
+            else:
+                buf['attn_out_buf'].copy_(buf['q_buf'].reshape(N, -1))
 
         for N in total_token_sizes:
             self.reset()
@@ -2105,13 +2983,8 @@ class MoEEngine:
                             buf['hidden_buf'].copy_(
                                 pp_bufs[prev_gpu]['hidden_buf'])
                         with torch.cuda.device(dev):
-                            stage1_fn(buf['hidden_buf'],
-                                      buf['static_positions'],
-                                      buf['static_slot_mapping'], layer,
-                                      buf['q_buf'], buf['k_buf'],
-                                      buf['v_buf'], buf['residual_buf'])
-                            buf['attn_out_buf'].copy_(
-                                buf['q_buf'].reshape(N, -1))
+                            _call_stage1(stage1_fn, buf, layer)
+                            _fill_attn_out_dummy(buf, N)
                             stage4a_fn(buf['attn_out_buf'],
                                        buf['residual_buf'], layer,
                                        buf['moe_input_buf'],
@@ -2156,14 +3029,10 @@ class MoEEngine:
                         g1 = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(g1, pool=graph_pools[gpu_idx],
                                               stream=stream):
-                            stage1_fn(buf['hidden_buf'],
-                                      buf['static_positions'],
-                                      buf['static_slot_mapping'], layer,
-                                      buf['q_buf'], buf['k_buf'],
-                                      buf['v_buf'], buf['residual_buf'])
+                            _call_stage1(stage1_fn, buf, layer)
                         stage1_graphs.append(g1)
 
-                    buf['attn_out_buf'].copy_(buf['q_buf'].reshape(N, -1))
+                    _fill_attn_out_dummy(buf, N)
 
                     with torch.cuda.device(dev):
                         g4a = torch.cuda.CUDAGraph()
@@ -2188,12 +3057,24 @@ class MoEEngine:
                                        buf['hidden_buf'], layer)
                         stage4b_graphs.append(g4b)
 
-                self._piecewise_graphs[N] = {
+                graph_dict = {
                     'stage1_graphs': stage1_graphs,
                     'stage4a_graphs': stage4a_graphs,
                     'stage4b_graphs': stage4b_graphs,
                     'pp_bufs': pp_bufs,
                 }
+                if self.is_mla:
+                    # Save MLA buffers per GPU to prevent GC
+                    graph_dict['mla_buffers'] = {
+                        gpu_idx: {
+                            'q_nope_buf': pp_bufs[gpu_idx]['q_nope_buf'],
+                            'q_pe_buf': pp_bufs[gpu_idx]['q_pe_buf'],
+                            'ckv_buf': pp_bufs[gpu_idx]['ckv_buf'],
+                            'kpe_buf': pp_bufs[gpu_idx]['kpe_buf'],
+                        }
+                        for gpu_idx in range(self.pp_size)
+                    }
+                self._piecewise_graphs[N] = graph_dict
 
                 compile_str = " + torch.compile" if use_torch_compile else ""
                 print(f"  Piecewise CUDA graphs{compile_str} captured for "
@@ -2210,20 +3091,15 @@ class MoEEngine:
                         F.embedding(bufs['static_token_ids'],
                                     self.embed_tokens))
                     for layer in range(self.num_layers):
-                        stage1_fn(bufs['hidden_buf'],
-                                  bufs['static_positions'],
-                                  bufs['static_slot_mapping'], layer,
-                                  bufs['q_buf'], bufs['k_buf'],
-                                  bufs['v_buf'], bufs['residual_buf'])
-                        bufs['attn_out_buf'].copy_(
-                            bufs['q_buf'].reshape(N, -1))
+                        _call_stage1(stage1_fn, bufs, layer)
+                        _fill_attn_out_dummy(bufs, N)
                         stage4a_fn(bufs['attn_out_buf'],
                                    bufs['residual_buf'], layer,
                                    bufs['moe_input_buf'],
                                    bufs['moe_residual_buf'],
                                    bufs['topk_weights_buf'],
                                    bufs['topk_ids_buf'])
-                        if self.offloading:
+                        if self.offloading and self.router[layer] is not None:
                             self.expert_map_buf.copy_(
                                 self.expert_map_abs[layer])
                         stage4b_fn(bufs['moe_input_buf'],
@@ -2248,15 +3124,10 @@ class MoEEngine:
                     g1 = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(g1, pool=graph_pool,
                                           stream=capture_stream):
-                        stage1_fn(bufs['hidden_buf'],
-                                  bufs['static_positions'],
-                                  bufs['static_slot_mapping'], layer,
-                                  bufs['q_buf'], bufs['k_buf'],
-                                  bufs['v_buf'], bufs['residual_buf'])
+                        _call_stage1(stage1_fn, bufs, layer)
                     stage1_graphs.append(g1)
 
-                    bufs['attn_out_buf'].copy_(
-                        bufs['q_buf'].reshape(N, -1))
+                    _fill_attn_out_dummy(bufs, N)
 
                     g4a = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(g4a, pool=graph_pool,
@@ -2269,7 +3140,7 @@ class MoEEngine:
                                    bufs['topk_ids_buf'])
                     stage4a_graphs.append(g4a)
 
-                    if self.offloading:
+                    if self.offloading and self.router[layer] is not None:
                         self.expert_map_buf.copy_(
                             self.expert_map_abs[layer])
 
@@ -2284,12 +3155,21 @@ class MoEEngine:
                     stage4b_graphs.append(g4b)
 
                 # Store buffers directly in dict for single-GPU compat
-                self._piecewise_graphs[N] = {
+                graph_dict = {
                     'stage1_graphs': stage1_graphs,
                     'stage4a_graphs': stage4a_graphs,
                     'stage4b_graphs': stage4b_graphs,
                     **bufs,
                 }
+                if self.is_mla:
+                    # Save MLA buffers explicitly to prevent GC
+                    graph_dict['mla_buffers'] = {
+                        'q_nope_buf': bufs['q_nope_buf'],
+                        'q_pe_buf': bufs['q_pe_buf'],
+                        'ckv_buf': bufs['ckv_buf'],
+                        'kpe_buf': bufs['kpe_buf'],
+                    }
+                self._piecewise_graphs[N] = graph_dict
 
                 compile_str = " + torch.compile" if use_torch_compile else ""
                 print(f"  Piecewise CUDA graphs{compile_str} captured for "
@@ -2484,11 +3364,20 @@ class MoEEngine:
             if N_actual < graph_N:
                 info['static_slot_mapping'][N_actual:].fill_(-1)
 
-        # ── 4. Increment decode seq_lens and plan FlashInfer ──
+        # ── 4. Increment decode seq_lens and plan FlashInfer / MLA ──
         if D > 0:
             for sid in decode_seq_ids:
                 self._seq_lens_cpu[sid] += 1
-            if pp:
+            if self.is_mla:
+                if pp:
+                    for gpu_idx in range(self.pp_size):
+                        self._plan_mla_decode_for_subset(
+                            self._mla_wrappers[gpu_idx], decode_seq_ids,
+                            gpu_idx=gpu_idx)
+                else:
+                    self._plan_mla_decode_for_subset(
+                        self._mla_decode_wrapper, decode_seq_ids)
+            elif pp:
                 for gpu_idx in range(self.pp_size):
                     self._plan_flashinfer_decode_pp(decode_seq_ids, gpu_idx)
             else:
@@ -2531,8 +3420,9 @@ class MoEEngine:
         prefill_max = max(prefill_lengths) if prefill_lengths else 0
 
         # ── 5b. Plan FlashInfer paged-KV for continuation prefills ──
+        # MLA uses _mla_decode_wrapper planned per-layer inside the loop (step 6b).
         cont_prefill_wrappers = None
-        if C > 0:
+        if C > 0 and not self.is_mla:
             if pp:
                 cont_prefill_wrappers = {}
                 for gpu_idx in range(self.pp_size):
@@ -2624,9 +3514,6 @@ class MoEEngine:
         for layer in range(self.num_layers):
             if _nvtx: torch.cuda.nvtx.range_push(f"layer_{layer}")
             buf = _buf(layer)
-            q_buf = buf['q_buf']
-            k_buf = buf['k_buf']
-            v_buf = buf['v_buf']
             attn_out_buf = buf['attn_out_buf']
 
             # Cross-GPU transfer at PP boundaries
@@ -2647,55 +3534,157 @@ class MoEEngine:
             if _nvtx: torch.cuda.nvtx.range_pop()  # stage1
             if _pt: _pt.after_stage1(layer)
 
-            # Stage 2: FlashInfer decode on q_buf[:D]
-            if D > 0:
-                if _nvtx: torch.cuda.nvtx.range_push("stage2")
-                if pp:
-                    gpu_idx = self.pp_layer_gpu[layer]
-                    wrapper = self._decode_wrappers[gpu_idx]
-                else:
-                    wrapper = self._decode_wrapper
-                q_decode = q_buf[:D]
-                decode_out = wrapper.run(
-                    q_decode,
-                    (self.k_cache[layer], self.v_cache[layer]))
-                attn_out_buf[:D].copy_(decode_out.reshape(D, H))
-                if _nvtx: torch.cuda.nvtx.range_pop()  # stage2
+            if self.is_mla:
+                # MLA: Stage 2 (decode) and Stage 3a (prefill) using MLA kernels
+                if D > 0:
+                    if _nvtx: torch.cuda.nvtx.range_push("stage2_mla")
+                    if pp:
+                        gpu_idx = self.pp_layer_gpu[layer]
+                        mla_wrapper = self._mla_wrappers[gpu_idx]
+                    else:
+                        mla_wrapper = self._mla_decode_wrapper
+                    q_nope_sl = buf['q_nope_buf'][:D]
+                    q_pe_sl = buf['q_pe_buf'][:D]
+                    q_absorbed = torch.einsum('bhp,hpc->bhc', q_nope_sl, self.W_UK_T[layer])
+                    attn_latent = mla_wrapper.run(
+                        q_absorbed, q_pe_sl,
+                        self.ckv_cache[layer], self.kpe_cache[layer])
+                    attn_v = torch.einsum('bhc,hcv->bhv', attn_latent, self.W_UV[layer])
+                    attn_out_buf[:D].copy_(
+                        attn_v.reshape(D, self.num_heads * self.v_head_dim))
+                    if _nvtx: torch.cuda.nvtx.range_pop()  # stage2_mla
 
-            # Stage 3a: FA3 self-attention for new prefills on q_buf[D:D+P]
-            if P > 0:
-                if _nvtx: torch.cuda.nvtx.range_push("stage3a")
-                q_pf = q_buf[D:D + P]
-                k_pf = k_buf[D:D + P]
-                v_pf = v_buf[D:D + P]
-                cu = (prefill_cu[self.pp_layer_gpu[layer]]
-                      if pp else prefill_cu_single)
-                prefill_out = flash_attn_varlen_func(
-                    q_pf, k_pf, v_pf,
-                    cu_seqlens_q=cu,
-                    cu_seqlens_k=cu,
-                    max_seqlen_q=prefill_max,
-                    max_seqlen_k=prefill_max,
-                    causal=True, fa_version=3)
-                attn_out_buf[D:D + P].copy_(prefill_out.reshape(P, H))
-                if _nvtx: torch.cuda.nvtx.range_pop()  # stage3a
+                # Stage 3a: MLA prefill (FA3 decompressed) for new prefills
+                if P > 0:
+                    if _nvtx: torch.cuda.nvtx.range_push("stage3a_mla")
+                    cu = (prefill_cu[self.pp_layer_gpu[layer]]
+                          if pp else prefill_cu_single)
+                    q_nope_pf = buf['q_nope_buf'][D:D + P]
+                    q_pe_pf = buf['q_pe_buf'][D:D + P]
+                    c_kv_pf = buf['ckv_buf'][D:D + P]
+                    k_pe_pf = buf['kpe_buf'][D:D + P]
 
-            # Stage 3b: FlashInfer paged-KV for continuation prefills
-            #           on q_buf[D+P:D+P+C]
-            if C > 0:
-                if _nvtx: torch.cuda.nvtx.range_push("stage3b")
-                q_cont = q_buf[D + P:D + P + C]
-                if pp:
-                    gpu_idx = self.pp_layer_gpu[layer]
-                    cpw = cont_prefill_wrappers[gpu_idx]
-                else:
-                    cpw = cont_prefill_wrappers
-                cont_out = cpw.run(
-                    q_cont,
-                    (self.k_cache[layer], self.v_cache[layer]))
-                attn_out_buf[D + P:D + P + C].copy_(
-                    cont_out.reshape(C, H))
-                if _nvtx: torch.cuda.nvtx.range_pop()  # stage3b
+                    kv_decompressed = F.linear(c_kv_pf, self.kv_b_proj[layer])
+                    kv_reshaped = kv_decompressed.view(P, self.num_heads,
+                                                        self.qk_nope_head_dim + self.v_head_dim)
+                    k_nope_pf = kv_reshaped[:, :, :self.qk_nope_head_dim]
+                    v_pf = kv_reshaped[:, :, self.qk_nope_head_dim:]
+                    k_pe_expanded = k_pe_pf.unsqueeze(1).expand(-1, self.num_heads, -1)
+                    k_full = torch.cat([k_nope_pf, k_pe_expanded], dim=-1)
+                    q_full_pf = torch.cat([q_nope_pf, q_pe_pf], dim=-1)
+                    pf_out = flash_attn_varlen_func(
+                        q_full_pf.contiguous(), k_full.contiguous(), v_pf.contiguous(),
+                        cu_seqlens_q=cu,
+                        cu_seqlens_k=cu,
+                        max_seqlen_q=prefill_max,
+                        max_seqlen_k=prefill_max,
+                        softmax_scale=self._mla_sm_scale,
+                        causal=True, fa_version=3)
+                    attn_out_buf[D:D + P].copy_(
+                        pf_out.reshape(P, self.num_heads * self.v_head_dim))
+                    if _nvtx: torch.cuda.nvtx.range_pop()  # stage3a_mla
+
+                # Stage 3b: MLA continuation prefill — absorbed path via
+                # BatchMLAPagedAttentionWrapper with multi-token qo_indptr.
+                # Attends to full paged KV cache (prior chunks + current chunk).
+                if C > 0:
+                    if _nvtx: torch.cuda.nvtx.range_push("stage3b_mla")
+                    q_nope_cont = buf['q_nope_buf'][D + P:D + P + C]  # [C, H, P]
+                    q_pe_cont = buf['q_pe_buf'][D + P:D + P + C]       # [C, H, R]
+
+                    # Absorbed Q: q_nope @ W_UK → [C, H, kv_lora_rank=512]
+                    q_absorbed_cont = torch.einsum(
+                        'bhp,hpc->bhc', q_nope_cont, self.W_UK_T[layer])
+
+                    # Plan MLA wrapper for continuation (overwrites decode plan)
+                    if pp:
+                        gpu_idx_c = self.pp_layer_gpu[layer]
+                        wrapper_c = self._mla_wrappers[gpu_idx_c]
+                        self._plan_mla_continuation(
+                            wrapper_c, continuation_seq_ids,
+                            cont_lengths, cont_total_seq_lens,
+                            gpu_idx=gpu_idx_c)
+                    else:
+                        wrapper_c = self._mla_decode_wrapper
+                        self._plan_mla_continuation(
+                            wrapper_c, continuation_seq_ids,
+                            cont_lengths, cont_total_seq_lens)
+
+                    attn_latent_cont = wrapper_c.run(
+                        q_absorbed_cont, q_pe_cont,
+                        self.ckv_cache[layer], self.kpe_cache[layer])
+                    # attn_latent_cont: [C, H, kv_lora_rank=512]
+                    attn_v_cont = torch.einsum(
+                        'bhc,hcv->bhv', attn_latent_cont, self.W_UV[layer])
+                    attn_out_buf[D + P:D + P + C].copy_(
+                        attn_v_cont.reshape(C, self.num_heads * self.v_head_dim))
+
+                    # If also decode tokens, restore decode plan for next layer
+                    if D > 0:
+                        if pp:
+                            for _gidx in range(self.pp_size):
+                                self._plan_mla_decode_for_subset(
+                                    self._mla_wrappers[_gidx],
+                                    decode_seq_ids, gpu_idx=_gidx)
+                        else:
+                            self._plan_mla_decode_for_subset(
+                                self._mla_decode_wrapper, decode_seq_ids)
+                    if _nvtx: torch.cuda.nvtx.range_pop()  # stage3b_mla
+            else:
+                # Standard (non-MLA) attention path
+                q_buf = buf['q_buf']
+                k_buf = buf['k_buf']
+                v_buf = buf['v_buf']
+
+                # Stage 2: FlashInfer decode on q_buf[:D]
+                if D > 0:
+                    if _nvtx: torch.cuda.nvtx.range_push("stage2")
+                    if pp:
+                        gpu_idx = self.pp_layer_gpu[layer]
+                        wrapper = self._decode_wrappers[gpu_idx]
+                    else:
+                        wrapper = self._decode_wrapper
+                    q_decode = q_buf[:D]
+                    decode_out = wrapper.run(
+                        q_decode,
+                        (self.k_cache[layer], self.v_cache[layer]))
+                    attn_out_buf[:D].copy_(decode_out.reshape(D, H))
+                    if _nvtx: torch.cuda.nvtx.range_pop()  # stage2
+
+                # Stage 3a: FA3 self-attention for new prefills on q_buf[D:D+P]
+                if P > 0:
+                    if _nvtx: torch.cuda.nvtx.range_push("stage3a")
+                    q_pf = q_buf[D:D + P]
+                    k_pf = k_buf[D:D + P]
+                    v_pf = v_buf[D:D + P]
+                    cu = (prefill_cu[self.pp_layer_gpu[layer]]
+                          if pp else prefill_cu_single)
+                    prefill_out = flash_attn_varlen_func(
+                        q_pf, k_pf, v_pf,
+                        cu_seqlens_q=cu,
+                        cu_seqlens_k=cu,
+                        max_seqlen_q=prefill_max,
+                        max_seqlen_k=prefill_max,
+                        causal=True, fa_version=3)
+                    attn_out_buf[D:D + P].copy_(prefill_out.reshape(P, H))
+                    if _nvtx: torch.cuda.nvtx.range_pop()  # stage3a
+
+                # Stage 3b: FlashInfer paged-KV for continuation prefills
+                #           on q_buf[D+P:D+P+C]
+                if C > 0:
+                    if _nvtx: torch.cuda.nvtx.range_push("stage3b")
+                    q_cont = q_buf[D + P:D + P + C]
+                    if pp:
+                        gpu_idx = self.pp_layer_gpu[layer]
+                        cpw = cont_prefill_wrappers[gpu_idx]
+                    else:
+                        cpw = cont_prefill_wrappers
+                    cont_out = cpw.run(
+                        q_cont,
+                        (self.k_cache[layer], self.v_cache[layer]))
+                    attn_out_buf[D + P:D + P + C].copy_(
+                        cont_out.reshape(C, H))
+                    if _nvtx: torch.cuda.nvtx.range_pop()  # stage3b
 
             # Zero padding region of attn_out_buf
             if N_actual < graph_N:
@@ -2717,14 +3706,15 @@ class MoEEngine:
                 self.offload_engine.process_layer(
                     layer, buf['topk_ids_buf'], N_actual,
                     router_input_buf=buf['moe_input_buf'])
-                if self.trace_recorder:
+                if self.trace_recorder and self.router[layer] is not None:
                     self.trace_recorder.process_layer(
                         layer, buf['topk_ids_buf'], N_actual,
                         router_input_buf=buf['moe_input_buf'])
             elif self.trace_recorder:
-                self.trace_recorder.process_layer(
-                    layer, buf['topk_ids_buf'], N_actual,
-                    router_input_buf=buf['moe_input_buf'])
+                if self.router[layer] is not None:
+                    self.trace_recorder.process_layer(
+                        layer, buf['topk_ids_buf'], N_actual,
+                        router_input_buf=buf['moe_input_buf'])
             if _nvtx: torch.cuda.nvtx.range_pop()  # cpu_break
             if _pt: _pt.after_io(layer)
 
@@ -2823,6 +3813,39 @@ class MoEEngine:
 
         return torch.cat([input_ids, torch.stack(generated, dim=1)], dim=1)
 
+    def fill_kv_random(self, std=0.01):
+        """Fill KV caches with random data (benchmarking warmup)."""
+        if self.is_mla:
+            for l in range(self.num_layers):
+                self.ckv_flat[l].normal_(0, std)
+                self.kpe_flat[l].normal_(0, std)
+        else:
+            for l in range(self.num_layers):
+                self.k_cache[l].normal_(0, std)
+                self.v_cache[l].normal_(0, std)
+
+    def kv_snapshot(self):
+        """Snapshot KV caches for later restoration."""
+        if self.is_mla:
+            return ([c.clone() for c in self.ckv_flat],
+                    [k.clone() for k in self.kpe_flat])
+        return ([kc.clone() for kc in self.k_cache],
+                [vc.clone() for vc in self.v_cache])
+
+    def kv_restore(self, snapshot):
+        """Restore KV caches from a snapshot created by kv_snapshot()."""
+        a, b = snapshot
+        if self.is_mla:
+            for c, s in zip(self.ckv_flat, a):
+                c.copy_(s)
+            for k, s in zip(self.kpe_flat, b):
+                k.copy_(s)
+        else:
+            for kc, s in zip(self.k_cache, a):
+                kc.copy_(s)
+            for vc, s in zip(self.v_cache, b):
+                vc.copy_(s)
+
     def reset(self):
         """Reset KV cache and sequence state."""
         if self.pp_size > 1:
@@ -2831,9 +3854,14 @@ class MoEEngine:
         else:
             self.seq_lens.zero_()
         self._seq_lens_cpu.zero_()
-        for l in range(self.num_layers):
-            self.k_cache[l].zero_()
-            self.v_cache[l].zero_()
+        if self.is_mla:
+            for l in range(self.num_layers):
+                self.ckv_flat[l].zero_()
+                self.kpe_flat[l].zero_()
+        else:
+            for l in range(self.num_layers):
+                self.k_cache[l].zero_()
+                self.v_cache[l].zero_()
         if self._dynamic_pages:
             self._free_pages = deque(range(self.total_pages))
             self._seq_page_list = [[] for _ in range(self.max_seqs)]
@@ -2980,29 +4008,50 @@ class MoEEngine:
 
         # FlashInfer CUDA graph wrapper with pre-allocated buffers
         max_total_pages = batch_size * self.max_pages_per_seq
-        fi_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
-        fi_indices = torch.zeros(max_total_pages, dtype=torch.int32, device=self.device)
-        fi_last_page_len = torch.ones(batch_size, dtype=torch.int32, device=self.device)
-
-        # Pre-fill indices (contiguous page allocation)
-        idx = 0
-        for b in range(batch_size):
-            for p in range(self.max_pages_per_seq):
-                fi_indices[idx] = b * self.max_pages_per_seq + p
-                idx += 1
-
-        graph_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-            self._workspace_buf, kv_layout="NHD", use_cuda_graph=True,
-            paged_kv_indptr_buffer=fi_indptr,
-            paged_kv_indices_buffer=fi_indices,
-            paged_kv_last_page_len_buffer=fi_last_page_len)
+        if not self.is_mla:
+            fi_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
+            fi_indices = torch.zeros(max_total_pages, dtype=torch.int32, device=self.device)
+            fi_last_page_len = torch.ones(batch_size, dtype=torch.int32, device=self.device)
+            # Pre-fill indices (contiguous page allocation)
+            idx = 0
+            for b in range(batch_size):
+                for p in range(self.max_pages_per_seq):
+                    fi_indices[idx] = b * self.max_pages_per_seq + p
+                    idx += 1
+        else:
+            fi_indptr = fi_indices = fi_last_page_len = None
 
         # Increment _seq_lens_cpu to account for current token (written to cache
         # before attention within each layer, so FlashInfer must include it).
         self._seq_lens_cpu[:batch_size] += 1
 
+        if self.is_mla:
+            from flashinfer.mla import BatchMLAPagedAttentionWrapper as MLAWrapper
+            mla_qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32,
+                                          device=self.device)
+            mla_kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32,
+                                         device=self.device)
+            mla_kv_indices = torch.zeros(max_total_pages, dtype=torch.int32,
+                                          device=self.device)
+            mla_kv_len_arr = torch.ones(batch_size, dtype=torch.int32,
+                                         device=self.device)
+            graph_wrapper = MLAWrapper(
+                self._workspace_buf, use_cuda_graph=True,
+                qo_indptr=mla_qo_indptr,
+                kv_indptr=mla_kv_indptr,
+                kv_indices=mla_kv_indices,
+                kv_len_arr=mla_kv_len_arr)
+            plan_fn = lambda: self._plan_mla_decode(graph_wrapper, batch_size)
+        else:
+            graph_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                self._workspace_buf, kv_layout="NHD", use_cuda_graph=True,
+                paged_kv_indptr_buffer=fi_indptr,
+                paged_kv_indices_buffer=fi_indices,
+                paged_kv_last_page_len_buffer=fi_last_page_len)
+            plan_fn = lambda: self._plan_flashinfer_decode(graph_wrapper, batch_size)
+
         # Initial plan() — JIT compiles the FlashInfer kernel
-        self._plan_flashinfer_decode(graph_wrapper, batch_size)
+        plan_fn()
 
         # Choose forward function (optionally compiled)
         forward_fn = self._full_decode_graph_body
@@ -3013,13 +4062,13 @@ class MoEEngine:
         n_warmup = 5 if use_torch_compile else 3
         for _ in range(n_warmup):
             # Re-plan before each warmup step (seq_lens may change)
-            self._plan_flashinfer_decode(graph_wrapper, batch_size)
+            plan_fn()
             static_output = forward_fn(
                 static_token, static_pos, static_slot_mapping, graph_wrapper)
         torch.cuda.synchronize()
 
         # Plan once more before capture
-        self._plan_flashinfer_decode(graph_wrapper, batch_size)
+        plan_fn()
 
         # Capture CUDA graph
         graph = torch.cuda.CUDAGraph()
@@ -3027,7 +4076,7 @@ class MoEEngine:
             static_output = forward_fn(
                 static_token, static_pos, static_slot_mapping, graph_wrapper)
 
-        self._cuda_graphs[batch_size] = {
+        graph_dict = {
             'graph': graph,
             'graph_wrapper': graph_wrapper,
             'static_token': static_token,
@@ -3035,6 +4084,15 @@ class MoEEngine:
             'static_slot_mapping': static_slot_mapping,
             'static_output': static_output,
         }
+        if self.is_mla:
+            # Prevent GC of MLA pre-allocated metadata buffers baked into graph
+            graph_dict['mla_meta'] = {
+                'qo_indptr': mla_qo_indptr,
+                'kv_indptr': mla_kv_indptr,
+                'kv_indices': mla_kv_indices,
+                'kv_len_arr': mla_kv_len_arr,
+            }
+        self._cuda_graphs[batch_size] = graph_dict
         compile_str = " + torch.compile" if use_torch_compile else ""
         print(f"  CUDA graph{compile_str} captured for batch_size={batch_size} "
               f"(max_seq={warmup_seq_len + max_decode_tokens})")
@@ -3061,19 +4119,21 @@ class MoEEngine:
 
         # Re-plan FlashInfer with updated seq_lens (plan_info must match page count)
         wrapper = info['graph_wrapper']
-        seq_lens = self._seq_lens_cpu[:B]
-        pages_per_seq = (seq_lens + self.page_size - 1) // self.page_size
-        indptr = torch.zeros(B + 1, dtype=torch.int32)
-        indptr[1:] = pages_per_seq.cumsum(0)
-        last_page_len = (seq_lens - 1) % self.page_size + 1
-        total_pages = indptr[-1].item()
-        indices = wrapper._paged_kv_indices_buf[:total_pages]
-
-        wrapper.plan(
-            indptr, indices, last_page_len,
-            num_qo_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim, page_size=self.page_size,
-            pos_encoding_mode="NONE", q_data_type=self.dtype)
+        if self.is_mla:
+            self._plan_mla_decode(wrapper, B)
+        else:
+            seq_lens = self._seq_lens_cpu[:B]
+            pages_per_seq = (seq_lens + self.page_size - 1) // self.page_size
+            indptr = torch.zeros(B + 1, dtype=torch.int32)
+            indptr[1:] = pages_per_seq.cumsum(0)
+            last_page_len = (seq_lens - 1) % self.page_size + 1
+            total_pages = indptr[-1].item()
+            indices = wrapper._paged_kv_indices_buf[:total_pages]
+            wrapper.plan(
+                indptr, indices, last_page_len,
+                num_qo_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim, page_size=self.page_size,
+                pos_encoding_mode="NONE", q_data_type=self.dtype)
 
         # Replay
         info['graph'].replay()

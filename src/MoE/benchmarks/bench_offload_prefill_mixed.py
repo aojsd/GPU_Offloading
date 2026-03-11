@@ -45,7 +45,8 @@ def detect_model(model_path):
     """Auto-detect model type and return (E, L, max_epl, budget_sweep)."""
     with open(Path(model_path) / "config.json") as f:
         cfg = json.load(f)
-    E = cfg.get("num_local_experts", cfg.get("num_experts", 8))
+    E = (cfg.get("n_routed_experts") or cfg.get("num_local_experts")
+         or cfg.get("num_experts", 8))
     L = cfg.get("num_hidden_layers", 32)
 
     if E == 64:  # OLMoE

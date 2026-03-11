@@ -13,14 +13,21 @@ import os, sys
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import argparse
 import torch
 import torch.nn.functional as F
 from moe_engine import MoEEngine
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Verify expert residency and demand loading timing.")
+    parser.add_argument("--model", type=str, default="models/Mixtral-8x7B",
+                        help="Path to model directory")
+    args = parser.parse_args()
+
     engine = MoEEngine(
-        "models/Mixtral-8x7B", device="cuda:0",
+        args.model, device="cuda:0",
         experts_per_layer=2,
     )
 
@@ -92,8 +99,22 @@ def main():
 
                 # Stage 2
                 q_decode = q_buf[:1]
-                decode_out = engine._decode_wrapper.run(
-                    q_decode, (engine.k_cache[layer], engine.v_cache[layer]))
+                if engine.is_mla:
+                    q_nope_h = q_decode.view(1, engine.num_heads,
+                                             engine.qk_nope_head_dim)
+                    q_pe_h = info.get('q_pe_buf', q_buf)[:1]
+                    q_pe_h = q_pe_h.view(1, engine.num_heads,
+                                         engine.qk_rope_head_dim)
+                    q_absorbed = torch.einsum('bhp,hpc->bhc', q_nope_h,
+                                              engine.W_UK_T[layer])
+                    out = engine._mla_decode_wrapper.run(
+                        q_absorbed, q_pe_h,
+                        engine.ckv_cache[layer], engine.kpe_cache[layer])
+                    attn_v = torch.einsum('bhc,hcv->bhv', out, engine.W_UV[layer])
+                    decode_out = attn_v.reshape(1, engine.num_heads * engine.v_head_dim)
+                else:
+                    decode_out = engine._decode_wrapper.run(
+                        q_decode, (engine.k_cache[layer], engine.v_cache[layer]))
                 info['attn_out_buf'][:1].copy_(decode_out.reshape(1, H))
 
                 # Stage 4a

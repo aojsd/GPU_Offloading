@@ -20,9 +20,10 @@ done
 PCT=$(python3 -c "print(int($CACHE_FRAC * 100))")
 echo "=== Full pipeline for cache ${PCT}% (fraction=$CACHE_FRAC) ==="
 
-MODEL=models/Mixtral-8x7B
+MODEL=${MODEL:-models/Mixtral-8x7B}
+MODEL_TAG=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
 DATASET=datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json
-OUTPUT_BASE=datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b
+OUTPUT_BASE=datasets/ShareGPT_Vicuna/expert_traces/${MODEL_TAG}
 NUM_CONVERSATIONS=200
 MAX_OUTPUT_TOKENS=4096
 MAX_SEQS=32
@@ -75,7 +76,7 @@ fi
 # ── Phase 2: Policy simulation ───────────────────────────────────────────
 echo ""
 echo "Phase 2: Simulating policies for cache ${PCT}%..."
-python3 scripts/run_all_policies.py --cache-pct "$PCT"
+python3 scripts/run_all_policies.py --cache-pct "$PCT" --model "$MODEL"
 echo "Phase 2 complete."
 
 # ── Phase 3: GPU replay ─────────────────────────────────────────────────

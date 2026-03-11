@@ -289,7 +289,8 @@ def main():
     # then configure() to reduce budget for demand loading tests)
     with open(Path(args.model) / "config.json") as f:
         cfg = json.load(f)
-    E = cfg.get("num_local_experts") or cfg.get("num_experts")
+    E = (cfg.get("n_routed_experts") or cfg.get("num_experts")
+         or cfg.get("num_local_experts"))
     engine = MoEEngine(args.model, max_seqs=8, max_seq_len=2048,
                        experts_per_layer=E,
                        use_torch_compile=use_compile)

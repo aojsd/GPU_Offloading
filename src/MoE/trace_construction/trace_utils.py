@@ -478,17 +478,24 @@ def _parse_model_config(model_config_path: str, dtype_bytes: int = 2) -> dict:
 
     num_layers = cfg['num_hidden_layers']
     hidden_size = cfg['hidden_size']
-    intermediate_size = cfg['intermediate_size']
+    # MLA models use moe_intermediate_size for routed experts; fall back to
+    # intermediate_size for OLMoE/Mixtral (backward compat).
+    expert_I = cfg.get('moe_intermediate_size', cfg['intermediate_size'])
     num_heads = cfg['num_attention_heads']
-    num_kv_heads = cfg['num_key_value_heads']
+    num_kv_heads = cfg.get('num_key_value_heads', num_heads)
     head_dim = hidden_size // num_heads
     vocab_size = cfg['vocab_size']
-    num_experts = cfg.get('num_experts') or cfg.get('num_local_experts')
+    # n_routed_experts (DS-V2-Lite) > num_local_experts (Mixtral) > num_experts (OLMoE)
+    num_experts = (cfg.get('n_routed_experts') or cfg.get('num_local_experts')
+                   or cfg.get('num_experts'))
+    # Dense layers (no experts): DS-V2-Lite has first_k_dense_replace=1
+    first_k = cfg.get('first_k_dense_replace', 0)
+    num_moe_layers = num_layers - first_k
+    total_experts = num_moe_layers * num_experts
 
     # Per-expert memory: w1[2*I, H] + w2[H, I]
-    expert_params = 2 * intermediate_size * hidden_size + hidden_size * intermediate_size
+    expert_params = 2 * expert_I * hidden_size + hidden_size * expert_I
     expert_bytes = expert_params * dtype_bytes
-    total_experts = num_layers * num_experts
 
     # Non-expert model memory (attention + norms + embeddings + routers)
     per_layer_attn = (
@@ -507,19 +514,26 @@ def _parse_model_config(model_config_path: str, dtype_bytes: int = 2) -> dict:
     )
     non_expert_bytes = non_expert_params * dtype_bytes
 
-    # KV cache: per page per layer
-    kv_per_page_per_layer = lambda page_size: page_size * 2 * num_kv_heads * head_dim * dtype_bytes
+    # KV cache: per page per layer — use MLA formula when kv_lora_rank present
+    kv_lora_rank = cfg.get('kv_lora_rank')
+    if kv_lora_rank is not None:
+        qk_rope_head_dim = cfg.get('qk_rope_head_dim', 64)
+        kv_per_token_per_layer_val = (kv_lora_rank + qk_rope_head_dim) * dtype_bytes
+        kv_per_page_per_layer = lambda page_size, _v=kv_per_token_per_layer_val: page_size * _v
+    else:
+        kv_per_page_per_layer = lambda page_size: page_size * 2 * num_kv_heads * head_dim * dtype_bytes
 
     return {
         'num_layers': num_layers,
         'num_experts': num_experts,
         'hidden_size': hidden_size,
-        'intermediate_size': intermediate_size,
+        'intermediate_size': expert_I,
         'num_kv_heads': num_kv_heads,
         'head_dim': head_dim,
         'vocab_size': vocab_size,
         'expert_bytes': expert_bytes,
         'total_experts': total_experts,
+        'first_k_dense_replace': first_k,
         'non_expert_bytes': non_expert_bytes,
         'kv_per_page_per_layer': kv_per_page_per_layer,
         'model_name': Path(model_config_path).parent.name,

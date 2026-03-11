@@ -690,7 +690,7 @@ def measure_decode_phases(engine, torch, F, target_pos,
     info = engine._piecewise_graphs[1]
     H = engine.hidden_size
     L = engine.num_layers
-    wrapper = engine._decode_wrapper
+    wrapper = engine._decode_wrapper if not engine.is_mla else None
 
     layer_events = [
         [torch.cuda.Event(enable_timing=True) for _ in range(5)]
@@ -724,8 +724,20 @@ def measure_decode_phases(engine, torch, F, target_pos,
             evts[1].record()
 
             q_decode = info['q_buf'][:1]
-            decode_out = wrapper.run(
-                q_decode, (engine.k_cache[layer], engine.v_cache[layer]))
+            if engine.is_mla:
+                # MLA: q_buf contains absorbed q_nope; q_pe from dedicated buf
+                q_nope_h = q_decode.view(1, engine.num_heads, engine.qk_nope_head_dim)
+                q_pe_h = info.get('q_pe_buf', info['q_buf'])[:1]
+                q_pe_h = q_pe_h.view(1, engine.num_heads, engine.qk_rope_head_dim)
+                q_absorbed = torch.einsum('bhp,hpc->bhc', q_nope_h, engine.W_UK_T[layer])
+                out = engine._mla_decode_wrapper.run(
+                    q_absorbed, q_pe_h,
+                    engine.ckv_cache[layer], engine.kpe_cache[layer])
+                attn_v = torch.einsum('bhc,hcv->bhv', out, engine.W_UV[layer])
+                decode_out = attn_v.reshape(1, engine.num_heads * engine.v_head_dim)
+            else:
+                decode_out = wrapper.run(
+                    q_decode, (engine.k_cache[layer], engine.v_cache[layer]))
             info['attn_out_buf'][:1].copy_(decode_out.reshape(1, H))
             evts[2].record()
 
@@ -961,9 +973,7 @@ def run_sweep(args):
         engine.capture_mixed_cuda_graphs(
             total_token_sizes=[1], use_torch_compile=args.compile)
 
-        for layer in range(L):
-            engine.k_cache[layer].normal_(0, 0.01)
-            engine.v_cache[layer].normal_(0, 0.01)
+        engine.fill_kv_random(std=0.01)
         torch.cuda.synchronize()
 
         decode_results = {}

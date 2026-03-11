@@ -193,6 +193,9 @@ def correctness_test_20L(model_path, use_compile=True):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default=None,
+                        help="Path to a model directory (used as both "
+                             "--model-32L and --model-20L)")
     parser.add_argument("--model-32L", default="src/MoE/models/Mixtral-8x7B",
                         help="Path to 32L Mixtral model")
     parser.add_argument("--model-20L", default="src/MoE/models/Mixtral-8x7B-20L",
@@ -203,6 +206,11 @@ def main():
     parser.add_argument("--skip-20L", action="store_true",
                         help="Skip 20L correctness test")
     args = parser.parse_args()
+
+    # --model overrides both model-32L and model-20L when set
+    if args.model is not None:
+        args.model_32L = args.model
+        args.model_20L = args.model
 
     use_compile = not args.no_compile
     results = {}

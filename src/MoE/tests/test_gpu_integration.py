@@ -1063,8 +1063,10 @@ def main():
     with open(Path(model) / "config.json") as f:
         cfg = _json.load(f)
     num_layers = cfg["num_hidden_layers"]
-    num_experts = cfg.get("num_experts") or cfg.get("num_local_experts")
-    total_expert_slots = num_layers * num_experts
+    num_experts = (cfg.get("n_routed_experts") or cfg.get("num_experts")
+                   or cfg.get("num_local_experts"))
+    first_k = cfg.get("first_k_dense_replace", 0)
+    total_expert_slots = (num_layers - first_k) * num_experts
     cache_size = total_expert_slots // 2  # 50% → real offloading
 
     # Build ActivationTraces and simulate (all in-memory, no files)

@@ -144,17 +144,24 @@ def compute_replay_kv_budget(
 
     num_layers = cfg['num_hidden_layers']
     hidden_size = cfg['hidden_size']
-    intermediate_size = cfg['intermediate_size']
+    # MLA models use moe_intermediate_size for routed experts; fall back to
+    # intermediate_size for OLMoE/Mixtral (backward compat).
+    expert_I = cfg.get('moe_intermediate_size', cfg['intermediate_size'])
     num_heads = cfg['num_attention_heads']
-    num_kv_heads = cfg['num_key_value_heads']
+    num_kv_heads = cfg.get('num_key_value_heads', num_heads)
     head_dim = hidden_size // num_heads
     vocab_size = cfg['vocab_size']
-    num_experts = cfg.get('num_experts') or cfg.get('num_local_experts')
+    # n_routed_experts (DS-V2-Lite) > num_local_experts (Mixtral) > num_experts (OLMoE)
+    num_experts = (cfg.get('n_routed_experts') or cfg.get('num_local_experts')
+                   or cfg.get('num_experts'))
+    # Dense layers (no experts): DS-V2-Lite has first_k_dense_replace=1
+    first_k = cfg.get('first_k_dense_replace', 0)
+    num_moe_layers = num_layers - first_k
+    total_experts = num_moe_layers * num_experts
 
     # Per-expert memory: gate_proj[I,H] + up_proj[I,H] + down_proj[H,I]
-    expert_params = 2 * intermediate_size * hidden_size + hidden_size * intermediate_size
+    expert_params = 2 * expert_I * hidden_size + hidden_size * expert_I
     expert_bytes = expert_params * dtype_bytes
-    total_experts = num_layers * num_experts
 
     # Non-expert model: attention (Q/K/V/O proj) + norms + router + embeddings
     per_layer_attn = (
@@ -173,7 +180,7 @@ def compute_replay_kv_budget(
     )
     non_expert_bytes = non_expert_params * dtype_bytes
 
-    # Expert cache
+    # Expert cache (fraction applies to routed experts only)
     cache_size = int(total_experts * cache_fraction)
     cache_bytes = cache_size * expert_bytes
 
@@ -182,8 +189,13 @@ def compute_replay_kv_budget(
         graph_sizes = list(GRAPH_SIZES)
     graph_overhead_bytes = len(graph_sizes) * 200 * 1024 ** 2  # ~200 MB per size
 
-    # KV per page per layer: page_size tokens * 2 (K+V) * heads * head_dim * dtype
-    kv_per_page_per_layer = page_size * 2 * num_kv_heads * head_dim * dtype_bytes
+    # KV per page per layer: use MLA formula when kv_lora_rank present
+    kv_lora_rank = cfg.get('kv_lora_rank')
+    if kv_lora_rank is not None:
+        qk_rope_head_dim = cfg.get('qk_rope_head_dim', 64)
+        kv_per_page_per_layer = page_size * (kv_lora_rank + qk_rope_head_dim) * dtype_bytes
+    else:
+        kv_per_page_per_layer = page_size * 2 * num_kv_heads * head_dim * dtype_bytes
 
     gpu_bytes = int(gpu_memory_gb * 1024 ** 3)
     overhead_bytes = int(overhead_gb * 1024 ** 3)
@@ -276,7 +288,8 @@ def main():
     model_config_path = str(Path(args.model) / "config.json")
     with open(model_config_path) as f:
         cfg = json.load(f)
-    num_experts = cfg.get("num_experts") or cfg.get("num_local_experts")
+    num_experts = (cfg.get("n_routed_experts") or cfg.get("num_experts")
+                   or cfg.get("num_local_experts"))
     num_layers = cfg["num_hidden_layers"]
     top_k = cfg.get("num_experts_per_tok") or cfg.get("num_experts_per_topk")
     model_name = Path(args.model).name

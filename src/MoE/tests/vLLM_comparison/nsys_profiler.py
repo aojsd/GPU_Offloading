@@ -118,8 +118,7 @@ def write_custom_driver(path, seq_len, model_dir):
             max_decode_tokens=MAX_SEQ - 128)
 
         # Fill KV cache with random data to simulate target seq_len
-        engine.k_cache.normal_(0, 0.01)
-        engine.v_cache.normal_(0, 0.01)
+        engine.fill_kv_random(std=0.01)
 
         token = torch.tensor([100], device="cuda")
         pos = torch.tensor([SEQ_LEN], dtype=torch.int32, device="cuda")

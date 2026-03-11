@@ -253,8 +253,9 @@ class StaticFreq(CachePolicy):
                 for eid in step_experts[layer]:
                     key = (layer, eid)
                     self._global_freq[key] = self._global_freq.get(key, 0) + 1
+        fml = getattr(activation_trace, 'first_moe_layer', 0)
         all_experts = [(layer, eid)
-                       for layer in range(num_layers)
+                       for layer in range(fml, num_layers)
                        for eid in range(num_experts)]
         all_experts.sort(key=lambda k: (-self._global_freq.get(k, 0), k))
         return all_experts[:cache_size]
@@ -344,11 +345,12 @@ class OraclePrefetch(PrefetchPolicy):
 # ── Simulation ─────────────────────────────────────────────────────
 
 def _default_initial_cache(cache_size: int, num_layers: int,
-                           num_experts: int) -> list[tuple[int, int]]:
-    """Default initial cache: fill uniformly across layers."""
+                           num_experts: int,
+                           first_moe_layer: int = 0) -> list[tuple[int, int]]:
+    """Default initial cache: fill uniformly across MoE layers."""
     initial = []
     for eid in range(num_experts):
-        for layer in range(num_layers):
+        for layer in range(first_moe_layer, num_layers):
             if len(initial) >= cache_size:
                 return initial
             initial.append((layer, eid))
@@ -406,13 +408,15 @@ def simulate(cache_policy: CachePolicy,
     """
     num_layers = activation_trace.num_layers
     num_experts = activation_trace.num_experts
+    fml = getattr(activation_trace, 'first_moe_layer', 0)
 
     custom_initial = cache_policy.setup(
         activation_trace, cache_size, num_layers, num_experts)
     if initial_cache is None:
         initial_cache = (custom_initial if custom_initial is not None
                          else _default_initial_cache(
-                             cache_size, num_layers, num_experts))
+                             cache_size, num_layers, num_experts,
+                             first_moe_layer=fml))
 
     cache_policy.init_cache(initial_cache)
 

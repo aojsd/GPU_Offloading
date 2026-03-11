@@ -62,6 +62,14 @@ class ExpertOffloadEngine:
         self.device = engine.device
         self.true_offloading = engine.experts_per_layer is not None
 
+        # Dense layers have no experts (router[l] is None for MLA models).
+        # For non-MLA models, router is a stacked tensor so router[l] returns
+        # a 2D tensor (never None) — frozenset is empty, guards are no-ops.
+        self._dense_layers = frozenset(
+            l for l in range(engine.num_layers)
+            if isinstance(engine.router, list) and engine.router[l] is None
+        )
+
         if self.true_offloading:
             self.w1_buf = engine.w1_buf         # unified GPU buffer
             self.w2_buf = engine.w2_buf         # unified GPU buffer
@@ -153,6 +161,8 @@ class ExpertOffloadEngine:
                 else:
                     # All cache slots filled
                     for l in range(self.num_layers):
+                        if l in self._dense_layers:
+                            continue  # Skip dense layers — no experts to load
                         base = l * experts_per_layer
                         self.expert_map[l].fill_(-1)
                         self.expert_map_abs[l].fill_(-1)
@@ -180,6 +190,8 @@ class ExpertOffloadEngine:
                 f"{experts_per_layer}"
             # Load initial experts into unified buffer at fixed slots
             for l in range(self.num_layers):
+                if l in self._dense_layers:
+                    continue  # Skip dense layers — no experts to load
                 base = l * experts_per_layer
                 self.expert_map[l].fill_(-1)
                 self.expert_map_abs[l].fill_(-1)
@@ -224,6 +236,9 @@ class ExpertOffloadEngine:
                 post-layernorm hidden state fed to the router. Recorded to CPU
                 when self.record_router_inputs is True.
         """
+        if layer in self._dense_layers:
+            return  # Dense layer: no experts to manage
+
         # Step 1: set expert_map_buf to this layer's absolute map
         if self.true_offloading:
             self.expert_map_buf.copy_(self.expert_map_abs[layer])

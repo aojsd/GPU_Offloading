@@ -111,8 +111,23 @@ def measure_stage4b(engine, batch_size, n_steps=10):
 
             # Stage 2: decode attention
             q_decode = q_buf[:batch_size]
-            decode_out = engine._decode_wrapper.run(
-                q_decode, (engine.k_cache[layer], engine.v_cache[layer]))
+            if engine.is_mla:
+                q_nope_h = q_decode.view(batch_size, engine.num_heads,
+                                         engine.qk_nope_head_dim)
+                q_pe_h = info.get('q_pe_buf', q_buf)[:batch_size]
+                q_pe_h = q_pe_h.view(batch_size, engine.num_heads,
+                                     engine.qk_rope_head_dim)
+                q_absorbed = torch.einsum('bhp,hpc->bhc', q_nope_h,
+                                          engine.W_UK_T[layer])
+                out = engine._mla_decode_wrapper.run(
+                    q_absorbed, q_pe_h,
+                    engine.ckv_cache[layer], engine.kpe_cache[layer])
+                attn_v = torch.einsum('bhc,hcv->bhv', out, engine.W_UV[layer])
+                decode_out = attn_v.reshape(batch_size,
+                                            engine.num_heads * engine.v_head_dim)
+            else:
+                decode_out = engine._decode_wrapper.run(
+                    q_decode, (engine.k_cache[layer], engine.v_cache[layer]))
             attn_out_buf[:batch_size].copy_(decode_out.reshape(batch_size, H))
 
             # Zero padding
@@ -248,10 +263,12 @@ def get_model_info(model_path):
     """Read model config and compute memory info."""
     config = json.load(open(os.path.join(model_path, "config.json")))
     num_layers = config.get('num_hidden_layers', 32)
-    num_experts = config.get('num_experts',
-                             config.get('num_local_experts', 8))
+    num_experts = (config.get('n_routed_experts')
+                   or config.get('num_experts')
+                   or config.get('num_local_experts', 8))
     hidden_size = config.get('hidden_size', 4096)
-    intermediate_size = config.get('intermediate_size', 14336)
+    intermediate_size = config.get('moe_intermediate_size',
+                                   config.get('intermediate_size', 14336))
     top_k = config.get('num_experts_per_tok', 2)
 
     # Per-expert BF16 memory

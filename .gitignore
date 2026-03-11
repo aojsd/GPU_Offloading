@@ -23,3 +23,6 @@ CLAUDE.md
 
 # Temporary results
 results/**/tmp/
+
+# NFS
+**/.nfs*

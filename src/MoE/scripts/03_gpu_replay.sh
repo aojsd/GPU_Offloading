@@ -140,6 +140,51 @@ for job in "${JOBS[@]}"; do
 done
 echo ""
 
+# Results aggregation: rebuild results_<GPU>.md from all JSONs so far
+RESULTS_DIR="../../results/MoE/mixtral-8x7B"
+aggregate_results() {
+    python3 -c "
+import json, glob, os, sys
+tmp_dir = '$RESULTS_TMP'
+results_dir = '$RESULTS_DIR'
+jsons = sorted(glob.glob(os.path.join(tmp_dir, 'cache*pct-*.json')))
+if not jsons:
+    sys.exit(0)
+with open(jsons[0]) as f:
+    d = json.load(f)
+env = d.get('env', {})
+gpu_name = env.get('gpu_name', 'unknown')
+gpu_tag = 'unknown'
+for token in gpu_name.split():
+    if any(c.isdigit() for c in token) and len(token) >= 3:
+        gpu_tag = token
+        break
+md_path = os.path.join(results_dir, f'results_{gpu_tag}.md')
+os.makedirs(results_dir, exist_ok=True)
+header = (
+    f'### GPU Replay: Wall-Clock Timing ({gpu_name})\n\n'
+    '| Cache% | Policy | ms/step | Compute% | Demands | Prefetches |\n'
+    '|--------|--------|---------|----------|---------|------------|\n'
+)
+rows = []
+for jp in jsons:
+    with open(jp) as f:
+        r = json.load(f)
+    rows.append(
+        f'| {r[\"cache_pct\"]}%    '
+        f'| {r[\"policy\"]:<20s} '
+        f'| {r[\"ms_per_step\"]:>7.2f} '
+        f'| {r.get(\"compute_pct\", 0):>6.1f}% '
+        f'| {r.get(\"demands\", 0):>7d} '
+        f'| {r.get(\"prefetches\", 0):>10d} |'
+    )
+with open(md_path, 'w') as f:
+    f.write(header)
+    f.write('\n'.join(rows) + '\n')
+print(f'  results: {len(rows)} rows -> {md_path}')
+" 2>/dev/null
+}
+
 # Dispatch jobs to GPUs
 declare -a GPU_PID
 declare -a GPU_LOG
@@ -191,6 +236,7 @@ wait_for_any_gpu() {
                     tail -20 "${GPU_LOG[$g]}" | sed 's/^/    /'
                     FAILED=1
                 fi
+                aggregate_results
                 GPU_PID[$g]=0
                 return 0
             fi

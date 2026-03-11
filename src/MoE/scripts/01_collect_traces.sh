@@ -23,6 +23,15 @@ if [ "$NUM_GPUS" -lt 1 ]; then
 fi
 echo "Detected $NUM_GPUS GPU(s), using PP=$NUM_GPUS"
 
+# Auto-detect GPU memory (default 80 for H100)
+GPU_MEM_GB=$(python3 -c "
+import subprocess, re
+out = subprocess.check_output(['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'], text=True)
+mem_mib = int(out.strip().split('\n')[0])
+print(mem_mib // 1024)
+" 2>/dev/null || echo "80")
+echo "GPU memory: ${GPU_MEM_GB} GB"
+
 CACHE_FRACTIONS="0.6 0.7 0.8"
 
 for frac in $CACHE_FRACTIONS; do
@@ -39,6 +48,7 @@ for frac in $CACHE_FRACTIONS; do
         --max-output-tokens "$MAX_OUTPUT_TOKENS" \
         --max-seqs "$MAX_SEQS" \
         --pp "$NUM_GPUS" \
+        --gpu-memory-gb "$GPU_MEM_GB" \
         --resume
 done
 

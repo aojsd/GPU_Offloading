@@ -46,6 +46,19 @@ from policy_simulator import (
 from scheduler import Scheduler
 
 
+def _collect_env_metadata():
+    """Collect GPU and system metadata for result provenance."""
+    import platform
+    meta = {
+        'gpu_name': torch.cuda.get_device_name(0),
+        'gpu_memory_gb': round(torch.cuda.get_device_properties(0).total_mem / 1024**3, 1),
+        'cuda_version': torch.version.cuda,
+        'pytorch_version': torch.__version__,
+        'arch': platform.machine(),
+    }
+    return meta
+
+
 CACHE_POLICIES = [
     ("LRU", lambda: LRU()),
     ("LFU", lambda: LFU()),
@@ -351,40 +364,6 @@ def _parse_policy(name):
     return (name, cp_map[cp_name], pf_map[pf_name])
 
 
-def _append_result_to_md(result_dict, results_md_path):
-    """Append a timing row to results.md with file locking."""
-    import fcntl
-
-    table_header = (
-        "### GPU Replay: Wall-Clock Timing (All Policies)\n\n"
-        "| Cache% | Policy | ms/step | Compute% | Demands | Prefetches |\n"
-        "|--------|--------|---------|----------|---------|------------|\n"
-    )
-
-    row = (
-        f"| {result_dict['cache_pct']}%    "
-        f"| {result_dict['policy']:<20s} "
-        f"| {result_dict['ms_per_step']:>7.2f} "
-        f"| {result_dict.get('compute_pct', 0):>6.1f}% "
-        f"| {result_dict.get('demands', 0):>7d} "
-        f"| {result_dict.get('prefetches', 0):>10d} |\n"
-    )
-
-    os.makedirs(os.path.dirname(results_md_path), exist_ok=True)
-
-    with open(results_md_path, 'a+') as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            f.seek(0)
-            content = f.read()
-            if "### GPU Replay: Wall-Clock Timing" not in content:
-                f.write("\n" + table_header)
-            f.write(row)
-            f.flush()
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
-
-
 def _read_trace_cache_size(trace_path):
     """Read cache_size from a batched trace's scheduling config."""
     with open(trace_path) as f:
@@ -425,8 +404,6 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Dir for per-policy result JSONs (default: "
                              "results/MoE/mixtral-8x7B/tmp)")
-    parser.add_argument("--results-md", type=str, default=None,
-                        help="Path to results.md for incremental appending")
     args = parser.parse_args()
 
     if args.policy and args.policies:
@@ -476,13 +453,6 @@ def main():
     else:
         output_dir = repo_root / "results" / "MoE" / "mixtral-8x7B" / "tmp"
 
-    # Determine results.md path
-    if args.results_md:
-        results_md_path = args.results_md
-    else:
-        results_md_path = str(
-            repo_root / "results" / "MoE" / "mixtral-8x7B" / "results.md")
-
     results = run_batched_replay(
         args.model, batched_trace_path, per_conv_traces,
         cache_size, max_graph_size, args.warmup_steps,
@@ -492,6 +462,7 @@ def main():
     )
 
     # Save per-policy results
+    env_meta = _collect_env_metadata()
     os.makedirs(str(output_dir), exist_ok=True)
     for policy_name, policy_result in results.items():
         # Enrich with metadata
@@ -499,6 +470,7 @@ def main():
         if pct is not None:
             policy_result['cache_pct'] = pct
         policy_result['cache_size'] = cache_size
+        policy_result['env'] = env_meta
 
         # Save per-policy JSON
         if pct is not None:
@@ -508,10 +480,6 @@ def main():
         with open(str(out_file), 'w') as f:
             json.dump(policy_result, f, indent=2)
         print(f"  Saved: {out_file}")
-
-        # Append to results.md incrementally
-        if pct is not None:
-            _append_result_to_md(policy_result, results_md_path)
 
     # Also save combined results if --output specified
     if args.output:

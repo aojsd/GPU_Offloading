@@ -1,9 +1,9 @@
 #!/usr/bin/env -S python3 -u
-"""PP=2 chunked prefill correctness test on ALL 200 ShareGPT prompts.
+"""PP chunked prefill correctness test on ShareGPT prompts.
 
-Uses the FULL Mixtral-8x7B model (32 layers) split across 2 GPUs via
-pipeline parallelism. For each prompt, compares a reference prefill against
-N-chunk manual split (first chunk as new prefill, rest as continuations).
+Splits the model across GPUs via pipeline parallelism. For each prompt,
+compares a reference prefill against N-chunk manual split (first chunk as
+new prefill, rest as continuations).
 
 - Short prompts (<= max_graph): reference = single-shot full prefill.
 - Long prompts (> max_graph): reference = engine's chunked_prefill_to_slot.
@@ -12,8 +12,10 @@ N-chunk manual split (first chunk as new prefill, rest as continuations).
 Uses use_torch_compile=False to eliminate inductor noise.
 
 Usage:
-    python tests/test_chunked_prefill_pp.py
+    python tests/test_chunked_prefill_pp.py --model models/Mixtral-8x7B --pp 2
+    python tests/test_chunked_prefill_pp.py --model models/OLMoE-1B-7B-0924 --pp 1
 """
+import argparse
 import json
 import sys
 import time
@@ -32,37 +34,37 @@ from transformers import AutoTokenizer
 import moe_engine as _moe_engine_mod  # noqa: F401
 from moe_engine import MoEEngine
 
-# Full Mixtral-8x7B model (32 layers)
-MODEL_PATH = str(Path(__file__).resolve().parent.parent / "models" / "Mixtral-8x7B")
+DEFAULT_MODEL = str(Path(__file__).resolve().parent.parent / "models" / "Mixtral-8x7B")
 
-# ShareGPT trace files (used for prompt_text)
-TRACES_DIR = (
+# Raw ShareGPT dataset (model-independent)
+SHAREGPT_JSON = (
     Path(__file__).resolve().parent.parent
-    / "datasets" / "ShareGPT_Vicuna" / "expert_traces" / "mixtral-8x7b"
+    / "datasets" / "ShareGPT_Vicuna" / "ShareGPT_V3_unfiltered_cleaned_split.json"
 )
 
 
-def load_all_sharegpt_prompts():
-    """Load all 200 ShareGPT prompt texts from Mixtral trace files."""
-    manifest_path = TRACES_DIR / "manifest.json"
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+def load_all_sharegpt_prompts(max_prompts=200):
+    """Load ShareGPT prompts from the raw dataset."""
+    if not SHAREGPT_JSON.exists():
+        raise FileNotFoundError(f"ShareGPT dataset not found: {SHAREGPT_JSON}")
 
-    with open(manifest_path) as f:
-        manifest = json.load(f)
+    with open(SHAREGPT_JSON) as f:
+        data = json.load(f)
 
     prompts = []
-    for entry in manifest["conversations"]:
-        trace_path = TRACES_DIR / entry["trace_file"]
-        with open(trace_path) as f:
-            data = json.load(f)
-        prompt_text = data.get("prompt_text", "")
-        if not prompt_text:
+    for entry in data:
+        if len(prompts) >= max_prompts:
+            break
+        turns = entry.get("conversations", [])
+        if not turns or turns[0].get("from") != "human":
+            continue
+        text = turns[0]["value"].strip()
+        if not text:
             continue
         prompts.append({
-            "id": entry["conversation_id"],
-            "index": entry.get("index", len(prompts)),
-            "text": prompt_text,
+            "id": entry["id"],
+            "index": len(prompts),
+            "text": text,
         })
     return prompts
 
@@ -138,33 +140,52 @@ def cosine_sim(a, b):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="PP chunked prefill correctness test")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
+                        help="Path to model directory")
+    parser.add_argument("--pp", type=int, default=2,
+                        help="Pipeline parallel size (default: 2)")
+    parser.add_argument("--n-prompts", type=int, default=200,
+                        help="Max number of ShareGPT prompts to test")
+    args = parser.parse_args()
+
+    model_path = args.model
+    pp_size = args.pp
+
     n_gpus = torch.cuda.device_count()
     print(f"GPUs available: {n_gpus}")
-    if n_gpus < 2:
-        print("ERROR: PP=2 test requires at least 2 GPUs")
+    if n_gpus < pp_size:
+        print(f"ERROR: PP={pp_size} requires at least {pp_size} GPUs, "
+              f"found {n_gpus}")
         sys.exit(1)
 
     for i in range(n_gpus):
         props = torch.cuda.get_device_properties(i)
         print(f"  GPU {i}: {props.name} ({props.total_memory / 1e9:.1f} GB)")
 
-    model_path = MODEL_PATH
     print(f"\nModel: {model_path}")
 
-    # Load config to verify 32 layers
+    # Load config
     with open(Path(model_path) / "config.json") as f:
         cfg = json.load(f)
     num_layers = cfg["num_hidden_layers"]
-    print(f"Layers: {num_layers}")
-    assert num_layers == 32, f"Expected 32 layers, got {num_layers}"
+    is_mixtral = cfg.get("model_type") == "mixtral" or "mixtral" in model_path.lower()
+    print(f"Layers: {num_layers}, PP: {pp_size}")
 
-    dtype = torch.float16
-    max_graph_size = 512
+    # Model-specific settings
+    if is_mixtral:
+        dtype = torch.float16
+        max_graph_size = 512
+    else:
+        dtype = torch.bfloat16
+        max_graph_size = 512
+
     max_seq_len = 8192
     page_size = 16
 
     print(f"Dtype: {dtype}, max_graph_size: {max_graph_size}, "
-          f"max_seq_len: {max_seq_len}, PP=2")
+          f"max_seq_len: {max_seq_len}, PP={pp_size}")
 
     # Load tokenizer
     print("Loading tokenizer...")
@@ -172,7 +193,7 @@ def main():
 
     # Load all ShareGPT prompts
     print("Loading ShareGPT prompts...")
-    prompts = load_all_sharegpt_prompts()
+    prompts = load_all_sharegpt_prompts(max_prompts=args.n_prompts)
     print(f"Loaded {len(prompts)} prompts")
 
     # Tokenize all prompts
@@ -224,8 +245,8 @@ def main():
     print(f"Short prompts (<= {max_graph_size}, single-shot ref): {short_count}")
     print(f"Long prompts (> {max_graph_size}, N-chunk ref): {long_count}")
 
-    # Load engine with PP=2
-    print("\nLoading PP=2 engine with full Mixtral-8x7B (32 layers)...")
+    # Load engine
+    print(f"\nLoading PP={pp_size} engine ({num_layers} layers)...")
     t0 = time.time()
     engine = MoEEngine(
         model_path,
@@ -234,13 +255,13 @@ def main():
         page_size=page_size,
         dtype=dtype,
         device="cuda:0",
-        pipeline_parallel_size=2,
+        pipeline_parallel_size=pp_size,
         use_torch_compile=False,
     )
     load_time = time.time() - t0
     print(f"Engine loaded in {load_time:.1f}s")
 
-    for i in range(2):
+    for i in range(pp_size):
         alloc = torch.cuda.memory_allocated(i) / 1e9
         reserved = torch.cuda.memory_reserved(i) / 1e9
         print(f"  GPU {i}: allocated={alloc:.2f} GB, reserved={reserved:.2f} GB")
@@ -256,7 +277,7 @@ def main():
     capture_time = time.time() - t0
     print(f"Graphs captured in {capture_time:.1f}s")
 
-    for i in range(2):
+    for i in range(pp_size):
         alloc = torch.cuda.memory_allocated(i) / 1e9
         reserved = torch.cuda.memory_reserved(i) / 1e9
         print(f"  GPU {i} after capture: allocated={alloc:.2f} GB, "
@@ -334,8 +355,9 @@ def main():
     print("\n" + "=" * 80)
     print("SUMMARY")
     print("=" * 80)
+    layers_per_gpu = (num_layers + pp_size - 1) // pp_size
     print(f"Model: {model_path} ({num_layers} layers)")
-    print(f"Pipeline parallelism: PP=2 (16 layers/GPU)")
+    print(f"Pipeline parallelism: PP={pp_size} ({layers_per_gpu} layers/GPU)")
     print(f"Total prompts tested: {len(results)}")
     print(f"  Short (single-shot ref): "
           f"{sum(1 for r in results if r['mode'] == 'full')}")

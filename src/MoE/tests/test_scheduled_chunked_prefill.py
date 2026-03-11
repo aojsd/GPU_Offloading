@@ -14,6 +14,7 @@ Test 4: Multiple ShareGPT prompts — systematic comparison
 Usage:
     python tests/test_scheduled_chunked_prefill.py --model models/Mixtral-8x7B-20L
     python tests/test_scheduled_chunked_prefill.py --model models/OLMoE-1B-7B-0924
+    python tests/test_scheduled_chunked_prefill.py --model models/Mixtral-8x7B --pp 2
 """
 import argparse
 import json
@@ -29,28 +30,31 @@ from moe_engine import MoEEngine
 DEFAULT_MODEL = str(
     Path(__file__).resolve().parent.parent / "models" / "Mixtral-8x7B-20L")
 
-SHAREGPT_DIR = str(
+SHAREGPT_JSON = (
     Path(__file__).resolve().parent.parent
-    / "datasets" / "ShareGPT_Vicuna" / "expert_traces" / "mixtral-8x7b")
+    / "datasets" / "ShareGPT_Vicuna" / "ShareGPT_V3_unfiltered_cleaned_split.json")
 
 
 def load_sharegpt_prompts(n=10):
-    """Load first n ShareGPT prompts from traced conversations, re-tokenize."""
-    manifest_path = Path(SHAREGPT_DIR) / "manifest.json"
-    if not manifest_path.exists():
+    """Load first n ShareGPT prompts from the raw dataset."""
+    if not SHAREGPT_JSON.exists():
         return None
-    with open(manifest_path) as f:
-        manifest = json.load(f)
+    with open(SHAREGPT_JSON) as f:
+        data = json.load(f)
 
     convos = []
-    for entry in manifest['conversations'][:n]:
-        trace_path = Path(SHAREGPT_DIR) / entry['trace_file']
-        with open(trace_path) as f:
-            data = json.load(f)
+    for entry in data:
+        if len(convos) >= n:
+            break
+        turns = entry.get("conversations", [])
+        if not turns or turns[0].get("from") != "human":
+            continue
+        text = turns[0]["value"].strip()
+        if not text:
+            continue
         convos.append({
-            'id': data['conversation_id'],
-            'prompt_text': data.get('prompt_text', ''),
-            'prompt_tokens': data['prompt_tokens'],
+            'id': entry['id'],
+            'prompt_text': text,
         })
     return convos
 
@@ -224,16 +228,20 @@ def main():
     parser = argparse.ArgumentParser(
         description="Test scheduled chunked prefill correctness")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
+    parser.add_argument("--pp", type=int, default=1,
+                        help="Pipeline parallel size (default: 1)")
     parser.add_argument("--n-prompts", type=int, default=10,
                         help="Number of ShareGPT prompts to test")
     args = parser.parse_args()
 
     print(f"Model: {args.model}")
+    print(f"PP: {args.pp}")
 
     # Load engine with piecewise graphs
     print("\nLoading engine...")
     engine = MoEEngine(args.model, max_seqs=8, max_seq_len=8192,
-                       use_torch_compile=False)
+                       use_torch_compile=False,
+                       pipeline_parallel_size=args.pp)
 
     # Capture graphs — keep small to avoid OOM on truncated models
     graph_sizes = [1, 128, 256, 512, 1024]
@@ -294,8 +302,11 @@ def main():
             if not conv['prompt_text']:
                 continue
             messages = [{"role": "user", "content": conv['prompt_text']}]
-            tokens = tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True)
+            try:
+                tokens = tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True)
+            except Exception:
+                tokens = tokenizer.encode(conv['prompt_text'])
             if len(tokens) > max_graph or len(tokens) < 4:
                 continue
 

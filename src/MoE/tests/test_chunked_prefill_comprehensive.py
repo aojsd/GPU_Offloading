@@ -38,34 +38,35 @@ import moe_engine as _moe_engine_mod  # noqa: F401
 from moe_engine import MoEEngine
 
 
-# Path to ShareGPT trace files (used for prompt_text, model-independent)
-TRACES_DIR = (
+# Raw ShareGPT dataset (model-independent)
+SHAREGPT_JSON = (
     Path(__file__).resolve().parent.parent
-    / "datasets" / "ShareGPT_Vicuna" / "expert_traces" / "mixtral-8x7b"
+    / "datasets" / "ShareGPT_Vicuna" / "ShareGPT_V3_unfiltered_cleaned_split.json"
 )
 
 
-def load_all_sharegpt_prompts():
-    """Load all 200 ShareGPT prompt texts from Mixtral trace files."""
-    manifest_path = TRACES_DIR / "manifest.json"
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+def load_all_sharegpt_prompts(max_prompts=200):
+    """Load ShareGPT prompts from the raw dataset."""
+    if not SHAREGPT_JSON.exists():
+        raise FileNotFoundError(f"ShareGPT dataset not found: {SHAREGPT_JSON}")
 
-    with open(manifest_path) as f:
-        manifest = json.load(f)
+    with open(SHAREGPT_JSON) as f:
+        data = json.load(f)
 
     prompts = []
-    for entry in manifest["conversations"]:
-        trace_path = TRACES_DIR / entry["trace_file"]
-        with open(trace_path) as f:
-            data = json.load(f)
-        prompt_text = data.get("prompt_text", "")
-        if not prompt_text:
+    for entry in data:
+        if len(prompts) >= max_prompts:
+            break
+        turns = entry.get("conversations", [])
+        if not turns or turns[0].get("from") != "human":
+            continue
+        text = turns[0]["value"].strip()
+        if not text:
             continue
         prompts.append({
-            "id": entry["conversation_id"],
-            "index": entry.get("index", len(prompts)),
-            "text": prompt_text,
+            "id": entry["id"],
+            "index": len(prompts),
+            "text": text,
         })
     return prompts
 
@@ -156,11 +157,14 @@ def main():
         description="Comprehensive chunked prefill correctness test")
     parser.add_argument("--model", type=str, required=True,
                         help="Path to model directory")
+    parser.add_argument("--pp", type=int, default=1,
+                        help="Pipeline parallel size (default: 1)")
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Device to use (default: cuda:0)")
     args = parser.parse_args()
 
     print(f"Model: {args.model}")
+    print(f"PP: {args.pp}")
     print(f"Device: {args.device}")
 
     # Load config
@@ -263,6 +267,7 @@ def main():
         dtype=dtype,
         device=args.device,
         use_torch_compile=False,
+        pipeline_parallel_size=args.pp,
     )
     print(f"Engine loaded in {time.time() - t0:.1f}s")
 

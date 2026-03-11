@@ -13,7 +13,7 @@
 
 - **01 — Collect** (`01_collect_traces.sh`): GPU-based batched trace collection with
   continuous batching (greedy admission, LIFO preemption with recompute, dynamic page
-  allocation). 200 ShareGPT conversations, epl=5 offloading, one run per cache fraction (70/80/90%).
+  allocation). 200 ShareGPT conversations, epl=5 offloading, one run per cache fraction (70/80/90/95%).
   Outputs `batched_trace.json` + per-conversation traces.
 - **02 — Simulate** (`02_policy_simulate.sh`): CPU-only policy simulation
   (4 cache × 3 prefetch = 12 policies per cache%). Saves `GPUReplayTrace` files.
@@ -28,6 +28,7 @@ batching with greedy admission, LIFO preemption with recompute, dynamic page all
 
 | Cache% | Cached Experts | Steps | KV Budget (pages) | Avg Batch | Peak Batch | Preemptions | Avg Experts/Layer |
 |--------|---------------|-------|--------------------|-----------|------------|-------------|-------------------|
+| 95%    | 243           | 4555  | 3,004             | 21.0      | 32         | 0           | 6.92              |
 | 90%    | 230           | 4555  | 5,188             | 21.0      | 32         | 0           | 6.92              |
 | 80%    | 204           | 4555  | 9,556             | 21.0      | 32         | 0           | 6.92              |
 | 70%    | 179           | 4555  | 13,756             | 21.0      | 32         | 0           | 6.92              |
@@ -36,6 +37,7 @@ batching with greedy admission, LIFO preemption with recompute, dynamic page all
 
 | Cache% | setup | stage1 | attention | stage4a | stage4b | finish | **Total Per-Layer Compute** | **Total Compute (32 Layers)** |
 |--------|-------|--------|-----------|---------|---------|--------|-----------------------------|---------------------------------|
+| 95%    | 0.028 | 0.072  | 0.057     | 0.039   | 0.753   | 0.003  | **0.951**     | **30.44**       |
 | 90%    | 0.028 | 0.072  | 0.057     | 0.039   | 0.754   | 0.003  | **0.952**     | **30.47**       |
 | 80%    | 0.028 | 0.072  | 0.056     | 0.039   | 0.757   | 0.003  | **0.956**     | **30.58**       |
 | 70%    | 0.028 | 0.072  | 0.056     | 0.039   | 0.757   | 0.003  | **0.956**     | **30.58**       |
@@ -55,6 +57,32 @@ batching with greedy admission, LIFO preemption with recompute, dynamic page all
 </tr>
 </thead>
 <tbody>
+<!-- 95% cache (243 experts, 4555 steps) -->
+<tr class="cache-border">
+  <td rowspan="12"><b>95%</b></td>
+  <td rowspan="3">Belady</td>
+  <td>None</td><td>41.08</td><td>74.6%</td><td>42,470</td><td>0</td><td>42,470</td>
+</tr>
+<tr><td>Oracle</td><td>33.30</td><td>93.4%</td><td>0</td><td>43,781</td><td>43,781</td></tr>
+<tr><td>Oracle(1)</td><td>33.14</td><td>94.4%</td><td>691</td><td>43,055</td><td>43,746</td></tr>
+<tr class="policy-border">
+  <td rowspan="3">StaticFreq</td>
+  <td>None</td><td>44.46</td><td>68.9%</td><td>57,717</td><td>0</td><td>57,717</td>
+</tr>
+<tr><td>Oracle</td><td>34.18</td><td>92.8%</td><td>0</td><td>64,395</td><td>64,395</td></tr>
+<tr><td>Oracle(1)</td><td>37.31</td><td>84.1%</td><td>13,630</td><td>44,459</td><td>58,089</td></tr>
+<tr class="policy-border">
+  <td rowspan="3">LFU</td>
+  <td>None</td><td>71.51</td><td>43.0%</td><td>171,733</td><td>0</td><td>171,733</td>
+</tr>
+<tr><td>Oracle</td><td>61.20</td><td>53.6%</td><td>0</td><td>179,756</td><td>179,756</td></tr>
+<tr><td>Oracle(1)</td><td>65.65</td><td>48.1%</td><td>102,083</td><td>71,839</td><td>173,922</td></tr>
+<tr class="policy-border">
+  <td rowspan="3">LRU</td>
+  <td>None</td><td>211.03</td><td>14.6%</td><td>765,851</td><td>0</td><td>765,851</td>
+</tr>
+<tr><td>Oracle</td><td>196.37</td><td>19.5%</td><td>0</td><td>765,851</td><td>765,851</td></tr>
+<tr><td>Oracle(1)</td><td>210.02</td><td>15.2%</td><td>655,310</td><td>110,541</td><td>765,851</td></tr>
 <!-- 90% cache (230 experts, 4555 steps) -->
 <tr class="cache-border">
   <td rowspan="12"><b>90%</b></td>

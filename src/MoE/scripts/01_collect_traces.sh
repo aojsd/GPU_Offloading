@@ -51,7 +51,7 @@ else
 fi
 
 for frac in $CACHE_FRACTIONS; do
-    pct=$(python3 -c "print(int($frac * 100))")
+    pct=$(python3 -c "v=$frac*100; print(int(v) if v==int(v) else f'{v:g}')")
     out_dir="$OUTPUT_BASE/cache${pct}pct"
     echo ""
     echo "=== Collecting traces for cache ${pct}% (fraction=$frac) ==="

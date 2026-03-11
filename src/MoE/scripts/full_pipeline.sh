@@ -17,7 +17,7 @@ for arg in "$@"; do
     [ "$arg" = "--resume" ] && RESUME_FLAG="--resume"
 done
 
-PCT=$(python3 -c "print(int($CACHE_FRAC * 100))")
+PCT=$(python3 -c "v=$CACHE_FRAC*100; print(int(v) if v==int(v) else f'{v:g}')")
 echo "=== Full pipeline for cache ${PCT}% (fraction=$CACHE_FRAC) ==="
 
 MODEL=${MODEL:-models/Mixtral-8x7B}

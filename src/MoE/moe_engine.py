@@ -18,15 +18,11 @@ import torch
 import torch.nn.functional as F
 from pathlib import Path
 from safetensors import safe_open
-from flashinfer import (BatchDecodeWithPagedKVCacheWrapper,
-                        BatchPrefillWithPagedKVCacheWrapper)
+from vllm.v1.attention.backends.flashinfer import (
+    BatchDecodeWithPagedKVCacheWrapper,
+    BatchPrefillWithPagedKVCacheWrapper,
+)
 from vllm.vllm_flash_attn import flash_attn_varlen_func
-
-try:
-    from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
-    HAS_FLASHINFER = True
-except ImportError:
-    HAS_FLASHINFER = False
 
 
 def rope_pytorch(q, k, cos_sin_cache, positions, num_heads, head_dim,

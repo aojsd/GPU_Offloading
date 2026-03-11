@@ -112,10 +112,10 @@ def _moe_align_block_size_torch(topk_ids, num_experts, block_size,
     cum_blocks[1:] = torch.cumsum(n_blocks, dim=0)
     block_positions = torch.arange(expert_ids.shape[0], device=topk_ids.device, dtype=torch.int32)
     expert_ids[:] = torch.searchsorted(cum_blocks[1:].contiguous(), block_positions, right=True)
-    # Clamp padding blocks to valid range. Blocks beyond num_tokens_post_padded
-    # are never processed by the Triton kernel, but expert_map[expert_ids] would
-    # OOB if searchsorted returns num_experts for these padding positions.
-    expert_ids.clamp_(max=num_experts - 1)
+    # Padding blocks (beyond total real blocks) are never processed by the
+    # Triton kernel. Zero them so downstream expert_map[expert_ids] doesn't
+    # OOB when num_experts is the buffer dimension (> model expert count).
+    expert_ids[block_positions >= cum_blocks[-1]] = 0
 
     num_tokens_post_pad.fill_(0)
     num_tokens_post_pad[0] = cum_padded[-1]
@@ -466,13 +466,7 @@ class MoEEngine:
         kwargs = {}
         if expert_map is not None:
             kwargs['expert_map'] = expert_map
-            # Monkey-patched moe_align_block_size (glibc < 2.29) clamps
-            # expert_ids to [0, num_experts-1] before expert_map lookup,
-            # so num_experts must equal the model's global expert count.
-            # Native vLLM 0.17 kernel needs the buffer dimension instead.
-            kwargs['global_num_experts'] = (self.num_experts
-                                            if _needs_moe_patch
-                                            else w1.size(0))
+            kwargs['global_num_experts'] = w1.size(0)
         return fused_experts(
             hidden_states=hidden_states, w1=w1, w2=w2,
             topk_weights=topk_weights,

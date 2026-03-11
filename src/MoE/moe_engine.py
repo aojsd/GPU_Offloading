@@ -466,7 +466,7 @@ class MoEEngine:
         kwargs = {}
         if expert_map is not None:
             kwargs['expert_map'] = expert_map
-            kwargs['global_num_experts'] = self.num_experts
+            kwargs['global_num_experts'] = w1.size(0)
         return fused_experts(
             hidden_states=hidden_states, w1=w1, w2=w2,
             topk_weights=topk_weights,

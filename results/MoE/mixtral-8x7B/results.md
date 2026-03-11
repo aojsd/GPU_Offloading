@@ -4,6 +4,7 @@
 
 - 2x H100 80GB, PCIe 5.0, ~56 GB/s H2D per GPU (no contention: 1.00x with concurrent transfers)
 - Full Mixtral-8x7B 32L × 8E (256 total experts, 336 MB each, ~86 GB total)
+- Per-expert PCIe transfer time: 336 MB / 56 GB/s ≈ **6.0 ms**
 - System RAM: ~1 TB, no cgroup limit
 - Bench script: `scripts/batched_replay.py`, real-batch warmup, full trace replay (single trial)
 - Each config tests 4 cache policies × 3 prefetch policies = 12 combinations
@@ -31,13 +32,13 @@ batching with greedy admission, LIFO preemption with recompute, dynamic page all
 | 70%    | 179           | 4400  | 6,076              | 19.3      | 32         | 0           | 6.11              |
 | 80%    | 204           | 4387  | 1,876              | 19.1      | 32         | 111         | 6.27              |
 
-#### Per-Step Compute Breakdown (ms, averaged across No-Prefetch runs)
+#### Per-Layer Compute Breakdown (ms, averaged across No-Prefetch runs, 32 layers)
 
 | Cache% | setup | stage1 | attention | stage4a | stage4b | finish | **Total Compute** |
 |--------|-------|--------|-----------|---------|---------|--------|-------------------|
-| 60%    | 0.65  | 2.58   | 1.27      | 1.37    | 28.73   | 0.11   | **34.71**         |
-| 70%    | 0.65  | 2.57   | 1.36      | 1.37    | 28.90   | 0.11   | **34.96**         |
-| 80%    | 0.67  | 2.71   | 1.41      | 1.42    | 31.22   | 0.11   | **37.53**         |
+| 60%    | 0.020 | 0.081  | 0.040     | 0.043   | 0.898   | 0.003  | **1.085**         |
+| 70%    | 0.020 | 0.080  | 0.043     | 0.043   | 0.903   | 0.003  | **1.093**         |
+| 80%    | 0.021 | 0.085  | 0.044     | 0.044   | 0.976   | 0.003  | **1.173**         |
 
 ### GPU Replay: Wall-Clock Timing + Transfer Counts
 
@@ -76,10 +77,10 @@ batching with greedy admission, LIFO preemption with recompute, dynamic page all
 <tr><td>Oracle(1)</td><td>1064.19</td><td>3.8%</td><td>587,934</td><td>121,864</td><td>709,798</td></tr>
 <tr class="policy-border">
   <td rowspan="3">LRU</td>
-  <td>None</td><td>1200.67</td><td></td><td>800,246</td><td>0</td><td>800,246</td>
+  <td>None</td><td>1200.67</td><td>3.0%</td><td>800,246</td><td>0</td><td>800,246</td>
 </tr>
-<tr><td>Oracle</td><td></td><td></td><td>0</td><td>800,246</td><td>800,246</td></tr>
-<tr><td>Oracle(1)</td><td></td><td></td><td>674,972</td><td>125,274</td><td>800,246</td></tr>
+<tr><td>Oracle</td><td>1172.97</td><td>6.3%</td><td>0</td><td>800,246</td><td>800,246</td></tr>
+<tr><td>Oracle(1)</td><td>1198.18</td><td>3.5%</td><td>674,972</td><td>125,274</td><td>800,246</td></tr>
 <!-- 70% cache (179 experts, 4400 steps) -->
 <tr class="cache-border">
   <td rowspan="12"><b>70%</b></td>
@@ -102,10 +103,10 @@ batching with greedy admission, LIFO preemption with recompute, dynamic page all
 <tr><td>Oracle(1)</td><td>1019.40</td><td>4.0%</td><td>568,843</td><td>114,964</td><td>683,807</td></tr>
 <tr class="policy-border">
   <td rowspan="3">LRU</td>
-  <td>None</td><td>1175.26</td><td></td><td>787,822</td><td>0</td><td>787,822</td>
+  <td>None</td><td>1175.26</td><td>3.1%</td><td>787,822</td><td>0</td><td>787,822</td>
 </tr>
-<tr><td>Oracle</td><td></td><td></td><td>0</td><td>787,822</td><td>787,822</td></tr>
-<tr><td>Oracle(1)</td><td></td><td></td><td>669,004</td><td>118,818</td><td>787,822</td></tr>
+<tr><td>Oracle</td><td>1147.26</td><td>6.4%</td><td>0</td><td>787,822</td><td>787,822</td></tr>
+<tr><td>Oracle(1)</td><td>1171.97</td><td>3.5%</td><td>669,004</td><td>118,818</td><td>787,822</td></tr>
 <!-- 80% cache (204 experts, 4387 steps) -->
 <tr class="cache-border">
   <td rowspan="12"><b>80%</b></td>

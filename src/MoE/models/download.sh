@@ -7,10 +7,14 @@
 # Models:
 #   olmoe     (default) allenai/OLMoE-1B-7B-0924
 #   mixtral              mistralai/Mixtral-8x7B-Instruct-v0.1
+#   deepseek2            deepseek-ai/DeepSeek-V2
+#   deepseek2-lite       deepseek-ai/DeepSeek-V2-Lite
 #
 # Examples:
-#   ./download.sh ~/project/models              # downloads OLMoE
-#   ./download.sh ~/project/models mixtral      # downloads Mixtral-8x7B
+#   ./download.sh ~/project/models                   # downloads OLMoE
+#   ./download.sh ~/project/models mixtral            # downloads Mixtral-8x7B
+#   ./download.sh ~/project/models deepseek2          # downloads DeepSeek-V2
+#   ./download.sh ~/project/models deepseek2-lite     # downloads DeepSeek-V2-Lite
 #
 # Downloads into <target_dir>/<model_name> and creates a symlink in this
 # directory pointing to it.
@@ -23,10 +27,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 declare -A HF_REPOS=(
     [olmoe]="allenai/OLMoE-1B-7B-0924"
     [mixtral]="mistralai/Mixtral-8x7B-Instruct-v0.1"
+    [deepseek2]="deepseek-ai/DeepSeek-V2"
+    [deepseek2-lite]="deepseek-ai/DeepSeek-V2-Lite"
 )
 declare -A LOCAL_NAMES=(
     [olmoe]="OLMoE-1B-7B"
     [mixtral]="Mixtral-8x7B"
+    [deepseek2]="DeepSeek-V2"
+    [deepseek2-lite]="DeepSeek-V2-Lite"
 )
 
 # ── Parse args ───────────────────────────────────────────────────────

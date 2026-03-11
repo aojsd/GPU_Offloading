@@ -55,12 +55,16 @@ def rope_pytorch(q, k, cos_sin_cache, positions, num_heads, head_dim,
                         k_h[..., :half] * sin + k_h[..., half:] * cos], dim=-1)
     return q_rot.reshape(N, -1).to(orig_dtype), k_rot.reshape(N, -1).to(orig_dtype)
 
-# ── Patch vLLM's broken _moe_C ops (requires glibc 2.29, we have 2.28) ──
+# ── Conditionally patch vLLM's _moe_C ops (broken on glibc < 2.29) ──
 # Load _C.so (works fine — has silu_and_mul, etc.)
 import vllm._custom_ops as _vllm_ops
 _vllm_so = Path(_vllm_ops.__file__).parent / "_C.abi3.so"
 if _vllm_so.exists():
     torch.ops.load_library(str(_vllm_so))
+
+import platform
+_glibc_ver = platform.libc_ver()[1]
+_needs_moe_patch = _glibc_ver and tuple(int(x) for x in _glibc_ver.split(".")) < (2, 29)
 
 
 def _moe_align_block_size_torch(topk_ids, num_experts, block_size,
@@ -147,17 +151,16 @@ def _topk_softmax_torch(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
     token_expert_indices.copy_(row_offsets + tk_i.to(torch.int32))
 
 
-# Apply monkey-patches
-_vllm_ops.moe_align_block_size = _moe_align_block_size_torch
-_vllm_ops.moe_sum = _moe_sum_torch
-_vllm_ops.topk_softmax = _topk_softmax_torch
-# Also patch the module-level reference in moe_align_block_size.py
-import vllm.model_executor.layers.fused_moe.moe_align_block_size as _mabs_mod
-_mabs_mod.ops.moe_align_block_size = _moe_align_block_size_torch
-# Patch the module-level reference in fused_moe.py (used by vllm_topk_softmax)
-import vllm.model_executor.layers.fused_moe.fused_moe as _fused_moe_mod
-_fused_moe_mod.ops.topk_softmax = _topk_softmax_torch
-_fused_moe_mod.ops.moe_sum = _moe_sum_torch
+# Apply monkey-patches only on glibc < 2.29 (needed for old RHEL 8.10 systems)
+if _needs_moe_patch:
+    _vllm_ops.moe_align_block_size = _moe_align_block_size_torch
+    _vllm_ops.moe_sum = _moe_sum_torch
+    _vllm_ops.topk_softmax = _topk_softmax_torch
+    import vllm.model_executor.layers.fused_moe.moe_align_block_size as _mabs_mod
+    _mabs_mod.ops.moe_align_block_size = _moe_align_block_size_torch
+    import vllm.model_executor.layers.fused_moe.fused_moe as _fused_moe_mod
+    _fused_moe_mod.ops.topk_softmax = _topk_softmax_torch
+    _fused_moe_mod.ops.moe_sum = _moe_sum_torch
 
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 

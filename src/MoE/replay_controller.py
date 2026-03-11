@@ -251,8 +251,8 @@ class ReplayController:
     def process_layer_replay(self, layer, topk_ids_buf, n_tokens):
         """Called after stage4a (routing known).
 
-        1. Copy expert_map_abs[layer] → expert_map_buf
-        2. Wait for async prefetches targeting this layer
+        1. Wait for async prefetches targeting this layer
+        2. Copy expert_map_abs[layer] → expert_map_buf
         3. Execute demand_loads (blocking on compute stream)
         4. Re-copy expert_map_abs → expert_map_buf (updated by transfers)
         5. Issue prefetches for layer+1 (async, overlaps with stage4b)
@@ -260,13 +260,16 @@ class ReplayController:
         step_trace = self.trace.steps[self._current_step]
         layer_trace = step_trace.layers[layer]
 
-        # Step 1: set base expert map for this layer
-        self.expert_map_buf.copy_(self.expert_map_abs[layer])
-
-        # Step 2: sync prefetches targeting this layer
+        # Step 1: sync prefetches targeting this layer (must complete before
+        # we read expert_map_abs, which prefetches write to on the transfer
+        # stream via _execute_transfer)
         if self._has_prefetches:
             torch.cuda.current_stream().wait_event(
                 self._prefetch_done_event)
+
+        # Step 2: set base expert map for this layer (now race-free —
+        # all prefetch writes to expert_map_abs are visible after sync)
+        self.expert_map_buf.copy_(self.expert_map_abs[layer])
 
         # Step 3: demand loads (blocking, on compute stream)
         if layer_trace.demand_loads:

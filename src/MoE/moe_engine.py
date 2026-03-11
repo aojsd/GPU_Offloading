@@ -466,7 +466,13 @@ class MoEEngine:
         kwargs = {}
         if expert_map is not None:
             kwargs['expert_map'] = expert_map
-            kwargs['global_num_experts'] = w1.size(0)
+            # Monkey-patched moe_align_block_size (glibc < 2.29) clamps
+            # expert_ids to [0, num_experts-1] before expert_map lookup,
+            # so num_experts must equal the model's global expert count.
+            # Native vLLM 0.17 kernel needs the buffer dimension instead.
+            kwargs['global_num_experts'] = (self.num_experts
+                                            if _needs_moe_patch
+                                            else w1.size(0))
         return fused_experts(
             hidden_states=hidden_states, w1=w1, w2=w2,
             topk_weights=topk_weights,

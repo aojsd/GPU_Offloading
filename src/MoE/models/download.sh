@@ -80,32 +80,3 @@ fi
 
 ln -s "${MODEL_DIR}" "${LINK_PATH}"
 echo "Symlink created: ${LINK_PATH} -> ${MODEL_DIR}"
-
-# ── Post-download: truncate Mixtral ──────────────────────────────────
-if [ "${MODEL_KEY}" = "mixtral" ]; then
-    TRUNCATED_NAME="Mixtral-8x7B-20L"
-    TRUNCATED_DIR="${TARGET_DIR}/${TRUNCATED_NAME}"
-    TRUNCATED_LINK="${SCRIPT_DIR}/${TRUNCATED_NAME}"
-
-    if [ -d "${TRUNCATED_DIR}" ] && [ -f "${TRUNCATED_DIR}/config.json" ]; then
-        echo "Truncated model already exists at ${TRUNCATED_DIR}, skipping."
-    else
-        echo ""
-        echo "Creating truncated Mixtral (20 layers) at ${TRUNCATED_DIR}..."
-        # Use the same Python that has safetensors installed (conda env)
-        PYTHON="${PYTHON:-python3}"
-        "${PYTHON}" "${SCRIPT_DIR}/truncate_model.py" \
-            "${MODEL_DIR}" "${TRUNCATED_DIR}" --num-layers 20
-    fi
-
-    # Symlink for truncated model
-    if [ -L "${TRUNCATED_LINK}" ]; then
-        rm "${TRUNCATED_LINK}"
-    elif [ -e "${TRUNCATED_LINK}" ]; then
-        echo "Error: ${TRUNCATED_LINK} exists and is not a symlink."
-        exit 1
-    fi
-
-    ln -s "${TRUNCATED_DIR}" "${TRUNCATED_LINK}"
-    echo "Symlink created: ${TRUNCATED_LINK} -> ${TRUNCATED_DIR}"
-fi

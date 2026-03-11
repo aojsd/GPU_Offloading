@@ -191,15 +191,18 @@ def write_vllm_driver(path, seq_len, model_dir):
         )
 
         step = 0
+        profiling = False
         while llm.llm_engine.has_unfinished_requests():
             if step == 1 + NUM_WARMUP:  # 1 prefill + warmup decodes
                 torch.cuda.synchronize()
                 torch.cuda.nvtx.range_push("decode_profile")
+                profiling = True
             llm.llm_engine.step()
             step += 1
 
         torch.cuda.synchronize()
-        torch.cuda.nvtx.range_pop()
+        if profiling:
+            torch.cuda.nvtx.range_pop()
         print(f"Total steps: {{step}} (1 prefill + {{step-1}} decode)")
     """)
     Path(path).write_text(code)

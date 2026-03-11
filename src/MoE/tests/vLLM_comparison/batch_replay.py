@@ -47,6 +47,7 @@ class PrefillInfo:
     request_id: str
     prompt_token_ids: list  # full prompt tokens
     num_scheduled_tokens: int  # tokens computed THIS step
+    num_computed_tokens: int = 0  # tokens already computed before this step
 
 @dataclass
 class StepTrace:
@@ -152,6 +153,31 @@ def trace_vllm(model_path, workload, n_warmup_requests=3):
     torch.cuda.synchronize()
     print("  vLLM warmup complete")
 
+    # Monkey-patch vLLM V1 scheduler to capture per-request token counts.
+    # Without this, chunked prefill steps (where vLLM splits a long prompt
+    # across multiple steps) are misclassified.
+    _step_scheduled = {}  # request_id -> num_tokens_scheduled_this_step
+    _has_sched_hook = False
+    try:
+        ec = llm.llm_engine.engine_core
+        _sched = getattr(ec, 'scheduler', None)
+        if _sched is None:
+            # InprocClient wraps EngineCore
+            _sched = getattr(getattr(ec, 'engine_core', None),
+                             'scheduler', None)
+        if _sched is not None:
+            _orig_schedule = _sched.schedule
+            def _capturing_schedule():
+                result = _orig_schedule()
+                _step_scheduled.clear()
+                if hasattr(result, 'num_scheduled_tokens'):
+                    _step_scheduled.update(result.num_scheduled_tokens)
+                return result
+            _sched.schedule = _capturing_schedule
+            _has_sched_hook = True
+    except AttributeError:
+        pass
+
     # Build request lookup
     req_lookup = {r.request_id: r for r in workload}
     pending = list(workload)  # requests not yet submitted
@@ -197,8 +223,25 @@ def trace_vllm(model_path, workload, n_warmup_requests=3):
         prefill_infos = []
         output_tokens = {}
 
-        # Determine which requests were active this step by checking
-        # what tokens they produced
+        # (1) Handle intermediate prefill chunks invisible in step_outputs.
+        #     In vLLM V1, intermediate chunks (no output token yet) don't
+        #     produce RequestOutput.  The scheduler hook tells us they ran.
+        output_rids = {out.request_id for out in step_outputs}
+        if _has_sched_hook:
+            for rid, n_tok in _step_scheduled.items():
+                if (rid in active_reqs and rid not in output_rids
+                        and not rid.startswith("warmup_")):
+                    info = active_reqs[rid]
+                    if info['num_computed'] < info['prompt_len']:
+                        prefill_infos.append(PrefillInfo(
+                            request_id=rid,
+                            prompt_token_ids=info['prompt_token_ids'],
+                            num_scheduled_tokens=n_tok,
+                            num_computed_tokens=info['num_computed'],
+                        ))
+                        info['num_computed'] += n_tok
+
+        # (2) Process visible step_outputs
         for out in step_outputs:
             rid = out.request_id
             if rid.startswith("warmup_") or rid not in active_reqs:
@@ -211,16 +254,21 @@ def trace_vllm(model_path, workload, n_warmup_requests=3):
             prev_output_len = len(info['output_tokens'])
             curr_output_len = len(new_token_ids)
 
-            if prev_output_len == 0 and info['num_computed'] == 0:
-                # This was a prefill step — prompt was just computed
+            if info['num_computed'] < info['prompt_len']:
+                # Prefill step (final chunk, or full prompt if no chunking).
+                # Use scheduler chunk size when available; otherwise the
+                # remaining prompt tokens.
+                chunk_size = _step_scheduled.get(
+                    rid, info['prompt_len'] - info['num_computed'])
                 prefill_infos.append(PrefillInfo(
                     request_id=rid,
                     prompt_token_ids=info['prompt_token_ids'],
-                    num_scheduled_tokens=info['prompt_len'],
+                    num_scheduled_tokens=chunk_size,
+                    num_computed_tokens=info['num_computed'],
                 ))
-                info['num_computed'] = info['prompt_len']
+                info['num_computed'] += chunk_size
 
-                # First output token (from prefill)
+                # First output token (from final prefill chunk)
                 if curr_output_len > 0:
                     info['output_tokens'] = list(new_token_ids)
                     output_tokens[rid] = new_token_ids[-1]
@@ -335,17 +383,6 @@ def replay_on_custom(engine, traces, n_warmup=3, n_trials=5,
             # Mixed step — needs piecewise graph keyed by total tokens
             mixed_total_sizes.add(total)
 
-    # Also capture piecewise graphs for scattered-decode steps
-    # (decode_step requires contiguous [:B]; scattered slots fall through
-    # to mixed_step which will use piecewise if available)
-    for step in traces:
-        nd = len(step.decode_requests)
-        np_ = len(step.prefill_requests)
-        if nd > 0 and np_ == 0:
-            # Check if slots are contiguous — if not, mixed_step handles it
-            # We'll just ensure piecewise covers all decode-only totals too
-            mixed_total_sizes.add(nd)
-
     compile_str = " + torch.compile" if use_compile else ""
     # Capture CUDA graphs — use inference_mode to handle tensors from
     # vLLM's cleanup (may be left in inference-mode state)
@@ -384,137 +421,150 @@ def replay_on_custom(engine, traces, n_warmup=3, n_trials=5,
     # Use inference_mode for entire replay — CUDA graph static buffers
     # created during capture are inference tensors, must be updated
     # inside inference_mode
-    inference_ctx = torch.inference_mode()
-    inference_ctx.__enter__()
+    with torch.inference_mode():
+        for trial in range(n_warmup + n_trials):
+            engine.reset()
+            is_timed = trial >= n_warmup
 
-    for trial in range(n_warmup + n_trials):
-        engine.reset()
-        is_timed = trial >= n_warmup
+            for step_i, step in enumerate(traces):
+                nd = len(step.decode_requests)
+                np_ = len(step.prefill_requests)
 
-        for step_i, step in enumerate(traces):
-            nd = len(step.decode_requests)
-            np_ = len(step.prefill_requests)
+                # Build common data
+                decode_seq_ids = [req_to_slot[d['request_id']]
+                                  for d in step.decode_requests]
+                prefill_seq_ids = [req_to_slot[p['request_id']]
+                                   for p in step.prefill_requests]
 
-            # Build common data
-            decode_seq_ids = [req_to_slot[d['request_id']]
-                              for d in step.decode_requests]
-            prefill_seq_ids = [req_to_slot[p['request_id']]
-                               for p in step.prefill_requests]
-
-            if is_timed:
-                start_evt.record()
-
-            if nd > 0 and np_ == 0:
-                # Pure decode — use existing CUDA-graphed decode_step
-                # Need contiguous batch indices 0..D-1 for decode_step
-                # Remap to slot positions
-                tokens = torch.tensor(
-                    [d['token_id'] for d in step.decode_requests],
-                    device="cuda")
-                positions = torch.tensor(
-                    [engine._seq_lens_cpu[sid].item() for sid in decode_seq_ids],
-                    dtype=torch.int32, device="cuda")
-
-                # decode_step expects contiguous slots [:B], but our slots
-                # may be scattered. Use mixed_step for scattered slots.
-                if decode_seq_ids == list(range(nd)):
-                    logits = engine.decode_step(tokens, positions)
-                    # logits is [D, vocab]
-                else:
-                    decode_tokens = tokens
-                    logits = engine.mixed_step(
-                        decode_seq_ids, decode_tokens, [], [])
-
-            elif nd == 0 and np_ == 1:
-                # Pure single prefill — use prefill_to_slot
-                p = step.prefill_requests[0]
-                sid = prefill_seq_ids[0]
-                toks = p['prompt_token_ids'][:p['num_scheduled_tokens']]
-                input_ids = torch.tensor(toks, device="cuda")
-                logits = engine.prefill_to_slot(sid, input_ids)
-
-            elif nd == 0 and np_ > 1:
-                # Pure multi-prefill — unified path (same or variable length)
-                prefill_input_ids = []
-                for p in step.prefill_requests:
-                    toks = p['prompt_token_ids'][:p['num_scheduled_tokens']]
-                    prefill_input_ids.append(
-                        torch.tensor(toks, device="cuda"))
-                logits = engine.prefill_batch_to_slots(
-                    prefill_seq_ids, prefill_input_ids)
-
-            else:
-                # Mixed decode+prefill — use mixed_step
-                decode_token_list = [d['token_id']
-                                     for d in step.decode_requests]
-                decode_tokens = torch.tensor(decode_token_list, device="cuda")
-                prefill_input_ids = []
-                for p in step.prefill_requests:
-                    toks = p['prompt_token_ids'][:p['num_scheduled_tokens']]
-                    prefill_input_ids.append(
-                        torch.tensor(toks, device="cuda"))
-
-                logits = engine.mixed_step(
-                    decode_seq_ids, decode_tokens,
-                    prefill_seq_ids, prefill_input_ids)
-
-            if is_timed:
-                end_evt.record()
-                torch.cuda.synchronize()
-                all_latencies[step_i].append(start_evt.elapsed_time(end_evt))
-
-            # Correctness check (only on first timed trial)
-            if trial == n_warmup:
-                step_correctness = {}
+                if is_timed:
+                    start_evt.record()
 
                 if nd > 0 and np_ == 0:
-                    # Pure decode: logits is [D, vocab]
-                    for i, d in enumerate(step.decode_requests):
-                        custom_top1 = logits[i].argmax(dim=-1).item()
-                        vllm_tok = step.vllm_output_tokens.get(
-                            d['request_id'])
-                        match = (custom_top1 == vllm_tok
-                                 if vllm_tok is not None else None)
-                        step_correctness[d['request_id']] = (
-                            custom_top1, vllm_tok, match)
+                    # Pure decode — use existing CUDA-graphed decode_step
+                    # Need contiguous batch indices 0..D-1 for decode_step
+                    # Remap to slot positions
+                    tokens = torch.tensor(
+                        [d['token_id'] for d in step.decode_requests],
+                        device="cuda")
+                    positions = torch.tensor(
+                        [engine._seq_lens_cpu[sid].item()
+                         for sid in decode_seq_ids],
+                        dtype=torch.int32, device="cuda")
+
+                    # decode_step expects contiguous slots [:B], but our
+                    # slots may be scattered. Use mixed_step for scattered.
+                    if decode_seq_ids == list(range(nd)):
+                        logits = engine.decode_step(tokens, positions)
+                        # logits is [D, vocab]
+                    else:
+                        decode_tokens = tokens
+                        logits = engine.mixed_step(
+                            decode_seq_ids, decode_tokens, [], [])
 
                 elif nd == 0 and np_ == 1:
-                    # Pure prefill: logits is [S, vocab]
+                    # Pure single prefill — use prefill_to_slot
                     p = step.prefill_requests[0]
-                    custom_top1 = logits[-1].argmax(dim=-1).item()
-                    vllm_tok = step.vllm_output_tokens.get(p['request_id'])
-                    match = (custom_top1 == vllm_tok
-                             if vllm_tok is not None else None)
-                    step_correctness[p['request_id']] = (
-                        custom_top1, vllm_tok, match)
+                    sid = prefill_seq_ids[0]
+                    off = p.get('num_computed_tokens', 0)
+                    toks = p['prompt_token_ids'][
+                        off:off + p['num_scheduled_tokens']]
+                    input_ids = torch.tensor(toks, device="cuda")
+                    logits = engine.prefill_to_slot(sid, input_ids)
+
+                elif nd == 0 and np_ > 1:
+                    # Pure multi-prefill — unified path
+                    prefill_input_ids = []
+                    for p in step.prefill_requests:
+                        off = p.get('num_computed_tokens', 0)
+                        toks = p['prompt_token_ids'][
+                            off:off + p['num_scheduled_tokens']]
+                        prefill_input_ids.append(
+                            torch.tensor(toks, device="cuda"))
+                    logits = engine.prefill_batch_to_slots(
+                        prefill_seq_ids, prefill_input_ids)
 
                 else:
-                    # Mixed: logits is [N_total, vocab]
-                    for i, d in enumerate(step.decode_requests):
-                        custom_top1 = logits[i].argmax(dim=-1).item()
-                        vllm_tok = step.vllm_output_tokens.get(
-                            d['request_id'])
-                        match = (custom_top1 == vllm_tok
-                                 if vllm_tok is not None else None)
-                        step_correctness[d['request_id']] = (
-                            custom_top1, vllm_tok, match)
-
-                    offset = nd
+                    # Mixed decode+prefill — use mixed_step
+                    decode_token_list = [d['token_id']
+                                         for d in step.decode_requests]
+                    decode_tokens = torch.tensor(
+                        decode_token_list, device="cuda")
+                    prefill_input_ids = []
                     for p in step.prefill_requests:
-                        n_tok = p['num_scheduled_tokens']
-                        last_logit = logits[offset + n_tok - 1]
-                        custom_top1 = last_logit.argmax(dim=-1).item()
+                        off = p.get('num_computed_tokens', 0)
+                        toks = p['prompt_token_ids'][
+                            off:off + p['num_scheduled_tokens']]
+                        prefill_input_ids.append(
+                            torch.tensor(toks, device="cuda"))
+
+                    logits = engine.mixed_step(
+                        decode_seq_ids, decode_tokens,
+                        prefill_seq_ids, prefill_input_ids)
+
+                if is_timed:
+                    end_evt.record()
+                    torch.cuda.synchronize()
+                    all_latencies[step_i].append(
+                        start_evt.elapsed_time(end_evt))
+
+                # Correctness check (only on first timed trial)
+                if trial == n_warmup:
+                    step_correctness = {}
+
+                    if nd > 0 and np_ == 0:
+                        # Pure decode: logits is [D, vocab]
+                        for i, d in enumerate(step.decode_requests):
+                            custom_top1 = logits[i].argmax(
+                                dim=-1).item()
+                            vllm_tok = step.vllm_output_tokens.get(
+                                d['request_id'])
+                            match = (custom_top1 == vllm_tok
+                                     if vllm_tok is not None
+                                     else None)
+                            step_correctness[d['request_id']] = (
+                                custom_top1, vllm_tok, match)
+
+                    elif nd == 0 and np_ == 1:
+                        # Pure prefill: logits is [S, vocab]
+                        p = step.prefill_requests[0]
+                        custom_top1 = logits[-1].argmax(
+                            dim=-1).item()
                         vllm_tok = step.vllm_output_tokens.get(
                             p['request_id'])
                         match = (custom_top1 == vllm_tok
                                  if vllm_tok is not None else None)
                         step_correctness[p['request_id']] = (
                             custom_top1, vllm_tok, match)
-                        offset += n_tok
 
-                correctness[step_i] = step_correctness
+                    else:
+                        # Mixed: logits is [N_total, vocab]
+                        for i, d in enumerate(step.decode_requests):
+                            custom_top1 = logits[i].argmax(
+                                dim=-1).item()
+                            vllm_tok = step.vllm_output_tokens.get(
+                                d['request_id'])
+                            match = (custom_top1 == vllm_tok
+                                     if vllm_tok is not None
+                                     else None)
+                            step_correctness[d['request_id']] = (
+                                custom_top1, vllm_tok, match)
 
-    inference_ctx.__exit__(None, None, None)
+                        offset = nd
+                        for p in step.prefill_requests:
+                            n_tok = p['num_scheduled_tokens']
+                            last_logit = logits[offset + n_tok - 1]
+                            custom_top1 = last_logit.argmax(
+                                dim=-1).item()
+                            vllm_tok = step.vllm_output_tokens.get(
+                                p['request_id'])
+                            match = (custom_top1 == vllm_tok
+                                     if vllm_tok is not None
+                                     else None)
+                            step_correctness[p['request_id']] = (
+                                custom_top1, vllm_tok, match)
+                            offset += n_tok
+
+                    correctness[step_i] = step_correctness
 
     # Compute median latencies
     median_latencies = []

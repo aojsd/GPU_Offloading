@@ -146,8 +146,10 @@ def vllm_greedy_generate(llm, prompt_ids, max_new_tokens):
 def _time_custom_decode_once(engine, target_seq_len, n_steps, n_warmup):
     """Single trial: time n_steps CUDA-graph decode steps. Returns ms/step."""
     engine.reset()
-    engine.k_cache.normal_(0, 0.01)
-    engine.v_cache.normal_(0, 0.01)
+    for kc in engine.k_cache:
+        kc.normal_(0, 0.01)
+    for vc in engine.v_cache:
+        vc.normal_(0, 0.01)
     engine.seq_lens[0] = target_seq_len
     engine._seq_lens_cpu[0] = target_seq_len
 
@@ -780,8 +782,8 @@ def test_piecewise_graphed_vs_eager(model_dir):
                      [1], [prompt])
 
     seq_lens_snap = engine._seq_lens_cpu[:2].clone()
-    k_snap = engine.k_cache.clone()
-    v_snap = engine.v_cache.clone()
+    k_snap = [kc.clone() for kc in engine.k_cache]
+    v_snap = [vc.clone() for vc in engine.v_cache]
 
     # Eager mixed step
     decode_tok = torch.tensor([engine.lm_head.shape[0] - 1], device="cuda",
@@ -794,8 +796,10 @@ def test_piecewise_graphed_vs_eager(model_dir):
     # Restore state and run graphed
     engine._seq_lens_cpu[:2] = seq_lens_snap
     engine.seq_lens[:2] = seq_lens_snap.to("cuda")
-    engine.k_cache.copy_(k_snap)
-    engine.v_cache.copy_(v_snap)
+    for kc, ks in zip(engine.k_cache, k_snap):
+        kc.copy_(ks)
+    for vc, vs in zip(engine.v_cache, v_snap):
+        vc.copy_(vs)
 
     graph_logits = engine.mixed_step([0], decode_tok, [1], [prefill_ids])
 
@@ -867,8 +871,8 @@ def test_piecewise_multi_step(model_dir):
                      [1], [prompt])
 
     seq_lens_snap = engine._seq_lens_cpu[:2].clone()
-    k_snap = engine.k_cache.clone()
-    v_snap = engine.v_cache.clone()
+    k_snap = [kc.clone() for kc in engine.k_cache]
+    v_snap = [vc.clone() for vc in engine.v_cache]
     seq_lens_gpu_snap = engine.seq_lens[:2].clone()
 
     # Eager: 5 decode steps
@@ -882,8 +886,10 @@ def test_piecewise_multi_step(model_dir):
     # Restore and run graphed
     engine._seq_lens_cpu[:2] = seq_lens_snap
     engine.seq_lens[:2] = seq_lens_gpu_snap
-    engine.k_cache.copy_(k_snap)
-    engine.v_cache.copy_(v_snap)
+    for kc, ks in zip(engine.k_cache, k_snap):
+        kc.copy_(ks)
+    for vc, vs in zip(engine.v_cache, v_snap):
+        vc.copy_(vs)
 
     graph_generated = []
     next_toks = torch.tensor([100, 200], device="cuda", dtype=torch.long)
@@ -1005,6 +1011,7 @@ def cmd_decode(args):
             max_model_len=4096,
             gpu_memory_utilization=0.95,
             dtype="bfloat16",
+            enable_prefix_caching=False,
         )
 
         sp_warmup = SamplingParams(max_tokens=10, temperature=0)

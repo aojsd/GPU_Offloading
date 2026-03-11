@@ -1381,6 +1381,10 @@ class MoEEngine:
                 self.offload_engine.process_layer(
                     layer, buf['topk_ids_buf'], C,
                     router_input_buf=buf['moe_input_buf'])
+                if self.trace_recorder:
+                    self.trace_recorder.process_layer(
+                        layer, buf['topk_ids_buf'], C,
+                        router_input_buf=buf['moe_input_buf'])
             elif self.trace_recorder:
                 self.trace_recorder.process_layer(
                     layer, buf['topk_ids_buf'], C,
@@ -1391,6 +1395,8 @@ class MoEEngine:
 
             if _controller:
                 _controller.post_layer(layer)
+            if self.offload_engine and _controller is not self.offload_engine:
+                self.offload_engine.post_layer(layer)
 
         # ── 8. Final norm + lm_head ──
         last_buf = _buf(self.num_layers - 1)
@@ -2362,6 +2368,8 @@ class MoEEngine:
             _pt.step_start()
         if _controller:
             _controller.begin_step()
+        if self.offload_engine and _controller is not self.offload_engine:
+            self.offload_engine.begin_step()
         D = len(decode_seq_ids)
         prefill_lengths = [ids.shape[0] for ids in prefill_input_ids]
         cont_lengths = [ids.shape[0] for ids in continuation_input_ids]
@@ -2709,6 +2717,10 @@ class MoEEngine:
                 self.offload_engine.process_layer(
                     layer, buf['topk_ids_buf'], N_actual,
                     router_input_buf=buf['moe_input_buf'])
+                if self.trace_recorder:
+                    self.trace_recorder.process_layer(
+                        layer, buf['topk_ids_buf'], N_actual,
+                        router_input_buf=buf['moe_input_buf'])
             elif self.trace_recorder:
                 self.trace_recorder.process_layer(
                     layer, buf['topk_ids_buf'], N_actual,
@@ -2738,6 +2750,8 @@ class MoEEngine:
             # Clean up after MoE computation
             if _controller:
                 _controller.post_layer(layer)
+            if self.offload_engine and _controller is not self.offload_engine:
+                self.offload_engine.post_layer(layer)
             if _nvtx: torch.cuda.nvtx.range_pop()  # layer_N
 
         # ── 8. Final norm + lm_head (on last GPU for PP) ──

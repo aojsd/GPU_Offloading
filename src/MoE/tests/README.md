@@ -87,6 +87,44 @@ Four tests: (1) PP=2 logits match single-GPU offloaded, (2) performance
 vs single-GPU baseline, (3) trace collection produces valid structure,
 (4) memory allocation across GPUs.
 
+#### `test_gpu_integration.py` — End-to-end batched collection & replay (10 tests)
+
+Full-pipeline GPU tests for `collect_batched()` continuous batching,
+`Scheduler.collect()` trace collection, policy simulation, and offloaded
+replay with real PCIe expert swapping. Model-agnostic — works with OLMoE
+(single GPU), Mixtral PP=2, or Mixtral with `--experts-per-layer`.
+
+| Test | What's verified |
+|------|-----------------|
+| 1. Single conversation | Chunked prefill + decode produces tokens |
+| 2. Multi no-preempt | Multiple conversations complete without preemption |
+| 3. Preemption | LIFO preemption + recompute prefill under memory pressure |
+| 4. Page invariant | `pages_used == sum(ceil(seq_len/page_size))` every step |
+| 5. Seq-len consistency | `active_state.seq_len` matches token count exactly |
+| 6. EOS termination | Conversation stops early when model emits EOS |
+| 7. Replay faithfulness (no preempt) | Collect → serialize → reload → replay: routing & tokens match |
+| 8. Replay faithfulness (preempt) | Same as 7 with 12 convs, 15 preemptions |
+| 9. Full pipeline (no preempt) | Collect → LRU-Oracle simulation → offloaded replay with ReplayController |
+| 10. Full pipeline (preempt) | Same as 9 with preemptions and real PCIe expert swapping |
+
+```bash
+# OLMoE single GPU (~2 min)
+python tests/test_gpu_integration.py --model models/OLMoE-1B-7B
+
+# Mixtral PP=2 (2x H100, ~5 min)
+python tests/test_gpu_integration.py --model models/Mixtral-8x7B --pp 2
+
+# Mixtral single GPU with expert offloading
+python tests/test_gpu_integration.py --model models/Mixtral-8x7B --experts-per-layer 4
+```
+
+| Arg | Default | Description |
+|-----|---------|-------------|
+| `--model` | `models/OLMoE-1B-7B` | Path to model directory |
+| `--pp` | 1 | Pipeline parallel size (1 or 2) |
+| `--experts-per-layer` | None | Keep K experts/layer on GPU (mutually exclusive with `--pp > 1`) |
+| `--no-compile` | off | Disable torch.compile |
+
 ### GPU verification (standalone scripts)
 
 #### `verify_expert_residency.py` — Demand loading validation

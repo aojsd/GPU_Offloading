@@ -11,6 +11,9 @@ Usage:
 
     # PP=2 Mixtral-8x7B (full 32 layers, 2x H100, ~5 min)
     python tests/test_gpu_integration.py --model models/Mixtral-8x7B --pp 2
+
+    # Single-GPU Mixtral with expert offloading (K experts/layer on GPU)
+    python tests/test_gpu_integration.py --model models/Mixtral-8x7B --experts-per-layer 4
 """
 import argparse
 import math
@@ -903,15 +906,25 @@ def main():
                         help="Pipeline parallel size (1 or 2)")
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile (not recommended)")
+    parser.add_argument("--experts-per-layer", type=int, default=None,
+                        help="Expert offloading: keep K experts/layer on GPU "
+                             "(enables single-GPU Mixtral)")
     args = parser.parse_args()
 
     model = args.model
     pp = args.pp
+    epl = args.experts_per_layer
     use_compile = not args.no_compile
     page_size = 16
 
+    if epl is not None and pp > 1:
+        print("ERROR: --experts-per-layer and --pp > 1 are mutually exclusive")
+        return 1
+
     print(f"Model: {model}")
     print(f"PP size: {pp}")
+    if epl is not None:
+        print(f"experts_per_layer: {epl}")
     print(f"torch.compile: {use_compile}")
 
     # Engine config: generous budget for tests 1-2, tight for tests 3-5
@@ -927,6 +940,13 @@ def main():
 
     graph_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512]
 
+    # Engine kwargs: either PP or experts_per_layer (mutually exclusive)
+    engine_mode_kwargs = {}
+    if epl is not None:
+        engine_mode_kwargs['experts_per_layer'] = epl
+    else:
+        engine_mode_kwargs['pipeline_parallel_size'] = pp
+
     # ── Create engine (generous budget first for tests 1-2) ──
     print("\n" + "=" * 60)
     print("Creating engine (generous budget)...")
@@ -934,8 +954,7 @@ def main():
     engine = MoEEngine(
         model, max_seqs=max_seqs, max_seq_len=max_seq_len,
         page_size=page_size, use_torch_compile=use_compile,
-        pipeline_parallel_size=pp,
-        kv_page_budget=generous_budget)
+        kv_page_budget=generous_budget, **engine_mode_kwargs)
     print(f"Engine created in {time.time() - t0:.1f}s")
 
     print("Capturing CUDA graphs...")
@@ -979,8 +998,7 @@ def main():
     engine = MoEEngine(
         model, max_seqs=max_seqs, max_seq_len=max_seq_len,
         page_size=page_size, use_torch_compile=use_compile,
-        pipeline_parallel_size=pp,
-        kv_page_budget=tight_budget)
+        kv_page_budget=tight_budget, **engine_mode_kwargs)
     print(f"Engine created in {time.time() - t0:.1f}s")
 
     print("Capturing CUDA graphs...")

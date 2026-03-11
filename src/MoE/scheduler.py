@@ -793,7 +793,7 @@ class Scheduler:
 
         # Determine step count and scheduling source
         if controller is not None:
-            total_steps = n_steps or len(controller._trace.steps)
+            total_steps = n_steps or len(controller.trace.steps)
             def get_sched(s):
                 return controller.get_step_scheduling(s)
         else:

@@ -3,6 +3,8 @@
 Subcommands:
     decode      Correctness + decode performance vs vLLM
     prefill     Prefill performance (graph, compile+graph) vs vLLM
+    pp-decode   Pipeline-parallel decode performance vs vLLM (requires N GPUs)
+    pp-prefill  Pipeline-parallel prefill performance vs vLLM (requires N GPUs)
     cuda-graph  CUDA graph correctness (eager vs graph exact match) + timing
     mixed       mixed_step smoke tests (pure decode, pure prefill, mixed, multi-batch)
     all         Run all benchmarks
@@ -10,6 +12,8 @@ Subcommands:
 Usage:
     VLLM_ENABLE_V1_MULTIPROCESSING=0 python tests/vLLM_comparison/microbenchmark.py decode
     VLLM_ENABLE_V1_MULTIPROCESSING=0 python tests/vLLM_comparison/microbenchmark.py prefill --skip-vllm
+    VLLM_ENABLE_V1_MULTIPROCESSING=0 python tests/vLLM_comparison/microbenchmark.py pp-decode --pp 2
+    VLLM_ENABLE_V1_MULTIPROCESSING=0 python tests/vLLM_comparison/microbenchmark.py pp-prefill --pp 2
     python tests/vLLM_comparison/microbenchmark.py cuda-graph
     python tests/vLLM_comparison/microbenchmark.py mixed
     python tests/vLLM_comparison/microbenchmark.py all
@@ -1262,6 +1266,406 @@ def cmd_mixed(args):
 
 
 # =====================================================================
+#  Pipeline-parallel helpers
+# =====================================================================
+
+def _pp_seq_lens_ref(engine):
+    """Return the seq_lens tensor for reading (GPU 0 copy when PP)."""
+    return engine.seq_lens[0] if engine.pp_size > 1 else engine.seq_lens
+
+
+def _pp_set_seq_lens(engine, idx, val):
+    """Set seq_lens[idx] across all GPU replicas (and CPU mirror)."""
+    engine._seq_lens_cpu[idx] = val
+    if engine.pp_size > 1:
+        for sl in engine.seq_lens:
+            sl[idx] = val
+    else:
+        engine.seq_lens[idx] = val
+
+
+def _time_pp_decode_once(engine, target_seq_len, n_steps, n_warmup):
+    """Single trial: time n_steps piecewise decode steps for a PP engine.
+
+    Uses mixed_step (piecewise graphs) which is the correct decode path
+    for pipeline-parallel engines.
+    """
+    engine.reset()
+    engine.fill_kv_random(std=0.01)
+    _pp_set_seq_lens(engine, 0, target_seq_len)
+
+    token = torch.tensor([100], device="cuda")
+
+    for _ in range(n_warmup):
+        _pp_set_seq_lens(engine, 0, target_seq_len)
+        engine.mixed_step([0], token, [], [])
+    # Sync all devices
+    for d in (engine.pp_devices or [torch.device("cuda")]):
+        torch.cuda.synchronize(d)
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(n_steps):
+        _pp_set_seq_lens(engine, 0, target_seq_len)
+        engine.mixed_step([0], token, [], [])
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / n_steps
+
+
+def time_pp_decode(engine, target_seq_len, n_steps, n_warmup, n_trials):
+    """Time PP decode steps over multiple trials."""
+    trials = [_time_pp_decode_once(engine, target_seq_len, n_steps, n_warmup)
+              for _ in range(n_trials)]
+    return statistics.median(trials), trials
+
+
+def pp_custom_greedy_generate(engine, prompt_ids, max_new_tokens):
+    """Run greedy generation with PP-aware custom engine.
+
+    Uses prefill_to_slot (routes through mixed_step for PP) instead of
+    engine.prefill() which requires flat prefill graphs not available for PP.
+    """
+    engine.reset()
+    prompt_t = torch.tensor(prompt_ids, device="cuda")
+    logits = engine.prefill_to_slot(0, prompt_t)
+    next_token = logits[-1, :].argmax().item()
+    tokens = [next_token]
+
+    for _ in range(max_new_tokens - 1):
+        token_t = torch.tensor([next_token], device="cuda")
+        step_logits = engine.mixed_step([0], token_t, [], [])
+        next_token = step_logits[0].argmax().item()
+        tokens.append(next_token)
+        if next_token == engine.eos_token_id:
+            break
+
+    return tokens
+
+
+@torch.inference_mode()
+def benchmark_pp_prefill_custom(engine, seq_lens, use_torch_compile=False):
+    """Benchmark PP custom engine prefill with piecewise CUDA graphs."""
+    engine.reset()
+    engine.capture_mixed_cuda_graphs(
+        total_token_sizes=seq_lens, use_torch_compile=use_torch_compile)
+
+    results = {}
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt = torch.cuda.Event(enable_timing=True)
+
+    for seq_len in seq_lens:
+        input_ids = torch.randint(1, 1000, (1, seq_len), device="cuda")
+
+        for _ in range(PREFILL_N_WARMUP):
+            engine.reset()
+            engine.prefill_to_slot(0, input_ids.squeeze(0))
+        for d in (engine.pp_devices or [torch.device("cuda")]):
+            torch.cuda.synchronize(d)
+
+        times = []
+        for _ in range(PREFILL_N_TRIALS):
+            engine.reset()
+            start_evt.record()
+            engine.prefill_to_slot(0, input_ids.squeeze(0))
+            end_evt.record()
+            torch.cuda.synchronize()
+            times.append(start_evt.elapsed_time(end_evt))
+
+        median_ms = sorted(times)[PREFILL_N_TRIALS // 2]
+        results[seq_len] = median_ms
+        print(f"  seq_len={seq_len:>5d}  batch=1  "
+              f"median={median_ms:.2f}ms  (all: {', '.join(f'{t:.2f}' for t in times)})")
+
+    return results
+
+
+# =====================================================================
+#  Subcommand: pp-decode
+# =====================================================================
+
+def cmd_pp_decode(args):
+    pp_size = args.pp
+    n_gpus = torch.cuda.device_count()
+    if n_gpus < pp_size:
+        print(f"ERROR: PP={pp_size} requires {pp_size} GPUs, found {n_gpus}")
+        return
+
+    run_correctness = not args.perf_only
+    run_perf = not args.correctness_only
+    run_custom = not args.vllm_only
+    run_vllm = not args.custom_only
+
+    correctness_prompts = _make_correctness_prompts(args.model)
+    seq_lens = [s for s in PERF_SEQ_LENS if s <= args.max_seq]
+
+    custom_tokens = {}
+    vllm_tokens = {}
+    custom_perf = {}
+    vllm_perf = {}
+
+    if run_custom:
+        print("=" * 70)
+        print(f"CUSTOM ENGINE (PP={pp_size})")
+        print("=" * 70)
+
+        max_needed = max(seq_lens) + 256 if run_perf else 1024
+        engine = MoEEngine(
+            args.model, max_seqs=1, max_seq_len=max_needed,
+            use_torch_compile=True,
+            pipeline_parallel_size=pp_size)
+
+        with torch.inference_mode():
+            # Capture piecewise graphs (decode goes through mixed_step for PP)
+            engine.capture_mixed_cuda_graphs(
+                total_token_sizes=[1, 128, 256],
+                use_torch_compile=True)
+
+            # Warmup (use PP-compatible path: prefill_to_slot + mixed_step)
+            pp_custom_greedy_generate(engine, [100, 200, 300, 400], 5)
+            for d in engine.pp_devices:
+                torch.cuda.synchronize(d)
+            print("Warmup complete\n")
+
+            if run_correctness:
+                print("── Correctness (greedy generation) ──")
+                for i, prompt in enumerate(correctness_prompts):
+                    tokens = pp_custom_greedy_generate(engine, prompt, MAX_NEW_TOKENS)
+                    custom_tokens[i] = tokens
+                    print(f"  Prompt {i}: {len(tokens)} tokens generated")
+                print()
+
+            if run_perf:
+                print(f"── Performance (batch=1, {args.n_steps} steps/trial, "
+                      f"{args.n_trials} trials, {N_WARMUP} warmup, PP={pp_size}) ──")
+                print(f"{'seq_len':>10s}  {'median':>8s}  {'stdev':>8s}  {'tok/s':>8s}")
+                print("-" * 40)
+                for sl in seq_lens:
+                    med, trials = time_pp_decode(
+                        engine, sl, args.n_steps, N_WARMUP, args.n_trials)
+                    custom_perf[sl] = med
+                    std = statistics.stdev(trials) if len(trials) > 1 else 0
+                    print(f"{sl:>10,d}  {med:>8.2f}  {std:>7.3f}  {1000/med:>8.0f}")
+                print()
+
+        del engine
+        torch.cuda.empty_cache()
+
+    if run_vllm:
+        print("=" * 70)
+        print(f"vLLM (PP={pp_size})")
+        print("=" * 70)
+
+        from vllm import LLM, SamplingParams
+
+        llm = LLM(
+            model=args.model,
+            max_model_len=4096,
+            max_num_seqs=64,
+            gpu_memory_utilization=0.95,
+            dtype="bfloat16",
+            enable_prefix_caching=False,
+            pipeline_parallel_size=pp_size,
+            disable_log_stats=True,
+        )
+
+        sp_warmup = SamplingParams(max_tokens=10, temperature=0)
+        for j in range(3):
+            warmup_ids = torch.randint(1, 1000, (256,)).tolist()
+            llm.generate([{"prompt_token_ids": warmup_ids}],
+                         sampling_params=sp_warmup)
+        torch.cuda.synchronize()
+        print("Warmup complete\n")
+
+        if run_correctness:
+            print("── Correctness (greedy generation) ──")
+            for i, prompt in enumerate(correctness_prompts):
+                tokens, _ = vllm_greedy_generate(llm, prompt, MAX_NEW_TOKENS)
+                vllm_tokens[i] = tokens
+                print(f"  Prompt {i}: {len(tokens)} tokens generated")
+            print()
+
+        if run_perf:
+            print(f"── Performance (batch=1, {args.n_steps} steps/trial, "
+                  f"{args.n_trials} trials, {N_WARMUP} warmup, PP={pp_size}) ──")
+            print(f"{'seq_len':>10s}  {'median':>8s}  {'stdev':>8s}  {'tok/s':>8s}")
+            print("-" * 40)
+            for sl in seq_lens:
+                med, trials = time_vllm_decode(
+                    llm, sl, args.n_steps, N_WARMUP, args.n_trials)
+                vllm_perf[sl] = med
+                std = statistics.stdev(trials) if len(trials) > 1 else 0
+                print(f"{sl:>10,d}  {med:>8.2f}  {std:>7.3f}  {1000/med:>8.0f}")
+            print()
+
+        del llm
+        torch.cuda.empty_cache()
+
+    # Combined results
+    print("\n" + "=" * 70)
+    print(f"COMPARISON (PP={pp_size})")
+    print("=" * 70)
+
+    if run_correctness and custom_tokens and vllm_tokens:
+        print("\n── Correctness ──")
+        for i in sorted(set(custom_tokens) & set(vllm_tokens)):
+            ct = custom_tokens[i]
+            vt = vllm_tokens[i]
+            min_len = min(len(ct), len(vt))
+            match_len = sum(1 for a, b in zip(ct, vt) if a == b)
+            if ct[:min_len] == vt[:min_len]:
+                print(f"  Prompt {i}: EXACT MATCH — all {min_len} tokens identical")
+            else:
+                first_diff = next(j for j in range(min_len) if ct[j] != vt[j])
+                print(f"  Prompt {i}: diverges at token {first_diff}/{min_len}")
+
+    if run_perf and custom_perf and vllm_perf:
+        print(f"\n── Performance (ms/step, batch=1, PP={pp_size}) ──")
+        print(f"{'seq_len':>10s}  {'Custom':>10s}  {'vLLM':>10s}  {'Speedup':>10s}")
+        print("-" * 45)
+        for sl in seq_lens:
+            c = custom_perf.get(sl)
+            v = vllm_perf.get(sl)
+            if c is not None and v is not None:
+                print(f"{sl:>10,d}  {c:>10.2f}  {v:>10.2f}  {v/c:>9.2f}x")
+            elif c is not None:
+                print(f"{sl:>10,d}  {c:>10.2f}  {'—':>10s}  {'—':>10s}")
+            elif v is not None:
+                print(f"{sl:>10,d}  {'—':>10s}  {v:>10.2f}  {'—':>10s}")
+
+    print()
+
+
+# =====================================================================
+#  Subcommand: pp-prefill
+# =====================================================================
+
+def cmd_pp_prefill(args):
+    pp_size = args.pp
+    n_gpus = torch.cuda.device_count()
+    if n_gpus < pp_size:
+        print(f"ERROR: PP={pp_size} requires {pp_size} GPUs, found {n_gpus}")
+        return
+
+    print("=" * 80)
+    print(f"  PP PREFILL BENCHMARK: Custom (piecewise, compile+graph) vs vLLM (PP={pp_size})")
+    print("=" * 80)
+
+    # Custom: piecewise graphs (no compile)
+    print(f"\n── Custom Engine Prefill (piecewise graph, no compile, PP={pp_size}) ──")
+    engine = MoEEngine(
+        args.model, max_seqs=4, max_seq_len=4096,
+        use_torch_compile=False,
+        pipeline_parallel_size=pp_size)
+    custom_graph = benchmark_pp_prefill_custom(
+        engine, args.seq_lens, use_torch_compile=False)
+    del engine
+    torch.cuda.empty_cache()
+
+    # Custom: piecewise + torch.compile
+    print(f"\n── Custom Engine Prefill (piecewise + compile, PP={pp_size}) ──")
+    engine = MoEEngine(
+        args.model, max_seqs=4, max_seq_len=4096,
+        use_torch_compile=True,
+        pipeline_parallel_size=pp_size)
+    custom_compiled = benchmark_pp_prefill_custom(
+        engine, args.seq_lens, use_torch_compile=True)
+    del engine
+    torch.cuda.empty_cache()
+
+    # vLLM
+    vllm_results = {}
+    if not args.skip_vllm:
+        print(f"\n── vLLM Prefill (PP={pp_size}) ──")
+        from vllm import LLM, SamplingParams
+
+        llm = LLM(
+            model=args.model,
+            dtype="bfloat16",
+            max_model_len=4096,
+            max_num_seqs=64,
+            gpu_memory_utilization=0.95,
+            disable_log_stats=True,
+            enable_prefix_caching=False,
+            pipeline_parallel_size=pp_size,
+        )
+        sp = SamplingParams(max_tokens=1, temperature=0)
+
+        for i in range(3):
+            tokens = torch.randint(1, 1000, (256,)).tolist()
+            llm.llm_engine.add_request(
+                request_id=f"warmup_{i}",
+                prompt={"prompt_token_ids": tokens},
+                params=sp,
+            )
+            while llm.llm_engine.has_unfinished_requests():
+                llm.llm_engine.step()
+        torch.cuda.synchronize()
+
+        # PP prefill: step() is async across workers, CUDA events/sync
+        # in the main process don't capture worker GPU time. Use
+        # llm.generate(max_tokens=1) which blocks until completion.
+        # This measures prefill + 1 decode step.
+        for seq_len in args.seq_lens:
+            for i in range(PREFILL_N_WARMUP):
+                warm_ids = torch.randint(1, 1000, (seq_len,)).tolist()
+                llm.generate(
+                    [{"prompt_token_ids": warm_ids}],
+                    sampling_params=sp,
+                )
+
+            times = []
+            for trial in range(PREFILL_N_TRIALS):
+                trial_ids = torch.randint(1, 1000, (seq_len,)).tolist()
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                llm.generate(
+                    [{"prompt_token_ids": trial_ids}],
+                    sampling_params=sp,
+                )
+                t1 = time.perf_counter()
+                times.append((t1 - t0) * 1000)
+
+            median_ms = sorted(times)[PREFILL_N_TRIALS // 2]
+            vllm_results[seq_len] = median_ms
+            print(f"  seq_len={seq_len:>5d}  batch=1  "
+                  f"median={median_ms:.2f}ms  "
+                  f"(all: {', '.join(f'{t:.2f}' for t in times)})")
+
+        del llm
+        torch.cuda.empty_cache()
+
+    # Comparison table
+    print("\n" + "=" * 80)
+    print(f"  PREFILL COMPARISON (median ms, batch=1, PP={pp_size})")
+    print(f"  Note: vLLM times include prefill + 1 decode step (PP async step())")
+    print("=" * 80)
+
+    header = (f"  {'seq_len':>8s}  {'Graph':>10s}  {'Compile+G':>10s}  "
+              f"{'vLLM':>10s}  {'C+G vs vLLM':>12s}")
+    print(header)
+    print(f"  {'-' * (len(header) - 2)}")
+
+    for sl in args.seq_lens:
+        g = custom_graph.get(sl, float('nan'))
+        c = custom_compiled.get(sl, float('nan'))
+        v = vllm_results.get(sl, float('nan'))
+        delta = c - v if (v == v and c == c) else float('nan')
+        pct = delta / v * 100 if (v == v and v > 0 and c == c) else float('nan')
+
+        line = f"  {sl:>8d}"
+        line += f"  {g:>9.2f}ms" if g == g else f"  {'N/A':>10s}"
+        line += f"  {c:>9.2f}ms" if c == c else f"  {'N/A':>10s}"
+        v_str = f"{v:.2f}ms" if v == v else "N/A"
+        d_str = f"{delta:+.2f}ms ({pct:+.1f}%)" if (delta == delta) else "N/A"
+        line += f"  {v_str:>10s}  {d_str:>12s}"
+        print(line)
+
+    print()
+
+
+# =====================================================================
 #  Subcommand: all
 # =====================================================================
 
@@ -1325,6 +1729,28 @@ def main():
     p_prefill.add_argument("--skip-vllm", action="store_true")
     p_prefill.add_argument("--skip-combined", action="store_true")
 
+    # pp-decode
+    p_pp_decode = subparsers.add_parser("pp-decode",
+        help="Pipeline-parallel decode performance vs vLLM")
+    p_pp_decode.add_argument("--pp", type=int, default=2,
+                             help="Pipeline parallel size (default: 2)")
+    p_pp_decode.add_argument("--correctness-only", action="store_true")
+    p_pp_decode.add_argument("--perf-only", action="store_true")
+    p_pp_decode.add_argument("--custom-only", action="store_true")
+    p_pp_decode.add_argument("--vllm-only", action="store_true")
+    p_pp_decode.add_argument("--max-seq", type=int, default=2048)
+    p_pp_decode.add_argument("--n-steps", type=int, default=N_DECODE_STEPS)
+    p_pp_decode.add_argument("--n-trials", type=int, default=N_TRIALS)
+
+    # pp-prefill
+    p_pp_prefill = subparsers.add_parser("pp-prefill",
+        help="Pipeline-parallel prefill performance vs vLLM")
+    p_pp_prefill.add_argument("--pp", type=int, default=2,
+                              help="Pipeline parallel size (default: 2)")
+    p_pp_prefill.add_argument("--seq-lens", nargs="+", type=int,
+                              default=PREFILL_SEQ_LENS)
+    p_pp_prefill.add_argument("--skip-vllm", action="store_true")
+
     # cuda-graph
     subparsers.add_parser("cuda-graph",
         help="CUDA graph correctness + timing")
@@ -1348,6 +1774,8 @@ def main():
     dispatch = {
         "decode": cmd_decode,
         "prefill": cmd_prefill,
+        "pp-decode": cmd_pp_decode,
+        "pp-prefill": cmd_pp_prefill,
         "cuda-graph": cmd_cuda_graph,
         "mixed": cmd_mixed,
         "all": cmd_all,

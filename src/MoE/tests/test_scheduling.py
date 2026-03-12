@@ -964,34 +964,31 @@ class TestExtractNextTokens:
             assert tokens[i] == self._expected_token(i)
 
     def test_extract_prefill_only(self):
-        """Test 21: Prefill-only extraction (argmax of last row per chunk)."""
-        # 3 chunks: [128, 256, 64] = 448 total rows
-        logits = self._make_logits(448)
+        """Test 21: Prefill-only extraction (selective lm_head: 1 row per seq)."""
+        # 3 prefill seqs → 3 rows (engine already selected last-token logits)
+        logits = self._make_logits(3)
         tokens = extract_next_tokens(logits, n_decode=0,
                                      prefill_chunk_lengths=[128, 256, 64],
                                      continuation_chunk_lengths=[])
         assert len(tokens) == 3
-        # Last row of chunk 0: row 127
-        assert tokens[0] == self._expected_token(127)
-        # Last row of chunk 1: row 128+255 = 383
-        assert tokens[1] == self._expected_token(383)
-        # Last row of chunk 2: row 384+63 = 447
-        assert tokens[2] == self._expected_token(447)
+        assert tokens[0] == self._expected_token(0)
+        assert tokens[1] == self._expected_token(1)
+        assert tokens[2] == self._expected_token(2)
 
     def test_extract_continuation_only(self):
-        """Test 22: Continuation-only extraction."""
-        logits = self._make_logits(300)
+        """Test 22: Continuation-only extraction (selective: 1 row per seq)."""
+        logits = self._make_logits(2)
         tokens = extract_next_tokens(logits, n_decode=0,
                                      prefill_chunk_lengths=[],
                                      continuation_chunk_lengths=[100, 200])
         assert len(tokens) == 2
-        assert tokens[0] == self._expected_token(99)
-        assert tokens[1] == self._expected_token(299)
+        assert tokens[0] == self._expected_token(0)
+        assert tokens[1] == self._expected_token(1)
 
     def test_extract_mixed(self):
-        """Test 23: Mixed decode + prefill + continuation."""
-        # 2 decode + 2 prefill [100, 200] + 1 continuation [50] = 352 rows
-        logits = self._make_logits(352)
+        """Test 23: Mixed decode + prefill + continuation (selective layout)."""
+        # 2 decode + 2 prefill seqs + 1 continuation seq = 5 rows
+        logits = self._make_logits(5)
         tokens = extract_next_tokens(logits, n_decode=2,
                                      prefill_chunk_lengths=[100, 200],
                                      continuation_chunk_lengths=[50])
@@ -999,12 +996,12 @@ class TestExtractNextTokens:
         # Decode: rows 0, 1
         assert tokens[0] == self._expected_token(0)
         assert tokens[1] == self._expected_token(1)
-        # Prefill chunk 0: last row at 2+99=101
-        assert tokens[2] == self._expected_token(101)
-        # Prefill chunk 1: last row at 102+199=301
-        assert tokens[3] == self._expected_token(301)
-        # Continuation: last row at 302+49=351
-        assert tokens[4] == self._expected_token(351)
+        # Prefill seq 0: row 2
+        assert tokens[2] == self._expected_token(2)
+        # Prefill seq 1: row 3
+        assert tokens[3] == self._expected_token(3)
+        # Continuation seq 0: row 4
+        assert tokens[4] == self._expected_token(4)
 
     def test_extract_single_token_chunks(self):
         """Test 24: Prefill chunks of length 1 (edge case)."""
@@ -1018,13 +1015,13 @@ class TestExtractNextTokens:
         assert tokens[2] == self._expected_token(2)
 
     def test_extract_empty_groups(self):
-        """Test 25: Some groups empty, others not."""
-        logits = self._make_logits(50)
+        """Test 25: Some groups empty, others not (selective: 1 row per seq)."""
+        logits = self._make_logits(1)
         tokens = extract_next_tokens(logits, n_decode=0,
                                      prefill_chunk_lengths=[],
                                      continuation_chunk_lengths=[50])
         assert len(tokens) == 1
-        assert tokens[0] == self._expected_token(49)
+        assert tokens[0] == self._expected_token(0)
 
     def test_extract_assertion_on_mismatch(self):
         """Test 26: Wrong tensor size triggers assertion."""
@@ -1033,7 +1030,7 @@ class TestExtractNextTokens:
             extract_next_tokens(logits, n_decode=5,
                                 prefill_chunk_lengths=[3],
                                 continuation_chunk_lengths=[])
-            # Expected 5+3=8 rows consumed, but tensor has 10
+            # Expected 5+1=6 rows consumed, but tensor has 10
 
 
 # ===========================================================================

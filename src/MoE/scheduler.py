@@ -987,13 +987,14 @@ def extract_next_tokens(
 ) -> list[int]:
     """Extract per-sequence next token IDs from step logits.
 
-    Logit layout from step: [D decode rows | P prefill rows | C continuation rows]
+    Logit layout from step (selective lm_head):
+      [D decode rows | 1 row per prefill seq | 1 row per continuation seq]
     - Decode: argmax of logits[i] for each decode sequence
-    - Prefill: argmax of LAST row in each chunk
-    - Continuation: argmax of LAST row in each chunk
+    - Prefill: one row per sequence (last-token logits)
+    - Continuation: one row per sequence (last-token logits)
 
     Args:
-        logits: [N_total, vocab_size] tensor
+        logits: [D + num_prefill_seqs + num_cont_seqs, vocab_size] tensor
         n_decode: number of decode sequences (rows 0..n_decode-1)
         prefill_chunk_lengths: length of each new-prefill chunk
         continuation_chunk_lengths: length of each continuation chunk
@@ -1009,18 +1010,16 @@ def extract_next_tokens(
         decode_logits = logits[:n_decode]
         tokens.extend(decode_logits.argmax(dim=-1).tolist())
 
-    # Prefill: last row of each chunk
+    # Prefill: one row per sequence (already last-token logits)
     offset = n_decode
-    for chunk_len in prefill_chunk_lengths:
-        last_row = logits[offset + chunk_len - 1]
-        tokens.append(last_row.argmax(dim=-1).item())
-        offset += chunk_len
+    for _ in prefill_chunk_lengths:
+        tokens.append(logits[offset].argmax(dim=-1).item())
+        offset += 1
 
-    # Continuation: last row of each chunk
-    for chunk_len in continuation_chunk_lengths:
-        last_row = logits[offset + chunk_len - 1]
-        tokens.append(last_row.argmax(dim=-1).item())
-        offset += chunk_len
+    # Continuation: one row per sequence (already last-token logits)
+    for _ in continuation_chunk_lengths:
+        tokens.append(logits[offset].argmax(dim=-1).item())
+        offset += 1
 
     assert offset == logits.shape[0], (
         f"Logit extraction consumed {offset} rows but tensor has "

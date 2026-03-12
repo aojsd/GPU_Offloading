@@ -36,82 +36,10 @@ def _yarn_find_correction_dim(beta, rope_dim, theta, max_pos):
         2 * math.log(theta))
 
 
-def rope_mla(q_pe, k_pe, cos_sin_cache, positions):
-    """Apply RoPE to only the rope dimensions of Q and K in MLA.
-
-    Uses GPT-J / interleaved convention (pairs dim 2i with dim 2i+1),
-    NOT NeoX half-split. vLLM sets is_neox_style=False for DeepSeek-V2.
-
-    Args:
-        q_pe: [N, num_heads * qk_rope_head_dim]
-        k_pe: [N, qk_rope_head_dim] (single "head" before broadcast)
-        cos_sin_cache: [max_seq, qk_rope_head_dim] — first half cos, second half sin
-        positions: [N]
-    Returns:
-        q_pe_rot: same shape as q_pe
-        k_pe_rot: same shape as k_pe
-    """
-    orig_dtype = q_pe.dtype
-    N = q_pe.shape[0]
-    rope_dim = k_pe.shape[-1]
-    half = rope_dim // 2
-    cos = cos_sin_cache[positions.long(), :half]   # [N, half]
-    sin = cos_sin_cache[positions.long(), half:]   # [N, half]
-
-    # Interleaved rotation: pair dim 2i with dim 2i+1
-    def _rotate_interleaved(x, cos_t, sin_t):
-        """x: [..., rope_dim], cos_t/sin_t: [..., half]"""
-        x_even = x[..., 0::2]  # [..., half]
-        x_odd = x[..., 1::2]   # [..., half]
-        out_even = x_even * cos_t - x_odd * sin_t
-        out_odd = x_even * sin_t + x_odd * cos_t
-        return torch.stack([out_even, out_odd], dim=-1).flatten(-2)
-
-    # K: [N, rope_dim] — single virtual head
-    k_rot = _rotate_interleaved(k_pe.float(), cos, sin)
-
-    # Q: [N, num_heads * rope_dim] — reshape to per-head, broadcast cos/sin
-    num_heads = q_pe.shape[-1] // rope_dim
-    q_f = q_pe.float().view(N, num_heads, rope_dim)
-    cos_h = cos.unsqueeze(1)  # [N, 1, half]
-    sin_h = sin.unsqueeze(1)
-    q_rot = _rotate_interleaved(q_f, cos_h, sin_h)
-
-    return q_rot.reshape(N, -1).to(orig_dtype), k_rot.to(orig_dtype)
-
-
-def rope_pytorch(q, k, cos_sin_cache, positions, num_heads, head_dim,
-                 num_kv_heads=None):
-    """Pure PyTorch NeoX-style RoPE — fully compilable by torch.compile.
-
-    Args:
-        q: [N, num_heads * head_dim]
-        k: [N, num_kv_heads * head_dim]
-        cos_sin_cache: [max_seq, head_dim] (first half cos, second half sin)
-        positions: [N] int32/int64
-        num_heads: number of Q attention heads
-        head_dim: dimension per head
-        num_kv_heads: number of KV heads (defaults to num_heads for MHA)
-    Returns:
-        q_rot, k_rot: same shapes as input
-    """
-    if num_kv_heads is None:
-        num_kv_heads = num_heads
-    orig_dtype = q.dtype
-    N = q.shape[0]
-    half = head_dim // 2
-    cos = cos_sin_cache[positions.long(), :half].unsqueeze(1)   # [N, 1, half]
-    sin = cos_sin_cache[positions.long(), half:].unsqueeze(1)   # [N, 1, half]
-    q_h = q.float().view(N, num_heads, head_dim)
-    k_h = k.float().view(N, num_kv_heads, head_dim)
-    q_rot = torch.cat([q_h[..., :half] * cos - q_h[..., half:] * sin,
-                        q_h[..., :half] * sin + q_h[..., half:] * cos], dim=-1)
-    k_rot = torch.cat([k_h[..., :half] * cos - k_h[..., half:] * sin,
-                        k_h[..., :half] * sin + k_h[..., half:] * cos], dim=-1)
-    return q_rot.reshape(N, -1).to(orig_dtype), k_rot.reshape(N, -1).to(orig_dtype)
 
 # ── Load vLLM custom ops (_C.so has reshape_and_cache_flash, etc.) ──
 import vllm._custom_ops as _vllm_ops
+
 _vllm_so = Path(_vllm_ops.__file__).parent / "_C.abi3.so"
 if _vllm_so.exists():
     torch.ops.load_library(str(_vllm_so))
@@ -291,7 +219,7 @@ class MoEEngine:
         if self.pp_size > 1:
             # Per-GPU replicated small tensors
             build_fn = self._build_yarn_rope_cache if self.is_mla else self._build_rope_cache
-            self.cos_sin_cache = [build_fn().to(d)
+            self.cos_sin_cache = [build_fn().to(dtype=self.dtype, device=d)
                                   for d in self.pp_devices]
             self._k_scale = [torch.tensor(1.0, dtype=torch.float32, device=d)
                              for d in self.pp_devices]
@@ -389,9 +317,9 @@ class MoEEngine:
         else:
             # Single-GPU path (original)
             if self.is_mla:
-                self.cos_sin_cache = self._build_yarn_rope_cache().to(device)
+                self.cos_sin_cache = self._build_yarn_rope_cache().to(dtype=self.dtype, device=device)
             else:
-                self.cos_sin_cache = self._build_rope_cache().to(device)
+                self.cos_sin_cache = self._build_rope_cache().to(dtype=self.dtype, device=device)
             self._k_scale = torch.tensor(1.0, dtype=torch.float32,
                                          device=device)
             self._v_scale = torch.tensor(1.0, dtype=torch.float32,
@@ -1051,7 +979,7 @@ class MoEEngine:
         """Prefill forward pass — routes through step (piecewise graphs).
 
         Args: input_ids [B, S]
-        Returns: logits [B, S, vocab_size]
+        Returns: logits [B, vocab_size] — last-token logits per sequence
         Requires: capture_cuda_graphs() (or capture_prefill_cuda_graph())
         called with sufficient sizes, or falls back to eager.
         """
@@ -1064,7 +992,8 @@ class MoEEngine:
                                          device=self.device),
             prefill_seq_ids=seq_ids,
             prefill_input_ids=input_list)
-        return logits_flat.view(B, S, -1)
+        # step() returns only last-token logits for prefill: [B, vocab_size]
+        return logits_flat.view(B, -1)
 
     def capture_prefill_cuda_graph(self, total_token_sizes=None,
                                    use_torch_compile=None):
@@ -1312,7 +1241,7 @@ class MoEEngine:
             seq_id: slot index in block_table / seq_lens
             input_ids: [S] token IDs (1-D)
         Returns:
-            logits: [S, vocab_size]
+            logits: [1, vocab_size] — last-token logits
         """
         empty_dev = self.pp_devices[0] if self.pp_size > 1 else self.device
         return self.step(
@@ -1367,7 +1296,7 @@ class MoEEngine:
             seq_id: slot index in block_table / seq_lens
             input_ids: [S] token IDs (1-D)
         Returns:
-            logits: [S, vocab_size] (only last chunk's actual logits returned)
+            logits: [1, vocab_size] — last-token logits
         """
         S = input_ids.shape[0]
         graph_sizes = sorted(self._piecewise_graphs.keys())
@@ -1633,9 +1562,9 @@ class MoEEngine:
             if self.offload_engine and _controller is not self.offload_engine:
                 self.offload_engine.post_layer(layer)
 
-        # ── 8. Final norm + lm_head ──
+        # ── 8. Final norm + lm_head (last token only) ──
         last_buf = _buf(self.num_layers - 1)
-        hidden = last_buf['hidden_buf']
+        hidden = last_buf['hidden_buf'][C - 1:C]  # last actual token
         hidden = F.rms_norm(hidden, (self.hidden_size,), self.final_norm,
                             self.rms_norm_eps)
         logits = F.linear(hidden, self.lm_head)
@@ -1650,7 +1579,7 @@ class MoEEngine:
             self.seq_lens[seq_id] = total_seq_len
         # _seq_lens_cpu already set at step 4
 
-        return logits[:C]
+        return logits
 
     # ── Multi-Batch Prefill ─────────────────────────────────────────
 
@@ -1665,7 +1594,7 @@ class MoEEngine:
             seq_ids: list[int] — KV cache slot indices for each sequence
             input_ids: list[Tensor] (variable-length 1D) or Tensor [B, S] (same-length)
         Returns:
-            logits: Tensor [N_total, vocab_size] (flat)
+            logits: Tensor [num_seqs, vocab_size] — last-token logits per sequence
         """
         # Normalize to list of 1D tensors
         if isinstance(input_ids, torch.Tensor) and input_ids.dim() == 2:
@@ -1771,26 +1700,26 @@ class MoEEngine:
         # Fused QKV projection on ALL tokens
         qkv = F.linear(hidden, self.qkv_proj[layer])
         q, k, v = qkv.split([H, kv_dim, kv_dim], dim=-1)
-        v = v.contiguous()
 
         # Q/K norm (if model has it)
         if self.has_qk_norm:
-            q = F.rms_norm(q, (H,), self.q_norm[layer],
-                           self.rms_norm_eps).contiguous()
-            k = F.rms_norm(k, (kv_dim,), self.k_norm[layer],
-                           self.rms_norm_eps).contiguous()
+            q = F.rms_norm(q, (H,), self.q_norm[layer], self.rms_norm_eps)
+            k = F.rms_norm(k, (kv_dim,), self.k_norm[layer], self.rms_norm_eps)
 
-        # RoPE on ALL tokens
+        # reshape creates contiguous copies; rotary_embedding modifies in-place
+        q_3d = q.reshape(N, self.num_heads, self.head_dim)
+        k_3d = k.reshape(N, self.num_kv_heads, self.head_dim)
+        v_3d = v.reshape(N, self.num_kv_heads, self.head_dim)
+
+        # RoPE — in-place on bf16 tensors (cos_sin_cache is also bf16)
         cos_sin = self._get_cos_sin_cache(layer)
-        q, k = rope_pytorch(q, k, cos_sin, positions,
-                            self.num_heads, self.head_dim, self.num_kv_heads)
+        _vllm_ops.rotary_embedding(
+            positions.long(), q_3d, k_3d, self.head_dim, cos_sin, True)
 
         # Write K,V to paged cache for ALL tokens
-        k_write = k.reshape(N, self.num_kv_heads, self.head_dim)
-        v_write = v.reshape(N, self.num_kv_heads, self.head_dim)
         k_scale, v_scale = self._get_kv_scales(layer)
         _vllm_ops.reshape_and_cache_flash(
-            k_write, v_write,
+            k_3d, v_3d,
             self.k_cache[layer], self.v_cache[layer],
             slot_mapping, "auto", k_scale, v_scale)
 
@@ -1798,7 +1727,7 @@ class MoEEngine:
         # Decode tokens [0:D]: FlashInfer BatchDecode (reads paged KV cache)
         if D > 0 and N > D:
             # Mixed: both decode and prefill
-            q_decode = q[:D].view(D, self.num_heads, self.head_dim)
+            q_decode = q_3d[:D]
             decode_out = decode_wrapper.run(
                 q_decode, (self.k_cache[layer], self.v_cache[layer]))
             decode_out = decode_out.reshape(D, H)
@@ -1808,9 +1737,9 @@ class MoEEngine:
             # call, so addresses baked into a CUDA graph get freed by the next
             # plan() call.
             N_pf = N - D
-            q_pf = q[D:].reshape(N_pf, self.num_heads, self.head_dim)
-            k_pf = k_write[D:]
-            v_pf = v_write[D:]
+            q_pf = q_3d[D:]
+            k_pf = k_3d[D:]
+            v_pf = v_3d[D:]
             prefill_out = flash_attn_varlen_func(
                 q_pf, k_pf, v_pf,
                 cu_seqlens_q=prefill_cu_seqlens,
@@ -1824,7 +1753,7 @@ class MoEEngine:
 
         elif D > 0:
             # Pure decode
-            q_decode = q[:D].view(D, self.num_heads, self.head_dim)
+            q_decode = q_3d[:D]
             attn_out = decode_wrapper.run(
                 q_decode, (self.k_cache[layer], self.v_cache[layer]))
             attn_out = attn_out.reshape(D, H)
@@ -1832,9 +1761,9 @@ class MoEEngine:
         else:
             # Pure prefill — FA3 (stateless), same reason as mixed path above
             N_pf = N
-            q_pf = q.reshape(N_pf, self.num_heads, self.head_dim)
-            k_pf = k_write
-            v_pf = v_write
+            q_pf = q_3d
+            k_pf = k_3d
+            v_pf = v_3d
             attn_out = flash_attn_varlen_func(
                 q_pf, k_pf, v_pf,
                 cu_seqlens_q=prefill_cu_seqlens,
@@ -1893,9 +1822,13 @@ class MoEEngine:
         c_kv = F.rms_norm(c_kv, (self.kv_lora_rank,), self.kv_a_layernorm[layer], self.rms_norm_eps)
 
         cos_sin = self._get_cos_sin_cache(layer)
-        q_pe_rot, k_pe_rot = rope_mla(
-            q_pe.reshape(N, -1), k_pe, cos_sin, positions)
-        q_pe_rot = q_pe_rot.view(N, self.num_heads, self.qk_rope_head_dim)
+        q_pe_3d = q_pe.contiguous()            # [N, num_heads, R]
+        k_pe_3d = k_pe.unsqueeze(1)            # [N, 1, R]
+        _vllm_ops.rotary_embedding(
+            positions.long(), q_pe_3d, k_pe_3d,
+            self.qk_rope_head_dim, cos_sin, False)
+        q_pe_rot = q_pe_3d                     # [N, num_heads, R]
+        k_pe_rot = k_pe_3d.squeeze(1)          # [N, R]
 
         safe_slots = torch.where(slot_mapping >= 0, slot_mapping, self._scratch_slot)
         self.ckv_flat[layer][safe_slots] = c_kv
@@ -2004,27 +1937,28 @@ class MoEEngine:
 
         qkv = F.linear(normed, self.qkv_proj[layer])
         q, k, v = qkv.split([H, kv_dim, kv_dim], dim=-1)
-        v = v.contiguous()
 
         if self.has_qk_norm:
-            q = F.rms_norm(q, (H,), self.q_norm[layer],
-                           self.rms_norm_eps).contiguous()
-            k = F.rms_norm(k, (kv_dim,), self.k_norm[layer],
-                           self.rms_norm_eps).contiguous()
+            q = F.rms_norm(q, (H,), self.q_norm[layer], self.rms_norm_eps)
+            k = F.rms_norm(k, (kv_dim,), self.k_norm[layer], self.rms_norm_eps)
 
-        cos_sin = self._get_cos_sin_cache(layer)
-        q, k = rope_pytorch(q, k, cos_sin, positions,
-                            self.num_heads, self.head_dim, self.num_kv_heads)
-
+        # reshape creates contiguous copies from non-contiguous split views
+        q_3d = q.reshape(N, self.num_heads, self.head_dim)
         k_3d = k.reshape(N, self.num_kv_heads, self.head_dim)
         v_3d = v.reshape(N, self.num_kv_heads, self.head_dim)
+
+        # RoPE — in-place on bf16 tensors (cos_sin_cache is also bf16)
+        cos_sin = self._get_cos_sin_cache(layer)
+        _vllm_ops.rotary_embedding(
+            positions.long(), q_3d, k_3d, self.head_dim, cos_sin, True)
+
         k_scale, v_scale = self._get_kv_scales(layer)
         _vllm_ops.reshape_and_cache_flash(
             k_3d, v_3d,
             self.k_cache[layer], self.v_cache[layer],
             slot_mapping, "auto", k_scale, v_scale)
 
-        q_buf.copy_(q.view(N, self.num_heads, self.head_dim))
+        q_buf.copy_(q_3d)
         k_buf.copy_(k_3d)
         v_buf.copy_(v_3d)
         residual_buf.copy_(hidden)
@@ -2054,11 +1988,14 @@ class MoEEngine:
         c_kv_normed = F.rms_norm(c_kv, (self.kv_lora_rank,),
                                   self.kv_a_layernorm[layer], self.rms_norm_eps)
 
-        # RoPE on pe dimensions only
+        # RoPE on pe dimensions only (GPT-J interleaved style)
         cos_sin = self._get_cos_sin_cache(layer)
-        q_pe_flat = q_pe.reshape(N, -1)  # [N, H*R]
-        q_pe_rot, k_pe_rot = rope_mla(q_pe_flat, k_pe, cos_sin, positions)
-        q_pe_rot = q_pe_rot.view(N, self.num_heads, self.qk_rope_head_dim)
+        q_pe_3d = q_pe.contiguous()            # [N, num_heads, R]
+        k_pe_3d = k_pe.unsqueeze(1)            # [N, 1, R]
+        _vllm_ops.rotary_embedding(
+            positions.long(), q_pe_3d, k_pe_3d,
+            self.qk_rope_head_dim, cos_sin, False)
+        k_pe_rot = k_pe_3d.squeeze(1)          # [N, R]
 
         # Write to MLA KV cache (CUDA-graph safe scatter with sentinel handling)
         safe_slots = torch.where(slot_mapping >= 0, slot_mapping, self._scratch_slot)
@@ -2067,19 +2004,23 @@ class MoEEngine:
 
         # Output to buffers
         q_nope_buf.copy_(q_nope)        # [N, H, P=128]
-        q_pe_buf.copy_(q_pe_rot)        # [N, H, R=64]
+        q_pe_buf.copy_(q_pe_3d)         # [N, H, R=64]
         ckv_buf.copy_(c_kv_normed)      # [N, 512]
         kpe_buf.copy_(k_pe_rot)         # [N, 64]
         residual_buf.copy_(hidden)
 
     def _layer_stage4a_router(self, attn_out, residual, layer,
                               moe_input_buf, moe_residual_buf,
-                              topk_weights_buf, topk_ids_buf):
+                              topk_weights_buf, topk_ids_buf,
+                              token_expert_indices):
         """Stage 4a: O proj -> residual -> norm -> router -> topk.
 
         Writes routing decisions into buffers for CPU-side inspection between
         stage4a and stage4b. Used for expert offloading (demand loading between
         the two sub-stages).
+
+        Uses vLLM's fused topk_softmax kernel (softmax + topk + optional
+        renormalize in a single CUDA kernel) instead of separate PyTorch ops.
         """
         H = self.hidden_size
         hidden = residual + F.linear(attn_out, self.o_proj[layer])
@@ -2093,14 +2034,13 @@ class MoEEngine:
             return
 
         router_logits = F.linear(hidden, self.router[layer])
-        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-        topk_weights, topk_ids = torch.topk(routing_weights, self.top_k, dim=-1)
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        elif self.is_mla:
-            topk_weights = topk_weights * self.routed_scaling_factor
-        topk_weights_buf.copy_(topk_weights)
-        topk_ids_buf.copy_(topk_ids)
+        # Fused softmax + topk + optional renormalize — writes directly into
+        # topk_weights_buf and topk_ids_buf (no intermediate tensors or copies).
+        _vllm_ops.topk_softmax(topk_weights_buf, topk_ids_buf,
+                               token_expert_indices,
+                               router_logits.float(), self.norm_topk_prob)
+        if not self.norm_topk_prob and self.is_mla:
+            topk_weights_buf.mul_(self.routed_scaling_factor)
 
     def _layer_stage4b_moe(self, moe_input_buf, moe_residual_buf,
                            topk_weights_buf, topk_ids_buf, hidden_out, layer):
@@ -2147,10 +2087,11 @@ class MoEEngine:
     def _full_mixed_graph_body(self, all_token_ids, positions, slot_mapping,
                                num_decode_tokens, decode_wrapper,
                                prefill_cu_seqlens, prefill_max_seqlen):
-        """Full mixed forward — embed + layers + final norm + lm_head.
+        """Full mixed forward — embed + layers (no final norm/lm_head).
 
         Designed for torch.compile(dynamic=True) to fuse RMSNorm + residual
         + RoPE between graph-breaking external kernels.
+        Returns hidden states; caller applies selective norm + lm_head.
         """
         hidden = F.embedding(all_token_ids, self.embed_tokens)
         if self.is_mla:
@@ -2163,9 +2104,7 @@ class MoEEngine:
                 hidden = self._layer_mixed(hidden, layer, positions, slot_mapping,
                                            num_decode_tokens, decode_wrapper,
                                            prefill_cu_seqlens, prefill_max_seqlen)
-        hidden = F.rms_norm(hidden, (self.hidden_size,), self.final_norm,
-                            self.rms_norm_eps)
-        return F.linear(hidden, self.lm_head)
+        return hidden
 
     @torch.no_grad()
     def step(self, decode_seq_ids, decode_token_ids,
@@ -2195,12 +2134,11 @@ class MoEEngine:
             allocated in the block table (static allocation handles this).
           - After the call, seq_lens[sid] = offset + chunk_len.
 
-        Output extraction:
+        Output extraction (selective lm_head — only needed tokens get logits):
           - logits[:D] — decode tokens (one per sequence)
-          - logits[D:D+P] — new prefill tokens (concatenated, variable-length)
-          - logits[D+P:D+P+C] — continuation tokens (concatenated)
-          - To get a sequence's "next token prediction", take the last logit
-            row in that sequence's region.
+          - logits[D:D+num_prefill_seqs] — one row per prefill sequence (last token)
+          - logits[D+num_prefill_seqs:] — one row per continuation sequence (last token)
+          Each row is already the "next token prediction" logits.
 
         Args:
             decode_seq_ids: list[int] — KV cache slot indices for decode requests
@@ -2212,8 +2150,8 @@ class MoEEngine:
             continuation_offsets: list[int] — position offset for each continuation
                 (number of tokens already prefilled for that sequence)
         Returns:
-            logits: Tensor [N_total, vocab_size]
-                logits[:D] = decode, [D:D+P] = new prefill, [D+P:] = continuation
+            logits: Tensor [D + num_prefill_seqs + num_cont_seqs, vocab_size]
+                logits[:D] = decode, then one row per prefill/continuation seq
         """
         if continuation_seq_ids is None:
             continuation_seq_ids = []
@@ -2313,9 +2251,26 @@ class MoEEngine:
         prefill_max = max(prefill_lengths) if prefill_lengths else 0
 
         # ── Forward ──
-        logits = self._full_mixed_graph_body(
+        hidden_all = self._full_mixed_graph_body(
             all_token_ids, positions, slot_mapping,
             D, self._decode_wrapper, prefill_cu, prefill_max)
+
+        # ── Selective norm + lm_head ──
+        logit_token_indices = list(range(D))
+        offset = D
+        for length in prefill_lengths:
+            logit_token_indices.append(offset + length - 1)
+            offset += length
+        num_logit_tokens = len(logit_token_indices)
+        if num_logit_tokens < hidden_all.shape[0]:
+            idx = torch.tensor(logit_token_indices, dtype=torch.long,
+                               device=hidden_all.device)
+            hidden = hidden_all[idx]
+        else:
+            hidden = hidden_all
+        hidden = F.rms_norm(hidden, (self.hidden_size,), self.final_norm,
+                            self.rms_norm_eps)
+        logits = F.linear(hidden, self.lm_head)
 
         # ── Update GPU seq_lens ──
         for sid in decode_seq_ids:
@@ -2363,7 +2318,8 @@ class MoEEngine:
                 'moe_input_buf': torch.zeros(N, self.hidden_size, dtype=self.dtype, device=device),
                 'moe_residual_buf': torch.zeros(N, self.hidden_size, dtype=self.dtype, device=device),
                 'topk_weights_buf': torch.zeros(N, self.top_k, dtype=torch.float32, device=device),
-                'topk_ids_buf': torch.zeros(N, self.top_k, dtype=torch.int64, device=device),
+                'topk_ids_buf': torch.zeros(N, self.top_k, dtype=torch.int32, device=device),
+                'token_expert_indices': torch.zeros(N, self.top_k, dtype=torch.int32, device=device),
                 'static_positions': (torch.arange(N, dtype=torch.int32, device=device)
                                      % self.max_seq_len),
                 'static_slot_mapping': (torch.arange(N, dtype=torch.long, device=device)
@@ -2390,8 +2346,10 @@ class MoEEngine:
             'topk_weights_buf': torch.zeros(N, self.top_k,
                                             dtype=torch.float32,
                                             device=device),
-            'topk_ids_buf': torch.zeros(N, self.top_k, dtype=torch.int64,
+            'topk_ids_buf': torch.zeros(N, self.top_k, dtype=torch.int32,
                                         device=device),
+            'token_expert_indices': torch.zeros(N, self.top_k, dtype=torch.int32,
+                                                device=device),
             'static_positions': (torch.arange(N, dtype=torch.int32,
                                               device=device)
                                  % self.max_seq_len),
@@ -2511,7 +2469,8 @@ class MoEEngine:
                                        buf['moe_input_buf'],
                                        buf['moe_residual_buf'],
                                        buf['topk_weights_buf'],
-                                       buf['topk_ids_buf'])
+                                       buf['topk_ids_buf'],
+                                       buf['token_expert_indices'])
                             stage4b_fn(buf['moe_input_buf'],
                                        buf['moe_residual_buf'],
                                        buf['topk_weights_buf'],
@@ -2564,7 +2523,8 @@ class MoEEngine:
                                        buf['moe_input_buf'],
                                        buf['moe_residual_buf'],
                                        buf['topk_weights_buf'],
-                                       buf['topk_ids_buf'])
+                                       buf['topk_ids_buf'],
+                                       buf['token_expert_indices'])
                         stage4a_graphs.append(g4a)
 
                     with torch.cuda.device(dev):
@@ -2619,7 +2579,8 @@ class MoEEngine:
                                    bufs['moe_input_buf'],
                                    bufs['moe_residual_buf'],
                                    bufs['topk_weights_buf'],
-                                   bufs['topk_ids_buf'])
+                                   bufs['topk_ids_buf'],
+                                   bufs['token_expert_indices'])
                         if self.offloading and self.router[layer] is not None:
                             self.expert_map_buf.copy_(
                                 self.expert_map_abs[layer])
@@ -2658,7 +2619,8 @@ class MoEEngine:
                                    bufs['moe_input_buf'],
                                    bufs['moe_residual_buf'],
                                    bufs['topk_weights_buf'],
-                                   bufs['topk_ids_buf'])
+                                   bufs['topk_ids_buf'],
+                                   bufs['token_expert_indices'])
                     stage4a_graphs.append(g4a)
 
                     if self.offloading and self.router[layer] is not None:
@@ -3266,12 +3228,39 @@ class MoEEngine:
             if _nvtx: torch.cuda.nvtx.range_pop()  # layer_N
 
         # ── 8. Final norm + lm_head (on last GPU for PP) ──
+        # Only compute lm_head for tokens that need logits: all decode tokens,
+        # plus the last token of each prefill/continuation sequence.
+        # This avoids running the expensive vocab projection on all prefill
+        # tokens (e.g. 2048→1 at seq_len=2048).
         if _nvtx: torch.cuda.nvtx.range_push("final")
         last_buf = _buf(self.num_layers - 1)
-        hidden = last_buf['hidden_buf']
-        hidden = F.rms_norm(hidden, (self.hidden_size,), self.final_norm,
-                            self.rms_norm_eps)
-        logits = F.linear(hidden, self.lm_head)
+        hidden_all = last_buf['hidden_buf']
+
+        # Build indices of tokens that need logits
+        logit_token_indices = list(range(D))  # all decode tokens
+        offset = D
+        for length in prefill_lengths:
+            logit_token_indices.append(offset + length - 1)  # last token
+            offset += length
+        for length in cont_lengths:
+            logit_token_indices.append(offset + length - 1)  # last token
+            offset += length
+        num_logit_tokens = len(logit_token_indices)
+
+        if num_logit_tokens < N_actual:
+            # Selective: norm + lm_head only on needed tokens
+            idx = torch.tensor(logit_token_indices, dtype=torch.long,
+                               device=hidden_all.device)
+            hidden = hidden_all[idx]
+            hidden = F.rms_norm(hidden, (self.hidden_size,), self.final_norm,
+                                self.rms_norm_eps)
+            logits = F.linear(hidden, self.lm_head)
+        else:
+            # Pure decode or single-token sequences — no savings
+            hidden = hidden_all[:N_actual]
+            hidden = F.rms_norm(hidden, (self.hidden_size,), self.final_norm,
+                                self.rms_norm_eps)
+            logits = F.linear(hidden, self.lm_head)
 
         # Transfer logits back to primary device for consistent API
         if pp:
@@ -3301,6 +3290,11 @@ class MoEEngine:
             self._seq_lens_cpu[sid] = length
         # _seq_lens_cpu for continuations already set in step 4b
 
+        # When selective lm_head was used, logits is already the right size:
+        # [D + num_prefill_seqs + num_cont_seqs, vocab_size]
+        # Layout: logits[:D] = decode, then one row per prefill seq, one per cont seq.
+        if num_logit_tokens < N_actual:
+            return logits
         return logits[:N_actual]
 
     # ── Generation ───────────────────────────────────────────────────
@@ -3319,8 +3313,8 @@ class MoEEngine:
             self.seq_lens[:B] = 0
         self._seq_lens_cpu[:B] = 0
 
-        logits = self.prefill(input_ids)
-        next_token = logits[:, -1, :].argmax(dim=-1)
+        logits = self.prefill(input_ids)  # [B, vocab_size]
+        next_token = logits.argmax(dim=-1)
         generated = [next_token]
 
         for _ in range(max_new_tokens - 1):
@@ -3515,7 +3509,7 @@ if __name__ == "__main__":
     print("\nSmoke test: prefill...")
     logits = engine.prefill(input_ids)
     print(f"  Prefill logits shape: {logits.shape}")
-    print(f"  Top token: {logits[0, -1].argmax().item()}")
+    print(f"  Top token: {logits[0].argmax().item()}")
 
     print("Smoke test: generate...")
     engine.reset()

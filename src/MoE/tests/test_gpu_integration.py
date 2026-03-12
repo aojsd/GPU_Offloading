@@ -88,9 +88,8 @@ def run_single_conversation(engine, prompt_ids, max_output, page_size=16):
                 )
             offset = chunk_end
 
-        # First output token from last prefill chunk
-        chunk_len = chunk.shape[0]
-        next_token = logits[chunk_len - 1].argmax().unsqueeze(0)
+        # First output token from last prefill chunk (step returns last-token logits)
+        next_token = logits[-1].argmax().unsqueeze(0)
         output_token_ids.append(next_token.item())
 
         # Decode

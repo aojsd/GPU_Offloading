@@ -7,7 +7,7 @@ Three modes:
 
 Usage:
   # Pure timing (no nsys):
-  python tests/nsys_pp_decode.py --model-20L models/Mixtral-8x7B-20L \
+  python tests/nsys_pp_decode.py --model-20L ../../models/Mixtral-8x7B-20L \
       --model-32L /path/to/Mixtral-8x7B --mode all
 
   # nsys profiling (run under nsys):
@@ -17,7 +17,7 @@ Usage:
           --mode 32L-pp2 --nsys
 
   # Event-level timing per phase (no nsys needed):
-  python tests/nsys_pp_decode.py --model-20L models/Mixtral-8x7B-20L \
+  python tests/nsys_pp_decode.py --model-20L ../../models/Mixtral-8x7B-20L \
       --model-32L /path/to/Mixtral-8x7B --mode all --phase-timing
 """
 import ctypes

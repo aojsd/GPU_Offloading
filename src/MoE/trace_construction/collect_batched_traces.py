@@ -234,14 +234,14 @@ def main():
 
     Example:
         python trace_construction/collect_batched_traces.py \\
-            --model models/Mixtral-8x7B-Instruct-v0.1 \\
-            --dataset datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json \\
+            --model ../../models/Mixtral-8x7B-Instruct-v0.1 \\
+            --dataset ../../datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json \\
             --num-conversations 200 \\
             --max-output-tokens 4096 \\
             --max-seqs 32 \\
             --pp 2 \\
             --cache-fraction 0.5 \\
-            --output-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b-batched/
+            --output-dir ../../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b-batched/
     """
     parser = argparse.ArgumentParser(
         description="GPU-based batched trace collection with continuous batching")

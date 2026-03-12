@@ -6,14 +6,14 @@ bin/*
 *.ipynb_checkpoints*
 *.json
 
-# MoE model weights (downloaded via models/download.sh)
-src/MoE/models/*
-!src/MoE/models/download.sh
+# Model weights (downloaded via models/download.sh)
+models/*
+!models/download.sh
 
 # Datasets (downloaded via datasets/download.sh)
-src/MoE/datasets/*
-!src/MoE/datasets/download.sh
-!src/MoE/datasets/calc_avg_layer_experts.py
+datasets/*
+!datasets/download.sh
+!datasets/calc_avg_layer_experts.py
 
 # Personal CLAUDE.md
 ./CLAUDE.md

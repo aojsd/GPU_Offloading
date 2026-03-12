@@ -321,9 +321,9 @@ cd /path/to/src/MoE
 
 # Phase 1: GPU batched collection (one run per cache fraction)
 python trace_construction/collect_batched_traces.py \
-    --model models/Mixtral-8x7B \
-    --dataset datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json \
-    --output-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+    --model ../../models/Mixtral-8x7B \
+    --dataset ../../datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json \
+    --output-dir ../../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
     --cache-fraction 0.7 \
     --num-conversations 200 --max-seqs 32 --pp 2 --resume
 
@@ -332,8 +332,8 @@ python scripts/run_all_policies.py --parallel
 
 # Phase 3: GPU replay
 python scripts/batched_replay.py \
-    --model models/Mixtral-8x7B \
-    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+    --model ../../models/Mixtral-8x7B \
+    --trace-dir ../../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
     --cache-size 179 --max-graph-size 512
 ```
 

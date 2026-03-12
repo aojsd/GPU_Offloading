@@ -9,14 +9,14 @@ slots, prefill/decode/continuation dispatch, and request lifecycle.
 Usage:
     # Run replay for a specific cache% with all policies:
     python scripts/batched_replay.py \
-        --model models/Mixtral-8x7B \
-        --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+        --model ../../models/Mixtral-8x7B \
+        --trace-dir ../../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
         --cache-size 179
 
     # Single policy:
     python scripts/batched_replay.py \
-        --model models/Mixtral-8x7B \
-        --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+        --model ../../models/Mixtral-8x7B \
+        --trace-dir ../../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
         --cache-size 179 \
         --policies LRU-Oracle
 """

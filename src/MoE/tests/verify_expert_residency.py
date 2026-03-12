@@ -22,7 +22,7 @@ from moe_engine import MoEEngine
 def main():
     parser = argparse.ArgumentParser(
         description="Verify expert residency and demand loading timing.")
-    parser.add_argument("--model", type=str, default="models/Mixtral-8x7B",
+    parser.add_argument("--model", type=str, default="../../models/Mixtral-8x7B",
                         help="Path to model directory")
     args = parser.parse_args()
 

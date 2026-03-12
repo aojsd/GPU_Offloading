@@ -8,9 +8,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
 
-MODEL=${MODEL:-models/Mixtral-8x7B}
+MODEL=${MODEL:-../../models/Mixtral-8x7B}
 MODEL_TAG=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
 python3 scripts/run_all_policies.py --parallel --model "$MODEL"
 
 echo ""
-echo "Phase 2 complete. Replay traces in datasets/ShareGPT_Vicuna/expert_traces/${MODEL_TAG}/cache*pct/"
+echo "Phase 2 complete. Replay traces in ../../datasets/ShareGPT_Vicuna/expert_traces/${MODEL_TAG}/cache*pct/"

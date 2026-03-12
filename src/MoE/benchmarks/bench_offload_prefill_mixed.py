@@ -5,9 +5,9 @@ Sweeps cache sizes (via configure()) and measures latency + transfer stats
 for multiple prefill and mixed decode+prefill configurations.
 
 Usage:
-    python tests/bench_offload_prefill_mixed.py --model models/Mixtral-8x7B-20L
-    python tests/bench_offload_prefill_mixed.py --model models/OLMoE-1B-7B
-    python tests/bench_offload_prefill_mixed.py --model models/Mixtral-8x7B
+    python tests/bench_offload_prefill_mixed.py --model ../../models/Mixtral-8x7B-20L
+    python tests/bench_offload_prefill_mixed.py --model ../../models/OLMoE-1B-7B
+    python tests/bench_offload_prefill_mixed.py --model ../../models/Mixtral-8x7B
 """
 import argparse
 import json

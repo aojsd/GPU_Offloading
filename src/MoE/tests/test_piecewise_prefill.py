@@ -9,8 +9,8 @@ Test 2: Partial offloading — no CUDA errors, no NaN (experts_per_layer < E)
 Test 3: Latency comparison — flat vs piecewise prefill
 
 Usage:
-    python tests/test_piecewise_prefill.py --model models/Mixtral-8x7B-20L
-    python tests/test_piecewise_prefill.py --model models/OLMoE-1B-7B-0924
+    python tests/test_piecewise_prefill.py --model ../../models/Mixtral-8x7B-20L
+    python tests/test_piecewise_prefill.py --model ../../models/OLMoE-1B-7B-0924
 """
 import argparse
 import gc
@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 from moe_engine import MoEEngine
 
-DEFAULT_MODEL = str(Path(__file__).resolve().parent.parent / "models" / "Mixtral-8x7B-20L")
+DEFAULT_MODEL = str(Path(__file__).resolve().parent.parent.parent.parent / "models" / "Mixtral-8x7B-20L")
 
 
 def get_flat_prefill_tokens(model_path, prompt, seq_len, graph_sizes):

@@ -20,10 +20,10 @@ done
 PCT=$(python3 -c "v=$CACHE_FRAC*100; print(int(v) if v==int(v) else f'{v:g}')")
 echo "=== Full pipeline for cache ${PCT}% (fraction=$CACHE_FRAC) ==="
 
-MODEL=${MODEL:-models/Mixtral-8x7B}
+MODEL=${MODEL:-../../models/Mixtral-8x7B}
 MODEL_TAG=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
-DATASET=datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json
-OUTPUT_BASE=datasets/ShareGPT_Vicuna/expert_traces/${MODEL_TAG}
+DATASET=../../datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json
+OUTPUT_BASE=../../datasets/ShareGPT_Vicuna/expert_traces/${MODEL_TAG}
 NUM_CONVERSATIONS=200
 MAX_OUTPUT_TOKENS=4096
 MAX_SEQS=32

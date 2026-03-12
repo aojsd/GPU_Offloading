@@ -27,7 +27,7 @@ IMAGE_NAME="${DOCKER_IMAGE:-pytorch-gh200}"
 CONTAINER_WORKSPACE="/workspace/GPU_Offloading"
 
 # Auto-detect a storage directory by resolving the first symlink found
-# in a given directory (e.g. src/MoE/models/Mixtral-8x7B -> /data/models/Mixtral-8x7B
+# in a given directory (e.g. models/Mixtral-8x7B -> /data/models/Mixtral-8x7B
 # yields /data/models).
 auto_detect_dir() {
     local search_dir="$1"
@@ -43,8 +43,8 @@ auto_detect_dir() {
     done
 }
 
-MODELS_DIR="${MODELS_DIR:-$(auto_detect_dir "$REPO_ROOT/src/MoE/models" 2>/dev/null || true)}"
-DATASETS_DIR="${DATASETS_DIR:-$(auto_detect_dir "$REPO_ROOT/src/MoE/datasets" 2>/dev/null || true)}"
+MODELS_DIR="${MODELS_DIR:-$(auto_detect_dir "$REPO_ROOT/models" 2>/dev/null || true)}"
+DATASETS_DIR="${DATASETS_DIR:-$(auto_detect_dir "$REPO_ROOT/datasets" 2>/dev/null || true)}"
 
 # Build optional volume arguments — only mount if the directory exists
 VOLUME_ARGS=()
@@ -56,14 +56,14 @@ if [ -n "$MODELS_DIR" ] && [ -d "$MODELS_DIR" ]; then
     VOLUME_ARGS+=(-v "$MODELS_DIR:$MODELS_DIR")
 else
     echo "WARNING: No models directory detected."
-    echo "  Set MODELS_DIR or run src/MoE/models/download.sh first."
+    echo "  Set MODELS_DIR or run models/download.sh first."
 fi
 
 if [ -n "$DATASETS_DIR" ] && [ -d "$DATASETS_DIR" ]; then
     VOLUME_ARGS+=(-v "$DATASETS_DIR:$DATASETS_DIR")
 else
     echo "WARNING: No datasets directory detected."
-    echo "  Set DATASETS_DIR or run src/MoE/datasets/download.sh first."
+    echo "  Set DATASETS_DIR or run datasets/download.sh first."
 fi
 
 # =========================================================

@@ -30,14 +30,14 @@ mixed decode/prefill/continuation steps.
 ```bash
 # Replay all policies for a cache fraction
 python scripts/batched_replay.py \
-    --model models/Mixtral-8x7B \
-    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+    --model ../../models/Mixtral-8x7B \
+    --trace-dir ../../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
     --cache-size 179
 
 # Single policy
 python scripts/batched_replay.py \
-    --model models/Mixtral-8x7B \
-    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+    --model ../../models/Mixtral-8x7B \
+    --trace-dir ../../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
     --cache-size 179 \
     --policies LRU-Oracle
 ```

@@ -12,8 +12,8 @@ new prefill, rest as continuations).
 Uses use_torch_compile=False to eliminate inductor noise.
 
 Usage:
-    python tests/test_chunked_prefill_pp.py --model models/Mixtral-8x7B --pp 2
-    python tests/test_chunked_prefill_pp.py --model models/OLMoE-1B-7B-0924 --pp 1
+    python tests/test_chunked_prefill_pp.py --model ../../models/Mixtral-8x7B --pp 2
+    python tests/test_chunked_prefill_pp.py --model ../../models/OLMoE-1B-7B-0924 --pp 1
 """
 import argparse
 import json

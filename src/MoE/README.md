@@ -49,7 +49,7 @@ maximize performance fidelity.
 
 | Parameter | Full (32L) | Truncated (20L) |
 |---|---|---|
-| Layers | 32 | 20 (via `models/truncate_model.py`) |
+| Layers | 32 | 20 (via `../../models/truncate_model.py`) |
 | Experts per layer | 8 (top-2 selected) | 8 (top-2 selected) |
 | Hidden / Intermediate | 4096 / 14336 | 4096 / 14336 |
 | Attention | 32 Q heads, 8 KV heads (GQA), head_dim=128 | same |
@@ -177,7 +177,7 @@ attention and RoPE scaling.
 ### Engine API
 
 ```python
-engine = MoEEngine("src/MoE/models/OLMoE-1B-7B")
+engine = MoEEngine("models/OLMoE-1B-7B")
 
 # CUDA graph capture — REQUIRED before any prefill/decode
 engine.capture_prefill_cuda_graph(total_token_sizes=[128, 256, 512, 1024, 2048])
@@ -331,16 +331,16 @@ cd src/MoE
 
 # Phase 1: Collect batched traces (one run per cache fraction)
 python trace_construction/collect_batched_traces.py \
-    --model models/Mixtral-8x7B \
-    --dataset datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json \
-    --output-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+    --model ../../models/Mixtral-8x7B \
+    --dataset ../../datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json \
+    --output-dir ../../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
     --cache-fraction 0.7 --num-conversations 200 --max-seqs 32 --pp 2 --resume
 
 # Phases 2+3: Policy simulation + GPU replay
 python scripts/batched_replay.py \
-    --model models/Mixtral-8x7B \
-    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
-    --batched-trace datasets/.../cache70pct/batched_trace.json \
+    --model ../../models/Mixtral-8x7B \
+    --trace-dir ../../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+    --batched-trace ../../datasets/.../cache70pct/batched_trace.json \
     --cache-size 179 --max-graph-size 512
 ```
 
@@ -356,7 +356,7 @@ from policy_simulator import Belady, OraclePrefetch, simulate
 from replay_controller import ReplayController
 
 # Step 1: Record a trace
-engine = MoEEngine("models/Mixtral-8x7B", experts_per_layer=2)
+engine = MoEEngine("../../models/Mixtral-8x7B", experts_per_layer=2)
 engine.capture_prefill_cuda_graph(total_token_sizes=[128])
 engine.capture_mixed_cuda_graphs(total_token_sizes=[128])
 with torch.inference_mode():
@@ -373,7 +373,7 @@ assert not dm_trace.validate()
 
 # Step 3: Replay on GPU
 dm_trace = GPUReplayTrace.load("belady_oracle_cs128.json")
-engine = MoEEngine("models/Mixtral-8x7B", cache_size=128)
+engine = MoEEngine("../../models/Mixtral-8x7B", cache_size=128)
 controller = ReplayController(engine, dm_trace)
 controller.setup()
 engine.replay_controller = controller
@@ -399,9 +399,9 @@ and GPU memory budget analysis.
 | `gpu_replay_trace.py` | `GPUReplayTrace`, `ActivationTrace`, `TransferEvent`, `StepScheduling`, `RequestScheduling` — trace formats with scheduling metadata, JSON serialization and validation |
 | `policy_simulator.py` | `CachePolicy` (LRU, Belady, LFU, StaticFreq) x `PrefetchPolicy` (NoPrefetch, OraclePrefetch) + `simulate()` — orthogonal policy simulators |
 | `replay_controller.py` | `ReplayController` — replays `GPUReplayTrace` on GPU with async prefetch streams and demand loading |
-| `models/download.sh` | Download model weights (OLMoE, Mixtral) |
-| `models/truncate_model.py` | Truncate model to N layers (for fitting large models on single GPU) |
-| `datasets/download.sh` | Download datasets (ShareGPT) to shared storage with symlinks |
+| `../../models/download.sh` | Download model weights (OLMoE, Mixtral) |
+| `../../models/truncate_model.py` | Truncate model to N layers (for fitting large models on single GPU) |
+| `../../datasets/download.sh` | Download datasets (ShareGPT) to shared storage with symlinks |
 
 ### Topic Documentation
 

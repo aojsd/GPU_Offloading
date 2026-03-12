@@ -16,10 +16,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
 
-MODEL=${MODEL:-models/Mixtral-8x7B}
+MODEL=${MODEL:-../../models/Mixtral-8x7B}
 MODEL_TAG=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
 WARMUP=100
-TRACE_BASE=datasets/ShareGPT_Vicuna/expert_traces/${MODEL_TAG}
+TRACE_BASE=../../datasets/ShareGPT_Vicuna/expert_traces/${MODEL_TAG}
 
 # Policy groups in priority order
 POLICY_GROUPS=(

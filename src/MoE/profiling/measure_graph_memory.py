@@ -8,7 +8,7 @@ compute_kv_budget_from_cache().
 
 Usage:
     python profiling/measure_graph_memory.py \
-        --model models/Mixtral-8x7B --pp 2
+        --model ../../models/Mixtral-8x7B --pp 2
 """
 import argparse
 import json

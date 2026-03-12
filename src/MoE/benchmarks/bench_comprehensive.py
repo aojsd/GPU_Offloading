@@ -8,10 +8,10 @@ of the MoE kernel after expert weights are already in the unified buffer.
 
 Usage:
   # Single config
-  python tests/bench_comprehensive.py --model models/Mixtral-8x7B --experts-per-layer 4 --batch 1
+  python tests/bench_comprehensive.py --model ../../models/Mixtral-8x7B --experts-per-layer 4 --batch 1
 
   # Full sweep for one model (groups by model+experts_per_layer to minimize reloads)
-  python tests/bench_comprehensive.py --model models/Mixtral-8x7B --sweep
+  python tests/bench_comprehensive.py --model ../../models/Mixtral-8x7B --sweep
 
   # Full sweep for all models
   python tests/bench_comprehensive.py --sweep-all
@@ -470,9 +470,9 @@ def main():
 
     if args.sweep_all:
         models = [
-            "models/OLMoE-1B-7B",
-            "models/Mixtral-8x7B-20L",
-            "models/Mixtral-8x7B",
+            "../../models/OLMoE-1B-7B",
+            "../../models/Mixtral-8x7B-20L",
+            "../../models/Mixtral-8x7B",
         ]
         all_results = {}
         for model in models:

@@ -11,8 +11,8 @@ this script validates all fractions for completeness.
 
 Usage:
     python validate_batched_trace.py \
-        --model models/Mixtral-8x7B \
-        --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b \
+        --model ../../models/Mixtral-8x7B \
+        --trace-dir ../../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b \
         --cache-pct 60 70 80 \
         --pipeline-parallel 2
 """

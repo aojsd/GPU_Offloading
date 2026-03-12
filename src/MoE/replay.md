@@ -636,7 +636,7 @@ from policy_simulator import Belady, OraclePrefetch, simulate
 from replay_controller import ReplayController
 
 # Step 1: Record a trace (ExpertOffloadEngine mode)
-engine = MoEEngine("models/Mixtral-8x7B", experts_per_layer=2)
+engine = MoEEngine("../../models/Mixtral-8x7B", experts_per_layer=2)
 engine.capture_prefill_cuda_graph(total_token_sizes=[128])
 engine.capture_mixed_cuda_graphs(total_token_sizes=[128])
 with torch.inference_mode():
@@ -654,7 +654,7 @@ dm_trace.save("belady_oracle_cs128.json")
 
 # Step 3: Replay on GPU
 dm_trace = GPUReplayTrace.load("belady_oracle_cs128.json")
-engine = MoEEngine("models/Mixtral-8x7B", cache_size=128)
+engine = MoEEngine("../../models/Mixtral-8x7B", cache_size=128)
 controller = ReplayController(engine, dm_trace)
 controller.setup()
 engine.replay_controller = controller
@@ -677,8 +677,8 @@ continuation batches. See [scripts/README.md](scripts/README.md) for usage.
 
 ```bash
 python scripts/batched_replay.py \
-    --model models/Mixtral-8x7B \
-    --trace-dir datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
+    --model ../../models/Mixtral-8x7B \
+    --trace-dir ../../datasets/ShareGPT_Vicuna/expert_traces/mixtral-8x7b/cache70pct \
     --cache-size 179 --max-graph-size 512
 ```
 

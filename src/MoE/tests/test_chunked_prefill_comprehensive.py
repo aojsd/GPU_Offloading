@@ -15,9 +15,9 @@ Uses use_torch_compile=False to eliminate inductor noise.
 
 Usage:
     CUDA_VISIBLE_DEVICES=0 python tests/test_chunked_prefill_comprehensive.py \
-        --model models/Mixtral-8x7B-20L --device cuda:0
+        --model ../../models/Mixtral-8x7B-20L --device cuda:0
     CUDA_VISIBLE_DEVICES=1 python tests/test_chunked_prefill_comprehensive.py \
-        --model models/OLMoE-1B-7B --device cuda:0
+        --model ../../models/OLMoE-1B-7B --device cuda:0
 """
 import argparse
 import json

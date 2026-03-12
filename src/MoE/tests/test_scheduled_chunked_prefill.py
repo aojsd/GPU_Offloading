@@ -12,9 +12,9 @@ Test 3: Mixed batch — decode tokens + continuation chunk in same step
 Test 4: Multiple ShareGPT prompts — systematic comparison
 
 Usage:
-    python tests/test_scheduled_chunked_prefill.py --model models/Mixtral-8x7B-20L
-    python tests/test_scheduled_chunked_prefill.py --model models/OLMoE-1B-7B-0924
-    python tests/test_scheduled_chunked_prefill.py --model models/Mixtral-8x7B --pp 2
+    python tests/test_scheduled_chunked_prefill.py --model ../../models/Mixtral-8x7B-20L
+    python tests/test_scheduled_chunked_prefill.py --model ../../models/OLMoE-1B-7B-0924
+    python tests/test_scheduled_chunked_prefill.py --model ../../models/Mixtral-8x7B --pp 2
 """
 import argparse
 import json
@@ -28,10 +28,10 @@ from moe_engine import MoEEngine
 
 
 DEFAULT_MODEL = str(
-    Path(__file__).resolve().parent.parent / "models" / "Mixtral-8x7B-20L")
+    Path(__file__).resolve().parent.parent.parent.parent / "models" / "Mixtral-8x7B-20L")
 
 SHAREGPT_JSON = (
-    Path(__file__).resolve().parent.parent
+    Path(__file__).resolve().parent.parent.parent.parent
     / "datasets" / "ShareGPT_Vicuna" / "ShareGPT_V3_unfiltered_cleaned_split.json")
 
 

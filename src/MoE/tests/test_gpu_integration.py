@@ -7,13 +7,13 @@ and token generation.
 
 Usage:
     # Single-GPU OLMoE (fast, ~2 min)
-    python tests/test_gpu_integration.py --model models/OLMoE-1B-7B
+    python tests/test_gpu_integration.py --model ../../models/OLMoE-1B-7B
 
     # PP=2 Mixtral-8x7B (full 32 layers, 2x H100, ~5 min)
-    python tests/test_gpu_integration.py --model models/Mixtral-8x7B --pp 2
+    python tests/test_gpu_integration.py --model ../../models/Mixtral-8x7B --pp 2
 
     # Single-GPU Mixtral with expert offloading (K experts/layer on GPU)
-    python tests/test_gpu_integration.py --model models/Mixtral-8x7B --experts-per-layer 4
+    python tests/test_gpu_integration.py --model ../../models/Mixtral-8x7B --experts-per-layer 4
 """
 import argparse
 import math

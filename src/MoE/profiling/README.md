@@ -1,7 +1,7 @@
 # Profiling
 
 Nsight Systems and CUDA event profiling harnesses for the MoE engine.
-All scripts require an H100 GPU with models downloaded to `models/`.
+All scripts require an H100 GPU with models downloaded to `../../models/`.
 Run from `src/MoE/`.
 
 ## Scripts
@@ -62,7 +62,7 @@ python profiling/profile_phases.py --measure-transfer
 |-----|---------|-------------|
 | `--decode` | (none) | Decode configs: `128` or `4:2048` (batch:seqlen) |
 | `--prefill` | (none) | Prefill configs: `1024` or `2:128` |
-| `--model` | `models/Mixtral-8x7B-20L` | Path to model directory |
+| `--model` | `../../models/Mixtral-8x7B-20L` | Path to model directory |
 | `--sweep` | off | Run CUDA-event sweep, generate profiling.md |
 | `--compile` | off | Enable torch.compile |
 | `--analyze` | None | Analyze existing sqlite file (skip profiling) |

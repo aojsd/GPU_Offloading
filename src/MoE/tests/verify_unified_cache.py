@@ -196,9 +196,9 @@ def main():
     parser.add_argument("--model", default=None,
                         help="Path to a model directory (used as both "
                              "--model-32L and --model-20L)")
-    parser.add_argument("--model-32L", default="src/MoE/models/Mixtral-8x7B",
+    parser.add_argument("--model-32L", default="models/Mixtral-8x7B",
                         help="Path to 32L Mixtral model")
-    parser.add_argument("--model-20L", default="src/MoE/models/Mixtral-8x7B-20L",
+    parser.add_argument("--model-20L", default="models/Mixtral-8x7B-20L",
                         help="Path to 20L Mixtral model")
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--skip-32L", action="store_true",

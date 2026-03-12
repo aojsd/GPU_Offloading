@@ -11,22 +11,22 @@ Run from `src/MoE/`:
 python -m pytest tests/test_replay_policy.py tests/test_scheduling.py tests/test_trace_construction.py -v
 
 # GPU tests — OLMoE on 1 GPU
-CUDA_VISIBLE_DEVICES=0 python tests/test_split_stage4.py --model models/OLMoE-1B-7B
-CUDA_VISIBLE_DEVICES=0 python tests/test_piecewise_prefill.py --model models/OLMoE-1B-7B
-CUDA_VISIBLE_DEVICES=0 python tests/test_offload_correctness.py --model models/OLMoE-1B-7B
-CUDA_VISIBLE_DEVICES=0 python tests/test_scheduled_chunked_prefill.py --model models/OLMoE-1B-7B
-CUDA_VISIBLE_DEVICES=0 python tests/test_chunked_prefill_comprehensive.py --model models/OLMoE-1B-7B
-CUDA_VISIBLE_DEVICES=0 python tests/test_chunked_prefill_pp.py --model models/OLMoE-1B-7B --pp 1
-CUDA_VISIBLE_DEVICES=0 python tests/test_dynamic_pages.py --model models/OLMoE-1B-7B
-CUDA_VISIBLE_DEVICES=0 python tests/test_gpu_integration.py --model models/OLMoE-1B-7B
+CUDA_VISIBLE_DEVICES=0 python tests/test_split_stage4.py --model ../../models/OLMoE-1B-7B
+CUDA_VISIBLE_DEVICES=0 python tests/test_piecewise_prefill.py --model ../../models/OLMoE-1B-7B
+CUDA_VISIBLE_DEVICES=0 python tests/test_offload_correctness.py --model ../../models/OLMoE-1B-7B
+CUDA_VISIBLE_DEVICES=0 python tests/test_scheduled_chunked_prefill.py --model ../../models/OLMoE-1B-7B
+CUDA_VISIBLE_DEVICES=0 python tests/test_chunked_prefill_comprehensive.py --model ../../models/OLMoE-1B-7B
+CUDA_VISIBLE_DEVICES=0 python tests/test_chunked_prefill_pp.py --model ../../models/OLMoE-1B-7B --pp 1
+CUDA_VISIBLE_DEVICES=0 python tests/test_dynamic_pages.py --model ../../models/OLMoE-1B-7B
+CUDA_VISIBLE_DEVICES=0 python tests/test_gpu_integration.py --model ../../models/OLMoE-1B-7B
 
 # GPU tests — Mixtral-8x7B PP=2 (2x H100)
-python tests/test_split_stage4.py --model models/Mixtral-8x7B --pp 2
-python tests/test_scheduled_chunked_prefill.py --model models/Mixtral-8x7B --pp 2
-python tests/test_chunked_prefill_comprehensive.py --model models/Mixtral-8x7B --pp 2
-python tests/test_chunked_prefill_pp.py --model models/Mixtral-8x7B --pp 2
-python tests/test_dynamic_pages.py --model models/Mixtral-8x7B --pp 2
-python tests/test_gpu_integration.py --model models/Mixtral-8x7B --pp 2
+python tests/test_split_stage4.py --model ../../models/Mixtral-8x7B --pp 2
+python tests/test_scheduled_chunked_prefill.py --model ../../models/Mixtral-8x7B --pp 2
+python tests/test_chunked_prefill_comprehensive.py --model ../../models/Mixtral-8x7B --pp 2
+python tests/test_chunked_prefill_pp.py --model ../../models/Mixtral-8x7B --pp 2
+python tests/test_dynamic_pages.py --model ../../models/Mixtral-8x7B --pp 2
+python tests/test_gpu_integration.py --model ../../models/Mixtral-8x7B --pp 2
 ```
 
 ## Quick Reference: Which Tests Run Where
@@ -104,9 +104,9 @@ piecewise determinism and decode consistency instead.
 
 ```bash
 # OLMoE 1 GPU
-CUDA_VISIBLE_DEVICES=0 python tests/test_split_stage4.py --model models/OLMoE-1B-7B
+CUDA_VISIBLE_DEVICES=0 python tests/test_split_stage4.py --model ../../models/OLMoE-1B-7B
 # Mixtral PP=2
-python tests/test_split_stage4.py --model models/Mixtral-8x7B --pp 2
+python tests/test_split_stage4.py --model ../../models/Mixtral-8x7B --pp 2
 ```
 
 #### `test_scheduled_chunked_prefill.py` — Chunked prefill correctness (4 tests)
@@ -123,9 +123,9 @@ prompts (loaded from the raw dataset, model-independent).
 
 ```bash
 # OLMoE 1 GPU
-CUDA_VISIBLE_DEVICES=0 python tests/test_scheduled_chunked_prefill.py --model models/OLMoE-1B-7B
+CUDA_VISIBLE_DEVICES=0 python tests/test_scheduled_chunked_prefill.py --model ../../models/OLMoE-1B-7B
 # Mixtral PP=2
-python tests/test_scheduled_chunked_prefill.py --model models/Mixtral-8x7B --pp 2
+python tests/test_scheduled_chunked_prefill.py --model ../../models/Mixtral-8x7B --pp 2
 ```
 
 #### `test_chunked_prefill_comprehensive.py` — 200-prompt chunked prefill sweep
@@ -146,9 +146,9 @@ informational.
 
 ```bash
 # OLMoE 1 GPU
-CUDA_VISIBLE_DEVICES=0 python tests/test_chunked_prefill_comprehensive.py --model models/OLMoE-1B-7B
+CUDA_VISIBLE_DEVICES=0 python tests/test_chunked_prefill_comprehensive.py --model ../../models/OLMoE-1B-7B
 # Mixtral PP=2
-python tests/test_chunked_prefill_comprehensive.py --model models/Mixtral-8x7B --pp 2
+python tests/test_chunked_prefill_comprehensive.py --model ../../models/Mixtral-8x7B --pp 2
 ```
 
 #### `test_chunked_prefill_pp.py` — PP chunked prefill sweep
@@ -165,9 +165,9 @@ Supports any model/PP combination.
 
 ```bash
 # OLMoE 1 GPU
-CUDA_VISIBLE_DEVICES=0 python tests/test_chunked_prefill_pp.py --model models/OLMoE-1B-7B --pp 1
+CUDA_VISIBLE_DEVICES=0 python tests/test_chunked_prefill_pp.py --model ../../models/OLMoE-1B-7B --pp 1
 # Mixtral PP=2
-python tests/test_chunked_prefill_pp.py --model models/Mixtral-8x7B --pp 2
+python tests/test_chunked_prefill_pp.py --model ../../models/Mixtral-8x7B --pp 2
 ```
 
 #### `test_dynamic_pages.py` — Dynamic page allocation correctness
@@ -184,9 +184,9 @@ mixed batches.
 
 ```bash
 # OLMoE 1 GPU
-CUDA_VISIBLE_DEVICES=0 python tests/test_dynamic_pages.py --model models/OLMoE-1B-7B
+CUDA_VISIBLE_DEVICES=0 python tests/test_dynamic_pages.py --model ../../models/OLMoE-1B-7B
 # Mixtral PP=2
-python tests/test_dynamic_pages.py --model models/Mixtral-8x7B --pp 2
+python tests/test_dynamic_pages.py --model ../../models/Mixtral-8x7B --pp 2
 ```
 
 #### `test_gpu_integration.py` — End-to-end batched collection & replay (10 tests)
@@ -212,13 +212,13 @@ when PP > 1.
 
 ```bash
 # OLMoE single GPU (~2 min)
-CUDA_VISIBLE_DEVICES=0 python tests/test_gpu_integration.py --model models/OLMoE-1B-7B
+CUDA_VISIBLE_DEVICES=0 python tests/test_gpu_integration.py --model ../../models/OLMoE-1B-7B
 
 # Mixtral PP=2 (2x H100, ~5 min)
-python tests/test_gpu_integration.py --model models/Mixtral-8x7B --pp 2
+python tests/test_gpu_integration.py --model ../../models/Mixtral-8x7B --pp 2
 
 # Mixtral single GPU with expert offloading (tests 9-10)
-python tests/test_gpu_integration.py --model models/Mixtral-8x7B --experts-per-layer 4
+python tests/test_gpu_integration.py --model ../../models/Mixtral-8x7B --experts-per-layer 4
 ```
 
 | Arg | Default | Description |
@@ -245,7 +245,7 @@ piecewise validation with PP.
 
 ```bash
 # OLMoE 1 GPU
-CUDA_VISIBLE_DEVICES=0 python tests/test_piecewise_prefill.py --model models/OLMoE-1B-7B
+CUDA_VISIBLE_DEVICES=0 python tests/test_piecewise_prefill.py --model ../../models/OLMoE-1B-7B
 ```
 
 #### `test_offload_correctness.py` — Offloaded decode correctness (single-GPU only)
@@ -265,7 +265,7 @@ exclusive.
 
 ```bash
 # OLMoE 1 GPU
-CUDA_VISIBLE_DEVICES=0 python tests/test_offload_correctness.py --model models/OLMoE-1B-7B
+CUDA_VISIBLE_DEVICES=0 python tests/test_offload_correctness.py --model ../../models/OLMoE-1B-7B
 ```
 
 #### `test_pipeline_parallel.py` — PP=2 vs single-GPU offloaded (Mixtral only)
@@ -285,7 +285,7 @@ single-GPU offloaded, which requires a model too large for one GPU.
 
 ```bash
 # Mixtral 2x H100
-python tests/test_pipeline_parallel.py --model models/Mixtral-8x7B
+python tests/test_pipeline_parallel.py --model ../../models/Mixtral-8x7B
 ```
 
 #### `test_pcie_contention.py` — PCIe bandwidth contention (Mixtral single-GPU only)
@@ -320,11 +320,11 @@ Test 2 (20L): Compares all-resident unified cache vs no offloading.
 
 ## Models
 
-Scripts expect models in `src/MoE/models/`:
+Scripts expect models in `models/` (at repository root):
 
 | Model | Path | Notes |
 |-------|------|-------|
 | OLMoE-1B-7B | `models/OLMoE-1B-7B` | 16L, 64E (top-8), ~13.8 GB |
 | Mixtral-8x7B | `models/Mixtral-8x7B` | 32L, 8E (top-2), ~86 GB. Requires PP=2 or offloading. |
 
-Download: `bash models/download.sh`.
+Download: `bash ../../models/download.sh`.

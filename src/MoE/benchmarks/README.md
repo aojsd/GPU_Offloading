@@ -1,7 +1,7 @@
 # Benchmarks
 
 Performance benchmarks for the MoE engine's offloading infrastructure.
-All scripts require an H100 GPU with models downloaded to `models/`.
+All scripts require an H100 GPU with models downloaded to `../../models/`.
 Run from `src/MoE/`.
 
 ## Scripts
@@ -17,10 +17,10 @@ configurations (parity checks). Primary benchmark for data in
 
 ```bash
 # Single config
-python benchmarks/bench_comprehensive.py --model models/Mixtral-8x7B-20L --experts-per-layer 4 --batch 1
+python benchmarks/bench_comprehensive.py --model ../../models/Mixtral-8x7B-20L --experts-per-layer 4 --batch 1
 
 # Full sweep for one model
-python benchmarks/bench_comprehensive.py --model models/Mixtral-8x7B-20L --sweep
+python benchmarks/bench_comprehensive.py --model ../../models/Mixtral-8x7B-20L --sweep
 
 # All 3 models
 python benchmarks/bench_comprehensive.py --sweep-all
@@ -51,14 +51,14 @@ Reports latency and transfer statistics per configuration. Primary benchmark
 for prefill and mixed batch offloading data in [offload_1GPU.md](../offload_1GPU.md).
 
 ```bash
-python benchmarks/bench_offload_prefill_mixed.py --model models/Mixtral-8x7B-20L
-python benchmarks/bench_offload_prefill_mixed.py --model models/OLMoE-1B-7B
-python benchmarks/bench_offload_prefill_mixed.py --model models/Mixtral-8x7B
+python benchmarks/bench_offload_prefill_mixed.py --model ../../models/Mixtral-8x7B-20L
+python benchmarks/bench_offload_prefill_mixed.py --model ../../models/OLMoE-1B-7B
+python benchmarks/bench_offload_prefill_mixed.py --model ../../models/Mixtral-8x7B
 ```
 
 | Arg | Default | Description |
 |-----|---------|-------------|
-| `--model` | `models/Mixtral-8x7B-20L` | Path to model directory |
+| `--model` | `../../models/Mixtral-8x7B-20L` | Path to model directory |
 | `--n-warmup` | 3 | Warmup trials |
 | `--n-trials` | 10 | Timing trials per config |
 | `--output` | (none) | Save results to JSON |

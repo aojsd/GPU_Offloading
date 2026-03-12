@@ -4144,7 +4144,7 @@ class MoEEngine:
 
 if __name__ == "__main__":
     import sys
-    model_path = sys.argv[1] if len(sys.argv) > 1 else "src/MoE/models/OLMoE-1B-7B"
+    model_path = sys.argv[1] if len(sys.argv) > 1 else "models/OLMoE-1B-7B"
     engine = MoEEngine(model_path, max_seqs=4, max_seq_len=512,
                        use_torch_compile=False)
 

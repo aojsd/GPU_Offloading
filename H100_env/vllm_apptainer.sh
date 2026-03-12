@@ -109,16 +109,23 @@ echo "  Repo root   : $REPO_ROOT"
 echo "  Models dir  : ${MODELS_DIR:-(not set)}"
 echo "  Datasets dir: ${DATASETS_DIR:-(not set)}"
 
+# The base image only has python3; create a temp dir with a python symlink
+# so scripts that invoke `python` work without rebuilding the SIF.
+_PY_SHIM_DIR="$(mktemp -d)"
+ln -sf /usr/bin/python3 "$_PY_SHIM_DIR/python"
+
 if [ $# -gt 0 ]; then
     echo "  Command     : $*"
     apptainer exec --nv \
-        --bind "$BIND_ARGS" \
+        --bind "$BIND_ARGS,$_PY_SHIM_DIR:$_PY_SHIM_DIR" \
         --pwd "$CONTAINER_WORKSPACE" \
         "$SIF_FILE" \
-        bash -c "$*"
+        bash -c "export PATH=\"$_PY_SHIM_DIR:\$PATH\" && $*"
 else
     apptainer shell --nv \
-        --bind "$BIND_ARGS" \
+        --bind "$BIND_ARGS,$_PY_SHIM_DIR:$_PY_SHIM_DIR" \
         --pwd "$CONTAINER_WORKSPACE" \
         "$SIF_FILE"
 fi
+
+rm -rf "$_PY_SHIM_DIR"

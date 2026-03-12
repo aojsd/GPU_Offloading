@@ -12,6 +12,9 @@ From: vllm/vllm-openai:v0.17.1
     # Example:
     # pip install some-extra-package
 
+    # The base image only ships python3; alias python -> python3
+    ln -sf /usr/bin/python3 /usr/local/bin/python
+
     echo "Custom vLLM container build complete."
 
 %environment

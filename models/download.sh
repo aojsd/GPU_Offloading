@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
-# Download MoE model weights and create a symlink in this directory.
+# Download model weights and create a symlink in this directory.
 #
 # Usage:
 #   ./download.sh <target_dir> [model]
 #
-# Models:
+# MoE Models:
 #   olmoe     (default) allenai/OLMoE-1B-7B-0924
 #   mixtral              mistralai/Mixtral-8x7B-Instruct-v0.1
 #   deepseek2            deepseek-ai/DeepSeek-V2
 #   deepseek2-lite       deepseek-ai/DeepSeek-V2-Lite
+#
+# Dense Models:
+#   qwen3-32b            Qwen/Qwen3-32B              (~65 GB BF16)
 #
 # Examples:
 #   ./download.sh ~/project/models                   # downloads OLMoE
 #   ./download.sh ~/project/models mixtral            # downloads Mixtral-8x7B
 #   ./download.sh ~/project/models deepseek2          # downloads DeepSeek-V2
 #   ./download.sh ~/project/models deepseek2-lite     # downloads DeepSeek-V2-Lite
+#   ./download.sh ~/project/models qwen3-32b          # downloads Qwen3-32B (dense)
 #
 # Downloads into <target_dir>/<model_name> and creates a symlink in this
 # directory pointing to it.
@@ -25,16 +29,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Model registry ───────────────────────────────────────────────────
 declare -A HF_REPOS=(
+    # MoE models
     [olmoe]="allenai/OLMoE-1B-7B-0924"
     [mixtral]="mistralai/Mixtral-8x7B-Instruct-v0.1"
     [deepseek2]="deepseek-ai/DeepSeek-V2"
     [deepseek2-lite]="deepseek-ai/DeepSeek-V2-Lite"
+    # Dense models
+    [qwen3-32b]="Qwen/Qwen3-32B"
 )
 declare -A LOCAL_NAMES=(
+    # MoE models
     [olmoe]="OLMoE-1B-7B"
     [mixtral]="Mixtral-8x7B"
     [deepseek2]="DeepSeek-V2"
     [deepseek2-lite]="DeepSeek-V2-Lite"
+    # Dense models
+    [qwen3-32b]="Qwen3-32B"
 )
 
 # ── Parse args ───────────────────────────────────────────────────────

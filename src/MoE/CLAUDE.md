@@ -63,7 +63,12 @@ and end-to-end usage.
 - FlashInfer RoPE JIT needs `ninja` in PATH (prefill only)
 - torch.compile Inductor produces numerically different greedy tokens from eager (expected); no-compile matches vLLM at 80.4%, with compile only 3.8%
 - **CUDA graph static buffer GC**: ALL tensors captured by a graph must be kept alive; save in the graph info dict
-- **FlashInfer `plan()` before every decode replay**: `_plan_info` tile counts depend on actual page count, not just buffer contents
+- **FlashInfer `plan()` before every decode replay**: `_plan_info` tile counts depend on actual page count, not just buffer contents (applies to non-MLA FlashInfer decode and MLA continuation prefill)
 - **`_seq_lens_cpu += 1` BEFORE `plan()`**: FlashInfer must include the current token's K/V
 - **FlashInfer prefill incompatible with multi-graph**: `fmha_varlen_plan()` allocates fresh GPU tensors per call; use vLLM FA3 instead
+- **DS-V2-Lite (`is_mla=True`) LD_PRELOAD**: FlashInfer MLA JIT (GLIBCXX 3.4.32) is required
+  for continuation prefill (stage 3b) and `_layer_mixed_mla` eager fallback. Must prefix DS-V2-Lite runs with:
+  `LD_PRELOAD=/gpfs/radev/apps/avx512/software/GCCcore/13.3.0/lib64/libstdc++.so.6`
+  Piecewise decode (stage 2) uses vLLM FA3 and does NOT require LD_PRELOAD.
+- **All decode routes through piecewise** (`decode_step` → `mixed_step`); monolithic decode graph path removed
 - Eager mode is NOT for real experiments — only for sanity checks in test files

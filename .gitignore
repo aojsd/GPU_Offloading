@@ -16,7 +16,7 @@ src/MoE/datasets/*
 !src/MoE/datasets/calc_avg_layer_experts.py
 
 # Personal CLAUDE.md
-CLAUDE.md
+./CLAUDE.md
 
 # Figures
 *.pdf

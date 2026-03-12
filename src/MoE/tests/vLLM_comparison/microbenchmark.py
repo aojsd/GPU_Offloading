@@ -1774,8 +1774,6 @@ def main():
     dispatch = {
         "decode": cmd_decode,
         "prefill": cmd_prefill,
-        "pp-decode": cmd_pp_decode,
-        "pp-prefill": cmd_pp_prefill,
         "cuda-graph": cmd_cuda_graph,
         "mixed": cmd_mixed,
         "all": cmd_all,

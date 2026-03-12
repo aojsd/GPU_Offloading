@@ -19,7 +19,7 @@ class TraceRecorder:
 
         # Engine calls begin_step/process_layer/post_layer automatically
         for step in range(num_steps):
-            logits = engine.mixed_step(...)
+            logits = engine.step(...)
 
         trace_data = recorder.trace       # list of {step, layer, expert_ids}
         recorder.reset_trace()            # clear for next conversation

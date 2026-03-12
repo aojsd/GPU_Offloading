@@ -45,7 +45,7 @@ See [README.md](README.md) for project overview, offloading design, and file ind
 
 - `VLLM_ENABLE_V1_MULTIPROCESSING=0` must be set **before** any vLLM import
 - V tensor after QKV split is non-contiguous → needs `.contiguous()` or `.reshape()`
-- Q/K norm (if present) applies on flat `[B, hidden_dim]` **before** head reshape, not per-head
+- Q/K norm behavior is **model-dependent**: OLMoE uses flat `[B, hidden_dim]` with weight `[H]` before head reshape; **Qwen3** uses per-head `[B, num_heads, head_dim]` with weight `[head_dim]` after reshaping. See `DENSE_ENGINE_PLAN.md` §1.7a for the Qwen3 pattern.
 - FlashInfer RoPE JIT needs `ninja` in PATH (prefill only)
 - torch.compile Inductor produces numerically different greedy tokens from eager (expected)
 - **CUDA graph static buffer GC**: ALL tensors captured by a graph must be kept alive; save in the graph info dict

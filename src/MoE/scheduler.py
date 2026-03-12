@@ -10,7 +10,7 @@ This module contains:
 - PageAllocator: protocol for page management
 - MockPageAllocator: CPU-side page pool for testing
 - Scheduler: unified state machine + GPU orchestration
-- extract_next_tokens: logit extraction from mixed_step [D|P|C] layout
+- extract_next_tokens: logit extraction from step [D|P|C] layout
 - CollectionResult / ReplayResult: typed results for GPU methods
 - Serialization helpers: save_batched_trace, save_conversations
 """
@@ -175,7 +175,7 @@ class Scheduler:
         scheduler.add_requests([...])
         while not scheduler.is_done:
             result = scheduler.step()
-            # caller runs engine.mixed_step() using result
+            # caller runs engine.step() using result
             # caller extracts tokens from logits
             scheduler.advance_state(result, next_tokens)
     """
@@ -245,7 +245,7 @@ class Scheduler:
         self.waiting.extend(requests)
 
     def step(self) -> ScheduleResult:
-        """Run one scheduling step. Returns execution groups for mixed_step.
+        """Run one scheduling step. Returns execution groups for step.
 
         Implements the 6-phase vLLM V1 scheduling loop:
         1. Complete finished requests
@@ -670,7 +670,7 @@ class Scheduler:
                         engine._seq_lens_cpu[slot].item())
 
                 # 4. GPU forward pass
-                logits = engine.mixed_step(
+                logits = engine.step(
                     decode_seq_ids=result.decode_seq_ids,
                     decode_token_ids=decode_token_ids,
                     prefill_seq_ids=result.prefill_seq_ids,
@@ -857,7 +857,7 @@ class Scheduler:
                             # active_requests[rid] is kept intentionally:
                             # preserves decode_step for readmission.
 
-                # 2. Build mixed_step args from scheduling metadata
+                # 2. Build step args from scheduling metadata
                 decode_sids = []
                 decode_tokens_list = []
                 prefill_sids = []
@@ -925,7 +925,7 @@ class Scheduler:
                             sid, math.ceil((off + len(ids)) / self.page_size))
 
                 # 4. GPU forward
-                logits = engine.mixed_step(
+                logits = engine.step(
                     decode_seq_ids=decode_sids,
                     decode_token_ids=decode_tensor,
                     prefill_seq_ids=prefill_sids,
@@ -985,9 +985,9 @@ def extract_next_tokens(
     prefill_chunk_lengths: list[int],
     continuation_chunk_lengths: list[int],
 ) -> list[int]:
-    """Extract per-sequence next token IDs from mixed_step logits.
+    """Extract per-sequence next token IDs from step logits.
 
-    Logit layout from mixed_step: [D decode rows | P prefill rows | C continuation rows]
+    Logit layout from step: [D decode rows | P prefill rows | C continuation rows]
     - Decode: argmax of logits[i] for each decode sequence
     - Prefill: argmax of LAST row in each chunk
     - Continuation: argmax of LAST row in each chunk

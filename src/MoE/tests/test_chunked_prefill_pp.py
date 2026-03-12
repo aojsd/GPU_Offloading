@@ -70,10 +70,10 @@ def load_all_sharegpt_prompts(max_prompts=200):
 
 
 def ref_prefill_single_shot(engine, seq_id, input_ids):
-    """Prefill full prompt in one shot via mixed_step. Returns [S, vocab]."""
+    """Prefill full prompt in one shot via step. Returns [S, vocab]."""
     engine.reset()
     with torch.inference_mode():
-        logits = engine.mixed_step(
+        logits = engine.step(
             decode_seq_ids=[],
             decode_token_ids=torch.empty(0, dtype=torch.long,
                                          device=engine.device),
@@ -111,14 +111,14 @@ def chunked_prefill_n_chunks(engine, seq_id, input_ids, max_chunk_size):
             chunk_len = chunk.shape[0]
 
             if offset == 0:
-                logits = engine.mixed_step(
+                logits = engine.step(
                     decode_seq_ids=[],
                     decode_token_ids=empty,
                     prefill_seq_ids=[seq_id],
                     prefill_input_ids=[chunk],
                 )
             else:
-                logits = engine.mixed_step(
+                logits = engine.step(
                     decode_seq_ids=[],
                     decode_token_ids=empty,
                     prefill_seq_ids=[],
@@ -270,7 +270,7 @@ def main():
     print(f"\nCapturing piecewise CUDA graphs for sizes: {graph_sizes}")
     t0 = time.time()
     with torch.inference_mode():
-        engine.capture_mixed_cuda_graphs(
+        engine.capture_cuda_graphs(
             total_token_sizes=graph_sizes,
             use_torch_compile=False,
         )

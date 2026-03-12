@@ -174,7 +174,7 @@ def run_batched_scenario(engine, dynamic):
             engine.alloc_pages(sid_a, math.ceil(256 / page_size))
             engine.alloc_pages(sid_b, math.ceil(256 / page_size))
 
-        logits = engine.mixed_step(
+        logits = engine.step(
             decode_seq_ids=[],
             decode_token_ids=torch.empty(0, dtype=torch.long, device=dev),
             prefill_seq_ids=[sid_a, sid_b],
@@ -201,7 +201,7 @@ def run_batched_scenario(engine, dynamic):
                 engine.ensure_pages(
                     sid_b, math.ceil(b_end / page_size))
 
-            logits = engine.mixed_step(
+            logits = engine.step(
                 decode_seq_ids=[sid_a],
                 decode_token_ids=next_a,
                 prefill_seq_ids=[],
@@ -235,7 +235,7 @@ def run_batched_scenario(engine, dynamic):
             t0 = torch.cuda.Event(enable_timing=True)
             t1 = torch.cuda.Event(enable_timing=True)
             t0.record()
-            logits = engine.mixed_step(
+            logits = engine.step(
                 decode_seq_ids=[sid_a, sid_b],
                 decode_token_ids=decode_tokens,
                 prefill_seq_ids=[],
@@ -258,7 +258,7 @@ def run_batched_scenario(engine, dynamic):
                 have = len(engine._seq_page_list[sid_a])
                 if needed > have:
                     engine.alloc_pages(sid_a, 1)
-            logits = engine.mixed_step(
+            logits = engine.step(
                 decode_seq_ids=[sid_a],
                 decode_token_ids=next_a,
                 prefill_seq_ids=[],
@@ -293,7 +293,7 @@ def test_static_vs_dynamic(model_path, pp_size, use_compile):
     print(f"Engine created in {time.time() - t0:.1f}s")
 
     print("Capturing CUDA graphs...")
-    engine_s.capture_mixed_cuda_graphs(graph_sizes)
+    engine_s.capture_cuda_graphs(graph_sizes)
 
     print("Running scenario (static)...")
     logits_s, times_s = run_batched_scenario(engine_s, dynamic=False)
@@ -313,7 +313,7 @@ def test_static_vs_dynamic(model_path, pp_size, use_compile):
     print(f"Engine created in {time.time() - t0:.1f}s")
 
     print("Capturing CUDA graphs...")
-    engine_d.capture_mixed_cuda_graphs(graph_sizes)
+    engine_d.capture_cuda_graphs(graph_sizes)
 
     print("Running scenario (dynamic)...")
     logits_d, times_d = run_batched_scenario(engine_d, dynamic=True)

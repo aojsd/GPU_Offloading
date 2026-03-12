@@ -2,7 +2,7 @@
 
 Replays a pre-computed GPUReplayTrace on real GPU hardware using a
 unified expert cache shared across all layers. Drives the same
-_mixed_step_piecewise loop as ExpertOffloadEngine but uses trace-specified
+_step_piecewise loop as ExpertOffloadEngine but uses trace-specified
 prefetch/eviction/demand-load schedules instead of reactive demand loading.
 
 Prefetch timing:
@@ -26,7 +26,7 @@ Usage:
 
     engine.replay_controller = controller
     for step in range(len(trace.steps)):
-        logits = engine.mixed_step(...)
+        logits = engine.step(...)
 
     timing = controller.get_replay_stats()
 """
@@ -132,7 +132,7 @@ class ReplayController:
     No per-layer partitioning or scratchpad.
 
     Replaces ExpertOffloadEngine during replay mode. The MoEEngine's
-    _mixed_step_piecewise dispatches to this controller when
+    _step_piecewise dispatches to this controller when
     engine.replay_controller is set.
 
     Interface:
@@ -156,7 +156,7 @@ class ReplayController:
             track_phases: Record CUDA events at every phase boundary
                 (stage1, attention, stage4a, io, stage4b, step_setup,
                 step_finish). Superset of track_io. The engine records
-                events via self._phase_timer in _mixed_step_piecewise.
+                events via self._phase_timer in _step_piecewise.
         """
         self.trace = trace
         self.device = engine.device

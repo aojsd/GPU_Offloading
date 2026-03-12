@@ -28,7 +28,7 @@ engine (`../MoE/moe_engine.py`) that:
 | KV cache | Paged block table with `reshape_and_cache_flash` writes |
 | Decode attention | FlashInfer `BatchDecodeWithPagedKVCacheWrapper` |
 | Prefill attention | `flash_attn_varlen_func` (vLLM FA3) |
-| Mixed batches | Unified prefill+decode via `mixed_step()` |
+| Mixed batches | Unified prefill+decode via `step()` |
 | Compilation | `torch.compile` for fused RMSNorm + residual + RoPE |
 | CUDA graphs | Piecewise capture for graph-mode inference |
 | Generate loop | Prefill → autoregressive decode with greedy sampling |

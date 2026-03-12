@@ -35,7 +35,7 @@ def main():
         engine.capture_prefill_cuda_graph(total_token_sizes=[128],
                                            use_torch_compile=False)
         engine.reset()
-        engine.capture_mixed_cuda_graphs(total_token_sizes=[1, 128],
+        engine.capture_cuda_graphs(total_token_sizes=[1, 128],
                                           use_torch_compile=False)
 
     oe = engine.offload_engine
@@ -58,9 +58,9 @@ def main():
         logits = engine.prefill_to_slot(0, prompt)
         next_token = logits[-1].argmax().unsqueeze(0)
 
-        # Warmup (begin_step auto-called inside mixed_step)
+        # Warmup (begin_step auto-called inside step)
         for _ in range(5):
-            logits = engine.mixed_step(
+            logits = engine.step(
                 decode_seq_ids=[0], decode_token_ids=next_token,
                 prefill_seq_ids=[], prefill_input_ids=[])
             next_token = logits[0].argmax().unsqueeze(0)

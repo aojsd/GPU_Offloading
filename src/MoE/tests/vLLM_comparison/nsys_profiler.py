@@ -127,7 +127,7 @@ def write_custom_driver(path, seq_len, model_dir):
         for _ in range(NUM_WARMUP):
             engine.seq_lens[0] = SEQ_LEN
             engine._seq_lens_cpu[0] = SEQ_LEN
-            engine._decode_step_graphed(token, pos)
+            engine.decode_step(token, pos)
         torch.cuda.synchronize()
 
         # Profiled region
@@ -135,7 +135,7 @@ def write_custom_driver(path, seq_len, model_dir):
         for _ in range(NUM_DECODE):
             engine.seq_lens[0] = SEQ_LEN
             engine._seq_lens_cpu[0] = SEQ_LEN
-            engine._decode_step_graphed(token, pos)
+            engine.decode_step(token, pos)
         torch.cuda.synchronize()
         torch.cuda.cudart().cudaProfilerStop()
     """)

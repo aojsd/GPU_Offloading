@@ -151,7 +151,7 @@ def run_worker(args):
 
         # Capture piecewise graphs for mixed steps
         if tokens_per_step > 0:
-            engine.capture_mixed_cuda_graphs(
+            engine.capture_cuda_graphs(
                 total_token_sizes=[tokens_per_step],
                 use_torch_compile=args.compile)
 
@@ -174,7 +174,7 @@ def run_worker(args):
             pf_inputs = [torch.randint(1, 1000, (L,), device=engine.device)
                          for L in prefill_lengths]
 
-            return engine.mixed_step(
+            return engine.step(
                 decode_seq_ids=decode_seq_ids,
                 decode_token_ids=dec_tokens,
                 prefill_seq_ids=pf_seq_ids,
@@ -970,7 +970,7 @@ def run_sweep(args):
     L = engine.num_layers
 
     with torch.inference_mode():
-        engine.capture_mixed_cuda_graphs(
+        engine.capture_cuda_graphs(
             total_token_sizes=[1], use_torch_compile=args.compile)
 
         engine.fill_kv_random(std=0.01)
@@ -1005,7 +1005,7 @@ def run_sweep(args):
         for sz in PREFILL_SIZES:
             engine._piecewise_graphs = {}
             torch.cuda.empty_cache()
-            engine.capture_mixed_cuda_graphs(
+            engine.capture_cuda_graphs(
                 total_token_sizes=[sz], use_torch_compile=args.compile)
 
             engine.reset()

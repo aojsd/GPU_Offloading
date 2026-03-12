@@ -111,7 +111,7 @@ python tests/test_split_stage4.py --model ../../models/Mixtral-8x7B --pp 2
 
 #### `test_scheduled_chunked_prefill.py` — Chunked prefill correctness (4 tests)
 
-Tests that prefilling a prompt via continuation chunks in `mixed_step()`
+Tests that prefilling a prompt via continuation chunks in `step()`
 produces the same output as a single full prefill. Test 4 uses ShareGPT
 prompts (loaded from the raw dataset, model-independent).
 

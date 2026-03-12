@@ -241,14 +241,14 @@ forward) exceeded fusion savings. Fix: compile + CUDA graph together.
 
 ### Architecture
 
-Mixed prefill+decode batches via `mixed_step()`. Architecture matches vLLM V1:
+Mixed prefill+decode batches via `step()`. Architecture matches vLLM V1:
 concatenate all tokens `[decode | prefill]`, run shared compute on all tokens, split
 ONLY at attention (FlashInfer BatchDecode for decode, FA3 varlen for prefill),
 concatenate output, continue shared compute.
 
 ### Per-Layer Piecewise CUDA Graphs
 
-**Problem**: Eager `mixed_step()` has ~8ms Python/CUDA dispatch overhead for small
+**Problem**: Eager `step()` has ~8ms Python/CUDA dispatch overhead for small
 mixed batches, making the engine 0.52x slower than vLLM.
 
 **Solution**: 4-stage per-layer decomposition. Stages 1 and 4 operate on ALL N tokens

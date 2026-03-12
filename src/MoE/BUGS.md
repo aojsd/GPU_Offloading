@@ -58,7 +58,7 @@ than eager (3.8% vs 80.4% match with vLLM). For faithful performance modeling,
 both collection and replay MUST use compile.
 
 **Fix:** Set `use_torch_compile=True` in `batched_replay.py` and
-`capture_mixed_cuda_graphs`. For collection, decide whether traces should
+`capture_cuda_graphs`. For collection, decide whether traces should
 reflect compiled or eager routing (either is valid, but must be consistent with
 the research question).
 
@@ -112,7 +112,7 @@ scan `step_scheduling` for max `total_tokens` and verify a graph covers it.
 
 **File:** `scripts/batched_replay.py:104-112`
 
-Warmup runs N steps of `mixed_step([0], token, [], [])` — a single decode
+Warmup runs N steps of `step([0], token, [], [])` — a single decode
 sequence with dummy tokens. Real replay uses batches of 30-200+ sequences with
 mixed decode/prefill/continuation. This doesn't warm the GPU's L2 cache,
 instruction cache, or TLBs for the actual workload shapes, causing first-step
@@ -134,9 +134,9 @@ code paths in pipeline files (unused CLI flags, unused functions).
 `is_offloading = experts_per_layer < num_experts` determines whether to add 128
 to piecewise graph sizes. But the engine sets `self.offloading = True` whenever
 `experts_per_layer` is not None, even when `experts_per_layer == num_experts`.
-In the all-resident case, `prefill_to_slot()` routes through `mixed_step()`
+In the all-resident case, `prefill_to_slot()` routes through `step()`
 which needs a piecewise graph >= 128 tokens. Since only `[1, 16, 32]` are
-captured, `_find_nearest_piecewise_graph(128)` returns None and `mixed_step`
+captured, `_find_nearest_piecewise_graph(128)` returns None and `step`
 crashes silently. Fix: always include 128 in `piecewise_sizes`.
 
 ### `moe_engine.py`: `prefill()` and `generate()` crash in PP mode
@@ -145,7 +145,7 @@ crashes silently. Fix: always include 128 in `piecewise_sizes`.
 
 `prefill()` indexes `self.block_table[sid, pg]` with 2D tensor indexing. In PP
 mode, `self.block_table` is a list of per-GPU tensors → `TypeError`. Scripts
-01-03 use `mixed_step()` directly and are unaffected.
+01-03 use `step()` directly and are unaffected.
 
 ### `run_all_policies.py`: `--dual-gpu` merge reads nonexistent files
 

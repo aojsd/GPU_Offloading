@@ -53,8 +53,8 @@ def measure_stage4b(engine, batch_size, n_steps=10):
     # Warmup decode steps (use high-level API to ensure everything is set up)
     decode_seq_ids = list(range(batch_size))
     for i in range(5):
-        # begin_step auto-called inside mixed_step
-        logits = engine.mixed_step(
+        # begin_step auto-called inside step
+        logits = engine.step(
             decode_seq_ids=decode_seq_ids,
             decode_token_ids=next_token_batch,
             prefill_seq_ids=[], prefill_input_ids=[])
@@ -192,7 +192,7 @@ def run_grouped_configs(model_path, experts_per_layer, batch_sizes,
           f"offloading={'yes' if is_offloading else 'no (all-resident)'}")
 
     # Capture graphs for all batch sizes at once.
-    # When offloading is active, prefill_to_slot routes through mixed_step,
+    # When offloading is active, prefill_to_slot routes through step,
     # so piecewise graphs must also cover the prefill size (128 tokens).
     piecewise_sizes = sorted(set(batch_sizes) | {128}) if is_offloading else batch_sizes
     with torch.inference_mode():
@@ -200,7 +200,7 @@ def run_grouped_configs(model_path, experts_per_layer, batch_sizes,
             total_token_sizes=[128],
             use_torch_compile=use_compile)
         engine.reset()
-        engine.capture_mixed_cuda_graphs(
+        engine.capture_cuda_graphs(
             total_token_sizes=piecewise_sizes,
             use_torch_compile=use_compile)
 

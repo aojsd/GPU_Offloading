@@ -298,7 +298,7 @@ Expert map indexing:
 
 ### Per-Layer Execution Timeline
 
-For each layer during `_mixed_step_piecewise`, the MoEEngine calls into the
+For each layer during `_step_piecewise`, the MoEEngine calls into the
 replay controller at specific hook points. The key design: **only layer 0
 prefetches at the start of the network**. For all subsequent layers, prefetches
 are issued inside `process_layer_replay(L-1)` right before stage4b of L-1.
@@ -562,7 +562,7 @@ free_seq_ids.add(request_to_slot.pop(request_id))
 ```
 
 The multi-sequence replay loop in `scripts/batched_replay.py` processes each
-step's scheduling metadata, dispatches to `engine.mixed_step()` with the
+step's scheduling metadata, dispatches to `engine.step()` with the
 correct decode/prefill/continuation split, and uses actual traced tokens.
 
 ### GPU Memory Budget for Replay
@@ -638,11 +638,11 @@ from replay_controller import ReplayController
 # Step 1: Record a trace (ExpertOffloadEngine mode)
 engine = MoEEngine("../../models/Mixtral-8x7B", experts_per_layer=2)
 engine.capture_prefill_cuda_graph(total_token_sizes=[128])
-engine.capture_mixed_cuda_graphs(total_token_sizes=[128])
+engine.capture_cuda_graphs(total_token_sizes=[128])
 with torch.inference_mode():
     engine.prefill_to_slot(0, input_ids)
     for step in range(50):
-        logits = engine.mixed_step([0], [next_token], [], [])
+        logits = engine.step([0], [next_token], [], [])
         next_token = logits.argmax(-1)
 engine.offload_engine.save_trace("expert_trace.json")
 
@@ -661,7 +661,7 @@ engine.replay_controller = controller
 with torch.inference_mode():
     engine.prefill_to_slot(0, input_ids)
     for step in range(len(dm_trace.steps)):
-        logits = engine.mixed_step([0], [next_token], [], [])
+        logits = engine.step([0], [next_token], [], [])
         next_token = logits.argmax(-1)
 engine.replay_controller = None
 ```

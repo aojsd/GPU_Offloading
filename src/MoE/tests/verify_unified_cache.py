@@ -64,7 +64,7 @@ def smoke_test_32L(model_path, use_compile=True):
         engine.capture_prefill_cuda_graph(total_token_sizes=[128],
                                            use_torch_compile=use_compile)
         engine.reset()
-        engine.capture_mixed_cuda_graphs(total_token_sizes=[1],
+        engine.capture_cuda_graphs(total_token_sizes=[1],
                                           use_torch_compile=use_compile)
 
     print("\n  Graph capture: OK")
@@ -82,7 +82,7 @@ def smoke_test_32L(model_path, use_compile=True):
 
         tokens = [next_token.item()]
         for step in range(5):
-            logits = engine.mixed_step(
+            logits = engine.step(
                 decode_seq_ids=[0], decode_token_ids=next_token,
                 prefill_seq_ids=[], prefill_input_ids=[])
             assert not torch.isnan(logits).any(), f"NaN in decode step {step}!"
@@ -121,7 +121,7 @@ def correctness_test_20L(model_path, use_compile=True):
         engine_base.capture_prefill_cuda_graph(total_token_sizes=[128],
                                                 use_torch_compile=use_compile)
         engine_base.reset()
-        engine_base.capture_mixed_cuda_graphs(total_token_sizes=[1],
+        engine_base.capture_cuda_graphs(total_token_sizes=[1],
                                                use_torch_compile=use_compile)
 
     engine_base.reset()
@@ -131,7 +131,7 @@ def correctness_test_20L(model_path, use_compile=True):
         tokens_base = [next_token.item()]
 
         for _ in range(n_decode - 1):
-            logits = engine_base.mixed_step(
+            logits = engine_base.step(
                 decode_seq_ids=[0], decode_token_ids=next_token,
                 prefill_seq_ids=[], prefill_input_ids=[])
             next_token = logits[0].argmax().unsqueeze(0)
@@ -151,7 +151,7 @@ def correctness_test_20L(model_path, use_compile=True):
         engine_unified.capture_prefill_cuda_graph(total_token_sizes=[128],
                                                    use_torch_compile=use_compile)
         engine_unified.reset()
-        engine_unified.capture_mixed_cuda_graphs(total_token_sizes=[1, 128],
+        engine_unified.capture_cuda_graphs(total_token_sizes=[1, 128],
                                                   use_torch_compile=use_compile)
 
     engine_unified.reset()
@@ -161,7 +161,7 @@ def correctness_test_20L(model_path, use_compile=True):
         tokens_unified = [next_token.item()]
 
         for _ in range(n_decode - 1):
-            logits = engine_unified.mixed_step(
+            logits = engine_unified.step(
                 decode_seq_ids=[0], decode_token_ids=next_token,
                 prefill_seq_ids=[], prefill_input_ids=[])
             next_token = logits[0].argmax().unsqueeze(0)

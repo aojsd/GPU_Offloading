@@ -272,7 +272,7 @@ def run_batched_replay(model_path, batched_trace_path, per_conv_traces,
     captured_sizes = []
     for gs in graph_sizes:
         try:
-            engine.capture_mixed_cuda_graphs(total_token_sizes=[gs])
+            engine.capture_cuda_graphs(total_token_sizes=[gs])
             captured_sizes.append(gs)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()

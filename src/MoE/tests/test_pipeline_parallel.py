@@ -41,12 +41,12 @@ def test_correctness(model_path, epl=4):
                           use_torch_compile=False)
 
     with torch.inference_mode():
-        engine_pp.capture_mixed_cuda_graphs(
+        engine_pp.capture_cuda_graphs(
             total_token_sizes=[1, 128, 256, 512], use_torch_compile=False)
 
         # Prefill
         engine_pp.reset()
-        logits_pp_prefill = engine_pp.mixed_step(
+        logits_pp_prefill = engine_pp.step(
             decode_seq_ids=[],
             decode_token_ids=torch.empty(0, dtype=torch.long, device=engine_pp.device),
             prefill_seq_ids=[0],
@@ -54,7 +54,7 @@ def test_correctness(model_path, epl=4):
 
         # Decode
         next_tok = logits_pp_prefill[-1].argmax().unsqueeze(0)
-        logits_pp_decode = engine_pp.mixed_step(
+        logits_pp_decode = engine_pp.step(
             decode_seq_ids=[0],
             decode_token_ids=next_tok,
             prefill_seq_ids=[],
@@ -63,7 +63,7 @@ def test_correctness(model_path, epl=4):
         # Mixed batch (decode slot 0 + prefill slot 1)
         prompt2 = torch.randint(1, 1000, (64,), device=engine_pp.device)
         next_tok2 = logits_pp_decode[0].argmax().unsqueeze(0)
-        logits_pp_mixed = engine_pp.mixed_step(
+        logits_pp_mixed = engine_pp.step(
             decode_seq_ids=[0],
             decode_token_ids=next_tok2,
             prefill_seq_ids=[1],
@@ -85,12 +85,12 @@ def test_correctness(model_path, epl=4):
                           use_torch_compile=False)
 
     with torch.inference_mode():
-        engine_1g.capture_mixed_cuda_graphs(
+        engine_1g.capture_cuda_graphs(
             total_token_sizes=[1, 128, 256, 512], use_torch_compile=False)
 
         # Prefill
         engine_1g.reset()
-        logits_1g_prefill = engine_1g.mixed_step(
+        logits_1g_prefill = engine_1g.step(
             decode_seq_ids=[],
             decode_token_ids=torch.empty(0, dtype=torch.long, device=engine_1g.device),
             prefill_seq_ids=[0],
@@ -98,7 +98,7 @@ def test_correctness(model_path, epl=4):
 
         # Decode
         next_tok = logits_1g_prefill[-1].argmax().unsqueeze(0)
-        logits_1g_decode = engine_1g.mixed_step(
+        logits_1g_decode = engine_1g.step(
             decode_seq_ids=[0],
             decode_token_ids=next_tok,
             prefill_seq_ids=[],
@@ -107,7 +107,7 @@ def test_correctness(model_path, epl=4):
         # Mixed batch
         prompt2_1g = prompt2.to(engine_1g.device)
         next_tok2 = logits_1g_decode[0].argmax().unsqueeze(0)
-        logits_1g_mixed = engine_1g.mixed_step(
+        logits_1g_mixed = engine_1g.step(
             decode_seq_ids=[0],
             decode_token_ids=next_tok2,
             prefill_seq_ids=[1],
@@ -166,7 +166,7 @@ def test_performance(model_path, epl=4, n_warmup=3, n_trials=10):
                           use_torch_compile=False)
 
     with torch.inference_mode():
-        engine_pp.capture_mixed_cuda_graphs(
+        engine_pp.capture_cuda_graphs(
             total_token_sizes=[1, 128, 256, 512], use_torch_compile=False)
 
         # Prefill timing (wall clock with full sync for multi-GPU)
@@ -175,7 +175,7 @@ def test_performance(model_path, epl=4, n_warmup=3, n_trials=10):
             engine_pp.reset()
             _sync_all()
             t0 = time.perf_counter()
-            engine_pp.mixed_step(
+            engine_pp.step(
                 decode_seq_ids=[],
                 decode_token_ids=torch.empty(0, dtype=torch.long, device="cuda:0"),
                 prefill_seq_ids=[0],
@@ -188,7 +188,7 @@ def test_performance(model_path, epl=4, n_warmup=3, n_trials=10):
         pp_decode_times = []
         for i in range(n_warmup + n_trials):
             engine_pp.reset()
-            logits = engine_pp.mixed_step(
+            logits = engine_pp.step(
                 decode_seq_ids=[],
                 decode_token_ids=torch.empty(0, dtype=torch.long, device="cuda:0"),
                 prefill_seq_ids=[0],
@@ -196,7 +196,7 @@ def test_performance(model_path, epl=4, n_warmup=3, n_trials=10):
             next_tok = logits[-1].argmax().unsqueeze(0)
             _sync_all()
             t0 = time.perf_counter()
-            engine_pp.mixed_step(
+            engine_pp.step(
                 decode_seq_ids=[0],
                 decode_token_ids=next_tok,
                 prefill_seq_ids=[],
@@ -217,7 +217,7 @@ def test_performance(model_path, epl=4, n_warmup=3, n_trials=10):
                           use_torch_compile=False)
 
     with torch.inference_mode():
-        engine_1g.capture_mixed_cuda_graphs(
+        engine_1g.capture_cuda_graphs(
             total_token_sizes=[1, 128, 256, 512], use_torch_compile=False)
 
         # Prefill timing
@@ -226,7 +226,7 @@ def test_performance(model_path, epl=4, n_warmup=3, n_trials=10):
             engine_1g.reset()
             _sync_all()
             t0 = time.perf_counter()
-            engine_1g.mixed_step(
+            engine_1g.step(
                 decode_seq_ids=[],
                 decode_token_ids=torch.empty(0, dtype=torch.long, device="cuda:0"),
                 prefill_seq_ids=[0],
@@ -239,7 +239,7 @@ def test_performance(model_path, epl=4, n_warmup=3, n_trials=10):
         sg_decode_times = []
         for i in range(n_warmup + n_trials):
             engine_1g.reset()
-            logits = engine_1g.mixed_step(
+            logits = engine_1g.step(
                 decode_seq_ids=[],
                 decode_token_ids=torch.empty(0, dtype=torch.long, device="cuda:0"),
                 prefill_seq_ids=[0],
@@ -247,7 +247,7 @@ def test_performance(model_path, epl=4, n_warmup=3, n_trials=10):
             next_tok = logits[-1].argmax().unsqueeze(0)
             _sync_all()
             t0 = time.perf_counter()
-            engine_1g.mixed_step(
+            engine_1g.step(
                 decode_seq_ids=[0],
                 decode_token_ids=next_tok,
                 prefill_seq_ids=[],
@@ -302,7 +302,7 @@ def test_trace_collection(model_path):
     engine.trace_recorder = recorder
 
     with torch.inference_mode():
-        engine.capture_mixed_cuda_graphs(
+        engine.capture_cuda_graphs(
             total_token_sizes=[1, 128, 256, 512], use_torch_compile=False)
 
         # Run a short conversation
@@ -315,7 +315,7 @@ def test_trace_collection(model_path):
 
         n_decode = 10
         for step in range(n_decode):
-            logits = engine.mixed_step(
+            logits = engine.step(
                 decode_seq_ids=[0],
                 decode_token_ids=next_tok,
                 prefill_seq_ids=[],
@@ -364,7 +364,7 @@ def test_trace_collection(model_path):
             logits = engine.prefill_to_slot(0, prompt)
             next_tok = logits[-1].argmax().unsqueeze(0)
             for _ in range(10):
-                logits = engine.mixed_step(
+                logits = engine.step(
                     decode_seq_ids=[0],
                     decode_token_ids=next_tok,
                     prefill_seq_ids=[],

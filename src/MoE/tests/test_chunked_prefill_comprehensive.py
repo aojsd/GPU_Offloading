@@ -2,7 +2,7 @@
 """Comprehensive chunked prefill correctness test on ALL 200 ShareGPT prompts.
 
 For each prompt, compares a reference prefill against a manual 2-chunk split
-(first half as new prefill, second half as continuation via mixed_step).
+(first half as new prefill, second half as continuation via step).
 
 - Short prompts (<= max_graph): reference = single-shot full prefill.
   Compares ALL position logits.
@@ -72,10 +72,10 @@ def load_all_sharegpt_prompts(max_prompts=200):
 
 
 def ref_prefill_single_shot(engine, seq_id, input_ids):
-    """Prefill full prompt in one shot via mixed_step. Returns [S, vocab]."""
+    """Prefill full prompt in one shot via step. Returns [S, vocab]."""
     engine.reset()
     with torch.inference_mode():
-        logits = engine.mixed_step(
+        logits = engine.step(
             decode_seq_ids=[],
             decode_token_ids=torch.empty(0, dtype=torch.long,
                                          device=engine.device),
@@ -123,7 +123,7 @@ def chunked_prefill_n_chunks(engine, seq_id, input_ids, max_chunk_size):
 
             if offset == 0:
                 # First chunk: new prefill
-                logits = engine.mixed_step(
+                logits = engine.step(
                     decode_seq_ids=[],
                     decode_token_ids=empty,
                     prefill_seq_ids=[seq_id],
@@ -131,7 +131,7 @@ def chunked_prefill_n_chunks(engine, seq_id, input_ids, max_chunk_size):
                 )
             else:
                 # Continuation chunk
-                logits = engine.mixed_step(
+                logits = engine.step(
                     decode_seq_ids=[],
                     decode_token_ids=empty,
                     prefill_seq_ids=[],
@@ -275,7 +275,7 @@ def main():
     print(f"Capturing piecewise CUDA graphs for sizes: {graph_sizes}")
     t0 = time.time()
     with torch.inference_mode():
-        engine.capture_mixed_cuda_graphs(
+        engine.capture_cuda_graphs(
             total_token_sizes=graph_sizes,
             use_torch_compile=False,
         )

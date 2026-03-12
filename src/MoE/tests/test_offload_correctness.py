@@ -46,7 +46,7 @@ def benchmark_split_overhead(engine, seq_len=128, n_warmup=5, n_trials=20):
     for i in range(n_warmup + n_trials):
         engine.reset()
         start.record()
-        engine.mixed_step(
+        engine.step(
             decode_seq_ids=[],
             decode_token_ids=torch.empty(0, dtype=torch.long, device=engine.device),
             prefill_seq_ids=[0],
@@ -88,7 +88,7 @@ def benchmark_split_overhead(engine, seq_len=128, n_warmup=5, n_trials=20):
     for i in range(n_warmup + n_trials):
         tok = torch.tensor([1], dtype=torch.long, device=engine.device)
         start.record()
-        engine.mixed_step(
+        engine.step(
             decode_seq_ids=[0],
             decode_token_ids=tok,
             prefill_seq_ids=[],
@@ -125,7 +125,7 @@ def test_demand_load_correctness(engine, seq_len=128):
     oe.configure(gpu_budget_per_layer=E)
     engine.reset()
     oe.reset_trace()
-    logits_baseline = engine.mixed_step(
+    logits_baseline = engine.step(
         decode_seq_ids=[],
         decode_token_ids=torch.empty(0, dtype=torch.long, device=engine.device),
         prefill_seq_ids=[0],
@@ -135,7 +135,7 @@ def test_demand_load_correctness(engine, seq_len=128):
     oe.configure(gpu_budget_per_layer=2, initial_experts=[0, 1])
     engine.reset()
     oe.reset_trace()
-    logits_offloaded = engine.mixed_step(
+    logits_offloaded = engine.step(
         decode_seq_ids=[],
         decode_token_ids=torch.empty(0, dtype=torch.long, device=engine.device),
         prefill_seq_ids=[0],
@@ -188,12 +188,12 @@ def test_decode_with_offloading(engine, prompt_len=128, decode_steps=10):
     prompt = torch.randint(1, 1000, (prompt_len,), device=engine.device)
 
     # Baseline: all experts resident
-    # Use mixed_step for prefill (piecewise path) in both runs for consistency.
+    # Use step for prefill (piecewise path) in both runs for consistency.
     # prefill_to_slot uses the flat graph which doesn't trigger demand loading.
     oe.configure(gpu_budget_per_layer=E)
     engine.reset()
     oe.reset_trace()
-    logits = engine.mixed_step(
+    logits = engine.step(
         decode_seq_ids=[],
         decode_token_ids=torch.empty(0, dtype=torch.long, device=engine.device),
         prefill_seq_ids=[0],
@@ -202,7 +202,7 @@ def test_decode_with_offloading(engine, prompt_len=128, decode_steps=10):
 
     tokens_baseline = []
     for step in range(decode_steps):
-        logits = engine.mixed_step(
+        logits = engine.step(
             decode_seq_ids=[0],
             decode_token_ids=next_token,
             prefill_seq_ids=[],
@@ -214,7 +214,7 @@ def test_decode_with_offloading(engine, prompt_len=128, decode_steps=10):
     oe.configure(gpu_budget_per_layer=2, initial_experts=[0, 1])
     engine.reset()
     oe.reset_trace()
-    logits = engine.mixed_step(
+    logits = engine.step(
         decode_seq_ids=[],
         decode_token_ids=torch.empty(0, dtype=torch.long, device=engine.device),
         prefill_seq_ids=[0],
@@ -223,7 +223,7 @@ def test_decode_with_offloading(engine, prompt_len=128, decode_steps=10):
 
     tokens_offloaded = []
     for step in range(decode_steps):
-        logits = engine.mixed_step(
+        logits = engine.step(
             decode_seq_ids=[0],
             decode_token_ids=next_token,
             prefill_seq_ids=[],
@@ -274,7 +274,7 @@ def main():
             max_decode_tokens=256,
             use_torch_compile=use_compile)
         engine.reset()
-        engine.capture_mixed_cuda_graphs(
+        engine.capture_cuda_graphs(
             total_token_sizes=[1, 128, 256],
             use_torch_compile=use_compile)
 
@@ -300,7 +300,7 @@ def main():
             total_token_sizes=[128, 256],
             use_torch_compile=use_compile)
         engine.reset()
-        engine.capture_mixed_cuda_graphs(
+        engine.capture_cuda_graphs(
             total_token_sizes=[1, 128, 256],
             use_torch_compile=use_compile)
 

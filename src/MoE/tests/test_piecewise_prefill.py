@@ -68,11 +68,11 @@ def get_piecewise_prefill_tokens(model_path, prompt, seq_len, graph_sizes,
                        use_torch_compile=False)
 
     with torch.inference_mode():
-        engine.capture_mixed_cuda_graphs(
+        engine.capture_cuda_graphs(
             total_token_sizes=graph_sizes, use_torch_compile=False)
         engine.reset()
 
-        # prefill_to_slot now routes through mixed_step → piecewise
+        # prefill_to_slot now routes through step → piecewise
         logits = engine.prefill_to_slot(0, prompt)
         tokens = logits.argmax(dim=-1).cpu().clone()
 
@@ -105,7 +105,7 @@ def test_partial_offloading(model_path, prompt, seq_len, graph_sizes,
                        use_torch_compile=False)
 
     with torch.inference_mode():
-        engine.capture_mixed_cuda_graphs(
+        engine.capture_cuda_graphs(
             total_token_sizes=graph_sizes, use_torch_compile=False)
         engine.reset()
 

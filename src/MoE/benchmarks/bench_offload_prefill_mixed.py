@@ -137,7 +137,7 @@ def run_mixed_bench(engine, n_decode, prefill_lengths,
         oe.reset_trace()
 
         start_ev.record()
-        engine.mixed_step(
+        engine.step(
             decode_seq_ids=decode_seq_ids,
             decode_token_ids=decode_token_ids,
             prefill_seq_ids=prefill_seq_ids if prefill_lengths else [],
@@ -203,7 +203,7 @@ def main():
 
     with torch.inference_mode():
         print("Capturing piecewise CUDA graphs...")
-        engine.capture_mixed_cuda_graphs(
+        engine.capture_cuda_graphs(
             total_token_sizes=graph_sizes, use_torch_compile=False)
 
     oe = engine.offload_engine

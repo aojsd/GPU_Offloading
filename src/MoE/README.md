@@ -159,7 +159,7 @@ Layer L (L > 0):
 ## Implementation Phases
 
 1. **Core Compute Engine** (complete): Custom MoE engine with CUDA graph + torch.compile, validated against vLLM on OLMoE-1B-7B and Mixtral-8x7B. See [tests/vLLM_comparison/README.md](tests/vLLM_comparison/README.md).
-2. **Mixed Batch Support** (complete): Mixed prefill+decode via `mixed_step()`, piecewise CUDA graphs (per-layer 4-stage decomposition). 80.4% token match vs vLLM without compile (expected BF16 divergence). See [tests/vLLM_comparison/README.md](tests/vLLM_comparison/README.md).
+2. **Mixed Batch Support** (complete): Mixed prefill+decode via `step()`, piecewise CUDA graphs (per-layer 4-stage decomposition). 80.4% token match vs vLLM without compile (expected BF16 divergence). See [tests/vLLM_comparison/README.md](tests/vLLM_comparison/README.md).
 3. **Simulated Expert Offloading** (complete): Split stage 4 into 4a (router) + 4b (MoE) with CPU break. ExpertOffloadEngine demand-loads missing experts, records traces. Verified bit-identical + predicted latency = compute + IO. See [offload_1GPU.md](offload_1GPU.md).
 4. **Unified Expert Cache** (complete): Single `w1_buf[L*epl + scratchpad, 2*I, H]` buffer with per-layer views. Eliminated D2D copies (was 14.8 ms/step on 32L). Compute parity 36/36 checks passed. Latency model `wall = compute + IO` validated across 88 experiments. See [offload_1GPU.md](offload_1GPU.md).
 5. **Async Transfer & Prefetch** (complete): Two-stream architecture — transfer stream overlaps CPU→GPU copies with compute stream. Single CUDA event synchronization. See [replay.md](replay.md).
@@ -189,7 +189,7 @@ engine = MoEEngine("models/OLMoE-1B-7B")
 # CUDA graph capture — REQUIRED before any prefill/decode
 engine.capture_prefill_cuda_graph(total_token_sizes=[128, 256, 512, 1024, 2048])
 engine.capture_decode_cuda_graph(batch_size=1, warmup_seq_len=128, max_decode_tokens=256)
-engine.capture_mixed_cuda_graphs(total_token_sizes=[128, 256, 512, 1024, 2048])
+engine.capture_cuda_graphs(total_token_sizes=[128, 256, 512, 1024, 2048])
 
 # Prefill (graph-only, no eager fallback)
 logits = engine.prefill(input_ids)            # [B, S, vocab]
@@ -201,7 +201,7 @@ logits = engine.prefill_batch_to_slots(       # [N_total, vocab] (flat output)
 logits = engine.decode_step(token_ids, pos)   # [B, vocab]
 
 # Mixed batch (auto-dispatches to piecewise CUDA graphs if captured, else eager)
-logits = engine.mixed_step(                   # [N_total, vocab]
+logits = engine.step(                   # [N_total, vocab]
     decode_seq_ids, decode_tokens, prefill_seq_ids, prefill_input_ids)
 
 tokens = engine.generate(input_ids, max_new_tokens=128)
@@ -358,11 +358,11 @@ from replay_controller import ReplayController
 # Step 1: Record a trace
 engine = MoEEngine("../../models/Mixtral-8x7B", experts_per_layer=2)
 engine.capture_prefill_cuda_graph(total_token_sizes=[128])
-engine.capture_mixed_cuda_graphs(total_token_sizes=[128])
+engine.capture_cuda_graphs(total_token_sizes=[128])
 with torch.inference_mode():
     engine.prefill_to_slot(0, input_ids)
     for step in range(50):
-        logits = engine.mixed_step([0], [next_token], [], [])
+        logits = engine.step([0], [next_token], [], [])
         next_token = logits.argmax(-1)
 engine.offload_engine.save_trace("expert_trace.json")
 
@@ -380,7 +380,7 @@ engine.replay_controller = controller
 with torch.inference_mode():
     engine.prefill_to_slot(0, input_ids)
     for step in range(len(dm_trace.steps)):
-        logits = engine.mixed_step([0], [next_token], [], [])
+        logits = engine.step([0], [next_token], [], [])
         next_token = logits.argmax(-1)
 engine.replay_controller = None
 ```

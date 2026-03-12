@@ -408,7 +408,7 @@ def main():
     captured = []
     for gs in GRAPH_SIZES:
         try:
-            engine.capture_mixed_cuda_graphs(total_token_sizes=[gs])
+            engine.capture_cuda_graphs(total_token_sizes=[gs])
             captured.append(gs)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()

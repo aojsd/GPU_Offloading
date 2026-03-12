@@ -20,7 +20,7 @@ DEFAULT_MODEL = str(Path(__file__).resolve().parent.parent / "models" / "Mixtral
 
 
 def test_prefill_flat_vs_piecewise(engine, seq_len=128, use_compile=True):
-    """Compare flat prefill graph vs piecewise mixed_step (pure prefill)."""
+    """Compare flat prefill graph vs piecewise step (pure prefill)."""
     print(f"\n=== Prefill: flat graph vs piecewise (seq_len={seq_len}) ===")
 
     prompt = torch.randint(1, 1000, (seq_len,), device=engine.device)
@@ -29,9 +29,9 @@ def test_prefill_flat_vs_piecewise(engine, seq_len=128, use_compile=True):
     engine.reset()
     logits_flat = engine.prefill_to_slot(0, prompt)
 
-    # 2. Piecewise path (via mixed_step with no decode tokens)
+    # 2. Piecewise path (via step with no decode tokens)
     engine.reset()
-    logits_piecewise = engine.mixed_step(
+    logits_piecewise = engine.step(
         decode_seq_ids=[],
         decode_token_ids=torch.empty(0, dtype=torch.long, device=engine.device),
         prefill_seq_ids=[0],
@@ -73,7 +73,7 @@ def test_decode_piecewise(engine, prompt_len=128, decode_steps=5, use_compile=Tr
 
     tokens_piecewise = []
     for step in range(decode_steps):
-        logits = engine.mixed_step(
+        logits = engine.step(
             decode_seq_ids=[0],
             decode_token_ids=next_token,
             prefill_seq_ids=[],
@@ -136,7 +136,7 @@ def main():
                 max_decode_tokens=256,
                 use_torch_compile=use_compile)
             engine.reset()
-        engine.capture_mixed_cuda_graphs(
+        engine.capture_cuda_graphs(
             total_token_sizes=[1, 128, 256],
             use_torch_compile=use_compile)
 
@@ -169,7 +169,7 @@ def main():
             print(f"\n=== PP={args.pp}: flat graphs N/A, testing piecewise ===")
             prompt = torch.randint(1, 1000, (128,), device=engine.device)
             engine.reset()
-            logits1 = engine.mixed_step(
+            logits1 = engine.step(
                 decode_seq_ids=[],
                 decode_token_ids=torch.empty(0, dtype=torch.long,
                                              device=engine.device),
@@ -178,7 +178,7 @@ def main():
             tok1 = logits1[-1].argmax().item()
 
             engine.reset()
-            logits2 = engine.mixed_step(
+            logits2 = engine.step(
                 decode_seq_ids=[],
                 decode_token_ids=torch.empty(0, dtype=torch.long,
                                              device=engine.device),
@@ -199,7 +199,7 @@ def main():
             next_token = logits1[-1].argmax().unsqueeze(0)
             tokens = []
             for _ in range(5):
-                logits = engine.mixed_step(
+                logits = engine.step(
                     decode_seq_ids=[0],
                     decode_token_ids=next_token,
                     prefill_seq_ids=[],

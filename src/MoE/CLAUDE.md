@@ -71,5 +71,5 @@ and end-to-end usage.
 - **FlashInfer `plan()` before every decode replay**: `_plan_info` tile counts depend on actual page count, not just buffer contents (applies to non-MLA FlashInfer decode and MLA continuation prefill)
 - **`_seq_lens_cpu += 1` BEFORE `plan()`**: FlashInfer must include the current token's K/V
 - **FlashInfer prefill incompatible with multi-graph**: `fmha_varlen_plan()` allocates fresh GPU tensors per call; use vLLM FA3 instead
-- **All decode routes through piecewise** (`decode_step` → `mixed_step`); monolithic decode graph path removed
+- **Unified piecewise architecture**: ALL paths (decode, prefill, mixed) route through `step` → piecewise CUDA graphs. `capture_decode_cuda_graph` and `capture_prefill_cuda_graph` are thin wrappers around `capture_cuda_graphs`. Monolithic decode graph path and flat prefill graph path have been removed.
 - Eager mode is NOT for real experiments — only for sanity checks in test files

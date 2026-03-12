@@ -222,13 +222,13 @@ New intermediate buffers (per graph size N): `moe_input_buf [N,H]`,
 `moe_residual_buf [N,H]`, `topk_weights_buf [N,top_k] fp32`, `topk_ids_buf [N,top_k] int64`.
 
 When offloader is attached, ALL forward paths (decode_step, prefill, prefill_to_slot,
-prefill_batch_to_slots) route through piecewise mixed_step so the offloader hook runs.
+prefill_batch_to_slots) route through piecewise step so the offloader hook runs.
 
 ### Files
 
 | File | Role |
 |------|------|
-| `moe_engine.py` | `_layer_stage4a_router`, `_layer_stage4b_moe`, updated `capture_mixed_cuda_graphs` (3 graphs/layer), updated `_mixed_step_piecewise` with offload engine hook, auto-creates `ExpertOffloadEngine` when `experts_per_layer` is set |
+| `moe_engine.py` | `_layer_stage4a_router`, `_layer_stage4b_moe`, updated `capture_cuda_graphs` (3 graphs/layer), updated `_step_piecewise` with offload engine hook, auto-creates `ExpertOffloadEngine` when `experts_per_layer` is set |
 | `expert_offload_engine.py` | `ExpertOffloadEngine`: CPU pinned copies, residency tracking per layer, `process_layer()` for demand loading + trace recording, `save_trace()`, `get_transfer_stats()` |
 | `tests/test_split_stage4.py` | Basic correctness: flat vs piecewise graph comparison |
 | `tests/test_offload_correctness.py` | Latency overhead and output correctness with demand loading |
@@ -350,7 +350,7 @@ With K=2 cache slots and top-2 routing, decode (batch=1) needs exactly 2 experts
 
 Current design: prefill uses flat CUDA graph with only the K initially-mapped experts
 (approximate). Decode uses piecewise graphs with the offloader for demand loading.
-`mixed_step` raises `RuntimeError` if called with prefill sequences while offloader is attached.
+`step` raises `RuntimeError` if called with prefill sequences while offloader is attached.
 
 ### Expert cache (shared weight buffer)
 
@@ -379,7 +379,7 @@ When K >= E (all experts fit): `buf_slots = E`, no scratchpad needed.
 When K < E (offloading): `buf_slots = K + E`, slots 0..K-1 = persistent residents,
 K..K+E-1 = scratchpad for demand-loaded experts.
 
-**Flow per layer (in `_mixed_step_piecewise`)**:
+**Flow per layer (in `_step_piecewise`)**:
 1. Stage 4a graph replay → produces topk_ids (routing decisions)
 2. **Populate expert cache**: `w1_buf[:K] = w1[layer]`, `expert_map_buf = expert_map[layer]`
 3. **Offloader `process_layer()`**: reads topk_ids, loads missing experts into scratchpad
@@ -716,7 +716,7 @@ Where:
   where both values are available. Consistent at **0.175 ms/layer** across all models.
 
 **Data sources**: `bench_offload_prefill_mixed.py` (piecewise end-to-end, CUDA events
-around `mixed_step()`, 10 trials, median), `bench_comprehensive.py` (per-layer CUDA event
+around `step()`, 10 trials, median), `bench_comprehensive.py` (per-layer CUDA event
 kernel times, 10 decode steps x L layers).
 
 #### IO Bandwidth

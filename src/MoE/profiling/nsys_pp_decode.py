@@ -59,7 +59,7 @@ def measure_decode(engine, n_warmup=5, n_steps=20, nsys=False,
 
         # Warmup
         for _ in range(n_warmup):
-            logits = engine.mixed_step(
+            logits = engine.step(
                 decode_seq_ids=[0], decode_token_ids=next_token,
                 prefill_seq_ids=[], prefill_input_ids=[])
             next_token = logits[0].argmax().unsqueeze(0)
@@ -76,7 +76,7 @@ def measure_decode(engine, n_warmup=5, n_steps=20, nsys=False,
 
             _sync_all()
             t0 = time.perf_counter()
-            logits = engine.mixed_step(
+            logits = engine.step(
                 decode_seq_ids=[0], decode_token_ids=next_token,
                 prefill_seq_ids=[], prefill_input_ids=[])
             _sync_all()
@@ -111,7 +111,7 @@ def measure_decode_phase_timing(engine, n_warmup=5, n_steps=20):
 
         # Warmup
         for _ in range(n_warmup):
-            logits = engine.mixed_step(
+            logits = engine.step(
                 decode_seq_ids=[0], decode_token_ids=next_token,
                 prefill_seq_ids=[], prefill_input_ids=[])
             next_token = logits[0].argmax().unsqueeze(0)
@@ -380,7 +380,7 @@ def run_config(model_path, mode, n_warmup, n_steps, nsys, phase_timing,
                 total_token_sizes=[128],
                 use_torch_compile=use_torch_compile)
             engine.reset()
-        engine.capture_mixed_cuda_graphs(
+        engine.capture_cuda_graphs(
             total_token_sizes=[1, 128],
             use_torch_compile=use_torch_compile)
 

@@ -342,7 +342,7 @@ def replay_on_custom(engine, traces, n_warmup=3, n_trials=5,
                      use_compile=True):
     """Replay a vLLM trace on the custom engine.
 
-    Uses CUDA-graphed decode_step/prefill for pure steps, mixed_step for
+    Uses CUDA-graphed decode_step/prefill for pure steps, step for
     actual mixed batches. This ensures fair comparison with vLLM which also
     uses CUDA graphs.
 
@@ -387,7 +387,7 @@ def replay_on_custom(engine, traces, n_warmup=3, n_trials=5,
     # Capture CUDA graphs — use inference_mode to handle tensors from
     # vLLM's cleanup (may be left in inference-mode state)
     with torch.inference_mode():
-        # Capture prefill graphs first (decode capture uses mixed_step for warmup)
+        # Capture prefill graphs first (decode capture uses step for warmup)
         if prefill_total_sizes:
             engine.reset()
             engine.capture_prefill_cuda_graph(
@@ -408,7 +408,7 @@ def replay_on_custom(engine, traces, n_warmup=3, n_trials=5,
         # Capture piecewise graphs for mixed steps
         if mixed_total_sizes:
             engine.reset()
-            engine.capture_mixed_cuda_graphs(
+            engine.capture_cuda_graphs(
                 total_token_sizes=sorted(mixed_total_sizes),
                 use_torch_compile=use_compile)
             print(f"  Captured piecewise CUDA graphs{compile_str} for "
@@ -452,13 +452,13 @@ def replay_on_custom(engine, traces, n_warmup=3, n_trials=5,
                         dtype=torch.int32, device="cuda")
 
                     # decode_step expects contiguous slots [:B], but our
-                    # slots may be scattered. Use mixed_step for scattered.
+                    # slots may be scattered. Use step for scattered.
                     if decode_seq_ids == list(range(nd)):
                         logits = engine.decode_step(tokens, positions)
                         # logits is [D, vocab]
                     else:
                         decode_tokens = tokens
-                        logits = engine.mixed_step(
+                        logits = engine.step(
                             decode_seq_ids, decode_tokens, [], [])
 
                 elif nd == 0 and np_ == 1:
@@ -484,7 +484,7 @@ def replay_on_custom(engine, traces, n_warmup=3, n_trials=5,
                         prefill_seq_ids, prefill_input_ids)
 
                 else:
-                    # Mixed decode+prefill — use mixed_step
+                    # Mixed decode+prefill — use step
                     decode_token_list = [d['token_id']
                                          for d in step.decode_requests]
                     decode_tokens = torch.tensor(
@@ -497,7 +497,7 @@ def replay_on_custom(engine, traces, n_warmup=3, n_trials=5,
                         prefill_input_ids.append(
                             torch.tensor(toks, device="cuda"))
 
-                    logits = engine.mixed_step(
+                    logits = engine.step(
                         decode_seq_ids, decode_tokens,
                         prefill_seq_ids, prefill_input_ids)
 

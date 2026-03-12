@@ -42,7 +42,7 @@ class ExpertOffloadEngine:
 
         # Capture graphs, then decode:
         for step in range(num_steps):
-            logits = engine.mixed_step(...)  # begin_step() called internally
+            logits = engine.step(...)  # begin_step() called internally
 
         engine.offload_engine.save_trace("trace.json")
     """

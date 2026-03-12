@@ -40,11 +40,11 @@ PREFILL_CHUNK_SIZE = 256
 
 
 # ---------------------------------------------------------------------------
-# Reference: single-conversation collection via mixed_step
+# Reference: single-conversation collection via step
 # ---------------------------------------------------------------------------
 
 def run_single_conversation(engine, prompt_ids, max_output, page_size=16):
-    """Reference single-conversation collection using direct mixed_step calls.
+    """Reference single-conversation collection using direct step calls.
 
     Mirrors collect_batched_traces.py flow: chunked prefill (256-token chunks) + decode.
     Returns list of output token IDs.
@@ -70,14 +70,14 @@ def run_single_conversation(engine, prompt_ids, max_output, page_size=16):
             chunk = input_ids[offset:chunk_end]
 
             if offset == 0:
-                logits = engine.mixed_step(
+                logits = engine.step(
                     decode_seq_ids=[],
                     decode_token_ids=empty,
                     prefill_seq_ids=[0],
                     prefill_input_ids=[chunk],
                 )
             else:
-                logits = engine.mixed_step(
+                logits = engine.step(
                     decode_seq_ids=[],
                     decode_token_ids=empty,
                     prefill_seq_ids=[],
@@ -102,7 +102,7 @@ def run_single_conversation(engine, prompt_ids, max_output, page_size=16):
             if needed > current:
                 engine.alloc_pages(0, needed - current)
 
-            logits = engine.mixed_step(
+            logits = engine.step(
                 decode_seq_ids=[0],
                 decode_token_ids=next_token,
                 prefill_seq_ids=[],
@@ -321,7 +321,7 @@ def test_page_invariant_gpu(engine, kv_page_budget, page_size=16):
                       f"budget={kv_page_budget}")
                 passed = False
 
-            # Build mixed_step args
+            # Build step args
             if result.decode_requests:
                 decode_token_ids = torch.tensor(
                     [r.output_token_ids[-1] for r in result.decode_requests],
@@ -360,7 +360,7 @@ def test_page_invariant_gpu(engine, kv_page_budget, page_size=16):
                 continuation_offsets.append(
                     engine._seq_lens_cpu[slot].item())
 
-            logits = engine.mixed_step(
+            logits = engine.step(
                 decode_seq_ids=result.decode_seq_ids,
                 decode_token_ids=decode_token_ids,
                 prefill_seq_ids=result.prefill_seq_ids,
@@ -761,7 +761,7 @@ def test_seq_len_consistency(engine, kv_page_budget, page_size=16):
             if result.is_empty:
                 continue
 
-            # Build mixed_step args (same as test 4)
+            # Build step args (same as test 4)
             if result.decode_requests:
                 decode_token_ids = torch.tensor(
                     [r.output_token_ids[-1] for r in result.decode_requests],
@@ -800,7 +800,7 @@ def test_seq_len_consistency(engine, kv_page_budget, page_size=16):
                 continuation_offsets.append(
                     engine._seq_lens_cpu[slot].item())
 
-            logits = engine.mixed_step(
+            logits = engine.step(
                 decode_seq_ids=result.decode_seq_ids,
                 decode_token_ids=decode_token_ids,
                 prefill_seq_ids=result.prefill_seq_ids,
@@ -958,7 +958,7 @@ def main():
     print(f"Engine created in {time.time() - t0:.1f}s")
 
     print("Capturing CUDA graphs...")
-    engine.capture_mixed_cuda_graphs(graph_sizes)
+    engine.capture_cuda_graphs(graph_sizes)
     print(f"Graphs captured. Total pages: {engine.total_pages}")
 
     # ── Test 1: Single conversation match ──
@@ -1002,7 +1002,7 @@ def main():
     print(f"Engine created in {time.time() - t0:.1f}s")
 
     print("Capturing CUDA graphs...")
-    engine.capture_mixed_cuda_graphs(graph_sizes)
+    engine.capture_cuda_graphs(graph_sizes)
     print(f"Graphs captured. Total pages: {engine.total_pages}")
 
     # ── Test 3: With preemption ──
@@ -1097,7 +1097,7 @@ def main():
         cache_size=cache_size)
     print(f"Engine created in {time.time() - t0:.1f}s")
     print("Capturing CUDA graphs...")
-    rc_engine.capture_mixed_cuda_graphs(graph_sizes)
+    rc_engine.capture_cuda_graphs(graph_sizes)
     print(f"Graphs captured. Total pages: {rc_engine.total_pages}")
 
     # ── Test 9: Full pipeline, no preemption ──

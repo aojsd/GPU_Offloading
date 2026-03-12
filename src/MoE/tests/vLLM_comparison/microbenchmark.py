@@ -6,7 +6,7 @@ Subcommands:
     pp-decode   Pipeline-parallel decode performance vs vLLM (requires N GPUs)
     pp-prefill  Pipeline-parallel prefill performance vs vLLM (requires N GPUs)
     cuda-graph  CUDA graph correctness (eager vs graph exact match) + timing
-    mixed       mixed_step smoke tests (pure decode, pure prefill, mixed, multi-batch)
+    mixed       step smoke tests (pure decode, pure prefill, mixed, multi-batch)
     all         Run all benchmarks
 
 Usage:
@@ -157,15 +157,10 @@ def _time_custom_decode_once(engine, target_seq_len, n_steps, n_warmup):
     token = torch.tensor([100], device="cuda")
     pos = torch.tensor([target_seq_len], dtype=torch.int32, device="cuda")
 
-    use_graph = 1 in engine._cuda_graphs
-
     for _ in range(n_warmup):
         engine.seq_lens[0] = target_seq_len
         engine._seq_lens_cpu[0] = target_seq_len
-        if use_graph:
-            engine._decode_step_graphed(token, pos)
-        else:
-            engine.decode_step(token, pos)
+        engine.decode_step(token, pos)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
@@ -174,10 +169,7 @@ def _time_custom_decode_once(engine, target_seq_len, n_steps, n_warmup):
     for _ in range(n_steps):
         engine.seq_lens[0] = target_seq_len
         engine._seq_lens_cpu[0] = target_seq_len
-        if use_graph:
-            engine._decode_step_graphed(token, pos)
-        else:
-            engine.decode_step(token, pos)
+        engine.decode_step(token, pos)
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / n_steps
@@ -482,7 +474,7 @@ def run_cuda_graph_correctness(model_dir):
 
     for i in range(29):
         positions = engine.seq_lens[:1].clone()
-        logits = engine._decode_step_graphed(next_token, positions)
+        logits = engine.decode_step(next_token, positions)
         next_token = logits.argmax(dim=-1)
         generated_graph.append(next_token)
         if next_token.item() == engine.eos_token_id:
@@ -523,19 +515,13 @@ def run_cuda_graph_timing(model_dir):
     def time_steps(eng, n, label, use_graph=False):
         for _ in range(20):
             pos = eng.seq_lens[:1].clone()
-            if use_graph:
-                eng._decode_step_graphed(token, pos)
-            else:
-                eng.decode_step(token, pos)
+            eng.decode_step(token, pos)
         torch.cuda.synchronize()
 
         start.record()
         for _ in range(n):
             pos = eng.seq_lens[:1].clone()
-            if use_graph:
-                eng._decode_step_graphed(token, pos)
-            else:
-                eng.decode_step(token, pos)
+            eng.decode_step(token, pos)
         end.record()
         torch.cuda.synchronize()
         t = start.elapsed_time(end) / n
@@ -599,8 +585,8 @@ def run_cuda_graph_timing(model_dir):
 # =====================================================================
 
 def test_pure_decode_via_mixed(model_dir):
-    """Pure decode through mixed_step must match decode_step exactly."""
-    print("Test 1: pure decode via mixed_step...")
+    """Pure decode through step must match decode_step exactly."""
+    print("Test 1: pure decode via step...")
     short = _make_short_prompt(model_dir)
     engine = MoEEngine(model_dir, max_seqs=4, max_seq_len=512,
                        use_torch_compile=False)
@@ -617,7 +603,7 @@ def test_pure_decode_via_mixed(model_dir):
 
     engine.reset()
     engine.prefill_to_slot(0, prompt)
-    mixed_logits = engine.mixed_step([0], token, [], [])
+    mixed_logits = engine.step([0], token, [], [])
 
     diff = (ref_logits - mixed_logits).abs().max().item()
     assert diff == 0, f"Pure decode mismatch: max diff = {diff}"
@@ -628,8 +614,8 @@ def test_pure_decode_via_mixed(model_dir):
 
 
 def test_pure_prefill_via_mixed(model_dir):
-    """Pure prefill through mixed_step must match prefill exactly."""
-    print("Test 2: pure prefill via mixed_step...")
+    """Pure prefill through step must match prefill exactly."""
+    print("Test 2: pure prefill via step...")
     short = _make_short_prompt(model_dir)
     engine = MoEEngine(model_dir, max_seqs=4, max_seq_len=512,
                        use_torch_compile=False)
@@ -642,7 +628,7 @@ def test_pure_prefill_via_mixed(model_dir):
     ref_logits = engine.prefill_to_slot(0, prompt)
 
     engine.reset()
-    mixed_logits = engine.mixed_step(
+    mixed_logits = engine.step(
         [], torch.empty(0, dtype=torch.long, device="cuda"),
         [0], [prompt])
 
@@ -680,7 +666,7 @@ def test_mixed_batch(model_dir):
 
     engine.reset()
     engine.prefill_to_slot(0, prompt_a)
-    mixed_logits = engine.mixed_step(
+    mixed_logits = engine.step(
         [0], decode_token,
         [1], [prompt_b])
 
@@ -728,7 +714,7 @@ def test_multi_decode_multi_prefill(model_dir):
         engine.prefill_to_slot(i, p)
 
     decode_tokens = torch.randint(1, 1000, (2,), device="cuda")
-    mixed_logits = engine.mixed_step(
+    mixed_logits = engine.step(
         [0, 1], decode_tokens,
         [2, 3], prefill_prompts)
 
@@ -755,10 +741,10 @@ def test_multi_decode_multi_prefill(model_dir):
 
 def _run_eager_mixed(engine, decode_seq_ids, decode_token_ids,
                      prefill_seq_ids, prefill_input_ids):
-    """Run mixed_step in eager mode (bypass piecewise dispatch)."""
+    """Run step in eager mode (bypass piecewise dispatch)."""
     saved = getattr(engine, '_piecewise_graphs', None)
     engine._piecewise_graphs = {}
-    logits = engine.mixed_step(decode_seq_ids, decode_token_ids,
+    logits = engine.step(decode_seq_ids, decode_token_ids,
                                prefill_seq_ids, prefill_input_ids)
     if saved is not None:
         engine._piecewise_graphs = saved
@@ -768,12 +754,12 @@ def _run_eager_mixed(engine, decode_seq_ids, decode_token_ids,
 
 
 def test_piecewise_graphed_vs_eager(model_dir):
-    """Piecewise graphed mixed_step matches eager exactly (no torch.compile)."""
+    """Piecewise graphed step matches eager exactly (no torch.compile)."""
     print("Test 5: piecewise graphed vs eager (exact match)...")
     engine = MoEEngine(model_dir, max_seqs=8, max_seq_len=512,
                        use_torch_compile=False)
 
-    engine.capture_mixed_cuda_graphs(
+    engine.capture_cuda_graphs(
         total_token_sizes=[128, 256], use_torch_compile=False)
 
     prompt = torch.tensor(_make_short_prompt(model_dir), device="cuda")
@@ -800,7 +786,7 @@ def test_piecewise_graphed_vs_eager(model_dir):
     engine.seq_lens[:2] = seq_lens_snap.to("cuda")
     engine.kv_restore(kv_snap)
 
-    graph_logits = engine.mixed_step([0], decode_tok, [1], [prefill_ids])
+    graph_logits = engine.step([0], decode_tok, [1], [prefill_ids])
 
     match = torch.equal(eager_logits, graph_logits)
     max_diff = (eager_logits - graph_logits).abs().max().item()
@@ -819,7 +805,7 @@ def test_piecewise_padding(model_dir):
     print("Test 6: piecewise padding correctness...")
     engine = MoEEngine(model_dir, max_seqs=8, max_seq_len=512,
                        use_torch_compile=False)
-    engine.capture_mixed_cuda_graphs(
+    engine.capture_cuda_graphs(
         total_token_sizes=[128], use_torch_compile=False)
 
     short_prompt = _make_short_prompt(model_dir)
@@ -834,7 +820,7 @@ def test_piecewise_padding(model_dir):
 
     # Graphed (will pad to 128)
     engine.reset()
-    graph_logits = engine.mixed_step(
+    graph_logits = engine.step(
         [], torch.empty(0, dtype=torch.long, device="cuda"),
         [0, 1], [prompt1, prompt2])
 
@@ -855,7 +841,7 @@ def test_piecewise_multi_step(model_dir):
     print("Test 7: piecewise multi-step generation...")
     engine = MoEEngine(model_dir, max_seqs=8, max_seq_len=512,
                        use_torch_compile=False)
-    engine.capture_mixed_cuda_graphs(
+    engine.capture_cuda_graphs(
         total_token_sizes=[128], use_torch_compile=False)
 
     prompt = torch.tensor(_make_short_prompt(model_dir), device="cuda")
@@ -889,7 +875,7 @@ def test_piecewise_multi_step(model_dir):
     graph_generated = []
     next_toks = torch.tensor([100, 200], device="cuda", dtype=torch.long)
     for _ in range(5):
-        logits = engine.mixed_step([0, 1], next_toks, [], [])
+        logits = engine.step([0, 1], next_toks, [], [])
         next_toks = logits.argmax(dim=-1)
         graph_generated.append(next_toks.clone())
 
@@ -1287,7 +1273,7 @@ def _pp_set_seq_lens(engine, idx, val):
 def _time_pp_decode_once(engine, target_seq_len, n_steps, n_warmup):
     """Single trial: time n_steps piecewise decode steps for a PP engine.
 
-    Uses mixed_step (piecewise graphs) which is the correct decode path
+    Uses step (piecewise graphs) which is the correct decode path
     for pipeline-parallel engines.
     """
     engine.reset()
@@ -1298,7 +1284,7 @@ def _time_pp_decode_once(engine, target_seq_len, n_steps, n_warmup):
 
     for _ in range(n_warmup):
         _pp_set_seq_lens(engine, 0, target_seq_len)
-        engine.mixed_step([0], token, [], [])
+        engine.step([0], token, [], [])
     # Sync all devices
     for d in (engine.pp_devices or [torch.device("cuda")]):
         torch.cuda.synchronize(d)
@@ -1308,7 +1294,7 @@ def _time_pp_decode_once(engine, target_seq_len, n_steps, n_warmup):
     start.record()
     for _ in range(n_steps):
         _pp_set_seq_lens(engine, 0, target_seq_len)
-        engine.mixed_step([0], token, [], [])
+        engine.step([0], token, [], [])
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / n_steps
@@ -1324,7 +1310,7 @@ def time_pp_decode(engine, target_seq_len, n_steps, n_warmup, n_trials):
 def pp_custom_greedy_generate(engine, prompt_ids, max_new_tokens):
     """Run greedy generation with PP-aware custom engine.
 
-    Uses prefill_to_slot (routes through mixed_step for PP) instead of
+    Uses prefill_to_slot (routes through step for PP) instead of
     engine.prefill() which requires flat prefill graphs not available for PP.
     """
     engine.reset()
@@ -1335,7 +1321,7 @@ def pp_custom_greedy_generate(engine, prompt_ids, max_new_tokens):
 
     for _ in range(max_new_tokens - 1):
         token_t = torch.tensor([next_token], device="cuda")
-        step_logits = engine.mixed_step([0], token_t, [], [])
+        step_logits = engine.step([0], token_t, [], [])
         next_token = step_logits[0].argmax().item()
         tokens.append(next_token)
         if next_token == engine.eos_token_id:
@@ -1348,7 +1334,7 @@ def pp_custom_greedy_generate(engine, prompt_ids, max_new_tokens):
 def benchmark_pp_prefill_custom(engine, seq_lens, use_torch_compile=False):
     """Benchmark PP custom engine prefill with piecewise CUDA graphs."""
     engine.reset()
-    engine.capture_mixed_cuda_graphs(
+    engine.capture_cuda_graphs(
         total_token_sizes=seq_lens, use_torch_compile=use_torch_compile)
 
     results = {}
@@ -1417,12 +1403,12 @@ def cmd_pp_decode(args):
             pipeline_parallel_size=pp_size)
 
         with torch.inference_mode():
-            # Capture piecewise graphs (decode goes through mixed_step for PP)
-            engine.capture_mixed_cuda_graphs(
+            # Capture piecewise graphs (decode goes through step for PP)
+            engine.capture_cuda_graphs(
                 total_token_sizes=[1, 128, 256],
                 use_torch_compile=True)
 
-            # Warmup (use PP-compatible path: prefill_to_slot + mixed_step)
+            # Warmup (use PP-compatible path: prefill_to_slot + step)
             pp_custom_greedy_generate(engine, [100, 200, 300, 400], 5)
             for d in engine.pp_devices:
                 torch.cuda.synchronize(d)
@@ -1757,7 +1743,7 @@ def main():
 
     # mixed
     p_mixed = subparsers.add_parser("mixed",
-        help="mixed_step smoke tests")
+        help="step smoke tests")
     p_mixed.add_argument("--test", default="all",
         choices=["all", "pure-decode", "pure-prefill", "mixed", "multi",
                  "piecewise", "padding", "multi-step"])

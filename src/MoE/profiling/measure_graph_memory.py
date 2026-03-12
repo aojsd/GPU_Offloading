@@ -80,7 +80,7 @@ def measure(model_path, pp=2, max_seqs=8, max_seq_len=256,
 
     for gs in GRAPH_SIZES:
         try:
-            engine.capture_mixed_cuda_graphs(total_token_sizes=[gs])
+            engine.capture_cuda_graphs(total_token_sizes=[gs])
             torch.cuda.synchronize()
             curr = [gpu_used_gb(i) for i in range(pp)]
             delta_gb = [curr[i] - prev_used[i] for i in range(pp)]

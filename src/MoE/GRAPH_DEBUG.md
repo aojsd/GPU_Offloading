@@ -146,6 +146,6 @@ buffers but adds 2-5 ms dispatch overhead per forward pass.
 - `profiling/measure_graph_memory.py` — measurement script
 - `profiling/graph_memory_results.json` — raw per-size data (before fix)
 - `profiling/graph_memory_results_pool.json` — raw per-size data (after fix)
-- `moe_engine.py:capture_mixed_cuda_graphs()` — piecewise capture with pool sharing
+- `moe_engine.py:capture_cuda_graphs()` — piecewise capture with pool sharing
 - `moe_engine.py:_create_intermediate_buffers()` — per-size buffer allocation
 - `trace_construction/collect_batched_traces.py:compute_replay_kv_budget()` — budget function (overhead_gb can now be reduced)

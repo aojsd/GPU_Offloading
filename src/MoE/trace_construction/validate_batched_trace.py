@@ -122,7 +122,7 @@ def _validate_one(engine, recorder, at, per_conv_traces, prompts,
                         'decode_step': 0,
                     }
 
-            # Build mixed_step arguments
+            # Build step arguments
             decode_sids = []
             decode_tokens = []
             prefill_sids = []
@@ -169,7 +169,7 @@ def _validate_one(engine, recorder, at, per_conv_traces, prompts,
                     [], dtype=torch.long, device=engine.device)
 
             try:
-                engine.mixed_step(
+                engine.step(
                     decode_seq_ids=decode_sids,
                     decode_token_ids=decode_tensor,
                     prefill_seq_ids=prefill_sids,
@@ -305,7 +305,7 @@ def main():
     print(f"Capturing piecewise CUDA graphs ({len(graph_sizes)} sizes)...")
     for gs in graph_sizes:
         try:
-            engine.capture_mixed_cuda_graphs(total_token_sizes=[gs])
+            engine.capture_cuda_graphs(total_token_sizes=[gs])
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             print(f"  OOM at N={gs} — stopped")

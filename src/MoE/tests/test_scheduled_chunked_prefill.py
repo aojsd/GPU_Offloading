@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -u
 """Test scheduled chunked prefill correctness.
 
-Verifies that prefilling a prompt via continuation chunks in mixed_step()
+Verifies that prefilling a prompt via continuation chunks in step()
 produces the same output as a single full prefill. This is the foundation
 for vLLM-style scheduled chunked prefill where a prefill is interleaved
 with decode tokens across scheduler steps.
@@ -60,11 +60,11 @@ def load_sharegpt_prompts(n=10):
 
 
 def full_prefill(engine, seq_id, input_ids):
-    """Prefill a full prompt in one shot via mixed_step. Returns last-token logits."""
+    """Prefill a full prompt in one shot via step. Returns last-token logits."""
     engine.reset()
     empty_dev = engine.device
     with torch.inference_mode():
-        logits = engine.mixed_step(
+        logits = engine.step(
             decode_seq_ids=[],
             decode_token_ids=torch.empty(0, dtype=torch.long, device=empty_dev),
             prefill_seq_ids=[seq_id],
@@ -74,7 +74,7 @@ def full_prefill(engine, seq_id, input_ids):
 
 
 def chunked_prefill_via_continuation(engine, seq_id, input_ids, chunk_size):
-    """Prefill a prompt via multiple continuation chunks using mixed_step().
+    """Prefill a prompt via multiple continuation chunks using step().
 
     First chunk uses new-prefill (FA3 self-attention).
     Subsequent chunks use continuation (FlashInfer paged-KV attention).
@@ -96,7 +96,7 @@ def chunked_prefill_via_continuation(engine, seq_id, input_ids, chunk_size):
         for i, (off, chunk_ids) in enumerate(chunks):
             if i == 0:
                 # First chunk: new prefill
-                logits = engine.mixed_step(
+                logits = engine.step(
                     decode_seq_ids=[],
                     decode_token_ids=torch.empty(
                         0, dtype=torch.long, device=empty_dev),
@@ -104,7 +104,7 @@ def chunked_prefill_via_continuation(engine, seq_id, input_ids, chunk_size):
                     prefill_input_ids=[chunk_ids])
             else:
                 # Continuation chunk
-                logits = engine.mixed_step(
+                logits = engine.step(
                     decode_seq_ids=[],
                     decode_token_ids=torch.empty(
                         0, dtype=torch.long, device=empty_dev),
@@ -123,7 +123,7 @@ def mixed_decode_plus_continuation(engine, decode_seq_id, decode_token,
                                    cont_seq_id, cont_ids, cont_offset):
     """Run a mixed step with one decode token + one continuation chunk."""
     with torch.inference_mode():
-        logits = engine.mixed_step(
+        logits = engine.step(
             decode_seq_ids=[decode_seq_id],
             decode_token_ids=decode_token,
             prefill_seq_ids=[],
@@ -170,7 +170,7 @@ def test_three_chunks(engine, prompt):
 
 
 def test_mixed_decode_continuation(engine, prompt):
-    """Test: decode + continuation chunk in the same mixed_step.
+    """Test: decode + continuation chunk in the same step.
 
     1. Prefill seq 0 fully (reference decode sequence).
     2. Prefill first chunk of seq 1 as new prefill.
@@ -187,24 +187,24 @@ def test_mixed_decode_continuation(engine, prompt):
     # Reference: full prefill seq 0 + one decode step
     engine.reset()
     with torch.inference_mode():
-        logits_pf0 = engine.mixed_step(
+        logits_pf0 = engine.step(
             [], torch.empty(0, dtype=torch.long, device=empty_dev),
             [0], [prompt])
         next_token = logits_pf0[S - 1].argmax().unsqueeze(0)
-        ref_decode_logits = engine.mixed_step(
+        ref_decode_logits = engine.step(
             [0], next_token, [], [])
     ref_decode_token = ref_decode_logits[0].argmax().item()
 
     # Test: prefill seq 0 fully, prefill chunk1 of seq 1, then mixed step
     engine.reset()
     with torch.inference_mode():
-        logits_pf0 = engine.mixed_step(
+        logits_pf0 = engine.step(
             [], torch.empty(0, dtype=torch.long, device=empty_dev),
             [0], [prompt])
         next_token = logits_pf0[S - 1].argmax().unsqueeze(0)
 
         # Prefill first chunk of seq 1
-        engine.mixed_step(
+        engine.step(
             decode_seq_ids=[],
             decode_token_ids=torch.empty(0, dtype=torch.long,
                                          device=engine.device),
@@ -247,7 +247,7 @@ def main():
     graph_sizes = [1, 128, 256, 512, 1024]
     print(f"Capturing piecewise CUDA graphs for sizes: {graph_sizes}")
     with torch.inference_mode():
-        engine.capture_mixed_cuda_graphs(
+        engine.capture_cuda_graphs(
             total_token_sizes=graph_sizes,
             use_torch_compile=False)
 
@@ -273,7 +273,7 @@ def main():
 
     # Test 3: Mixed decode + continuation
     print("\n" + "=" * 60)
-    print("TEST 3: Decode + continuation chunk in same mixed_step")
+    print("TEST 3: Decode + continuation chunk in same step")
     print("=" * 60)
     prompt = torch.randint(1, 1000, (256,), device=engine.device)
     decode_match, decode_diff = test_mixed_decode_continuation(engine, prompt)

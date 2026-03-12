@@ -44,7 +44,7 @@ batching with greedy admission, LIFO preemption with recompute, dynamic page all
 
 <table>
 <style>
-  .cache-border td { border-top: 3px solid #333; }
+  .cache-border td { border-top: 5px solid #fff; }
   .policy-border td:nth-child(n+2) { border-top: 1px solid #999; }
 </style>
 <thead>

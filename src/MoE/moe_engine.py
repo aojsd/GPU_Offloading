@@ -110,112 +110,11 @@ def rope_pytorch(q, k, cos_sin_cache, positions, num_heads, head_dim,
                         k_h[..., :half] * sin + k_h[..., half:] * cos], dim=-1)
     return q_rot.reshape(N, -1).to(orig_dtype), k_rot.reshape(N, -1).to(orig_dtype)
 
-# ── Conditionally patch vLLM's _moe_C ops (broken on glibc < 2.29) ──
-# Load _C.so (works fine — has silu_and_mul, etc.)
+# ── Load vLLM custom ops (_C.so has reshape_and_cache_flash, etc.) ──
 import vllm._custom_ops as _vllm_ops
 _vllm_so = Path(_vllm_ops.__file__).parent / "_C.abi3.so"
 if _vllm_so.exists():
     torch.ops.load_library(str(_vllm_so))
-
-import platform
-_glibc_ver = platform.libc_ver()[1]
-_needs_moe_patch = _glibc_ver and tuple(int(x) for x in _glibc_ver.split(".")) < (2, 29)
-
-
-def _moe_align_block_size_torch(topk_ids, num_experts, block_size,
-                                sorted_ids, expert_ids, num_tokens_post_pad):
-    """Pure PyTorch replacement for _moe_C.moe_align_block_size.
-
-    Fully vectorized — no .item() calls or Python for-loops over experts.
-    This makes it compatible with CUDA graph capture and torch.compile.
-
-    sorted_ids must contain FLAT indices into topk_ids.flatten(), not original
-    token indices. The Triton kernel recovers the token via flat_idx // top_k.
-    """
-    N, K = topk_ids.shape
-    total_flat = N * K
-    flat_expert_ids = topk_ids.flatten()  # [N*K] expert assignments
-
-    # Count per expert
-    expert_counts = torch.zeros(num_experts, dtype=torch.int32, device=topk_ids.device)
-    expert_counts.scatter_add_(0, flat_expert_ids.long(),
-                               torch.ones(total_flat, dtype=torch.int32, device=topk_ids.device))
-
-    # Padded counts (round up to block_size)
-    padded_counts = ((expert_counts + block_size - 1) // block_size) * block_size
-    cum_padded = torch.zeros(num_experts + 1, dtype=torch.int32, device=topk_ids.device)
-    cum_padded[1:] = torch.cumsum(padded_counts, dim=0)
-    cum_orig = torch.zeros(num_experts + 1, dtype=torch.int32, device=topk_ids.device)
-    cum_orig[1:] = torch.cumsum(expert_counts, dim=0)
-
-    # Sort flat positions by expert
-    sort_order = flat_expert_ids.argsort(stable=True)
-    sorted_flat_pos = torch.arange(total_flat, device=topk_ids.device, dtype=torch.int32)[sort_order]
-    expert_of_sorted = flat_expert_ids[sort_order]
-
-    # Vectorized fill of sorted_ids: compute destination for each sorted token
-    within_idx = torch.arange(total_flat, device=topk_ids.device, dtype=torch.int32)
-    within_idx = within_idx - cum_orig[expert_of_sorted.long()]
-    dst = cum_padded[expert_of_sorted.long()] + within_idx
-
-    sorted_ids.fill_(total_flat)  # padding value (out-of-range, ignored by kernel)
-    sorted_ids.scatter_(0, dst.long(), sorted_flat_pos)
-
-    # Vectorized fill of expert_ids via searchsorted
-    n_blocks = padded_counts // block_size
-    cum_blocks = torch.zeros(num_experts + 1, dtype=torch.int32, device=topk_ids.device)
-    cum_blocks[1:] = torch.cumsum(n_blocks, dim=0)
-    block_positions = torch.arange(expert_ids.shape[0], device=topk_ids.device, dtype=torch.int32)
-    expert_ids[:] = torch.searchsorted(cum_blocks[1:].contiguous(), block_positions, right=True)
-    # Padding blocks (beyond total real blocks) are never processed by the
-    # Triton kernel. Zero them so downstream expert_map[expert_ids] doesn't
-    # OOB when num_experts is the buffer dimension (> model expert count).
-    expert_ids[block_positions >= cum_blocks[-1]] = 0
-
-    num_tokens_post_pad.fill_(0)
-    num_tokens_post_pad[0] = cum_padded[-1]
-
-
-def _moe_sum_torch(input: torch.Tensor, output: torch.Tensor):
-    """Pure PyTorch replacement for _moe_C.moe_sum (sum over top-k dim)."""
-    output.copy_(input.sum(dim=1))
-
-
-def _topk_softmax_torch(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
-                         token_expert_indices: torch.Tensor,
-                         gating_output: torch.Tensor,
-                         renormalize: bool) -> None:
-    """Pure PyTorch replacement for _moe_C.topk_softmax.
-
-    Computes softmax(gating_output) -> top-k selection -> fills output tensors.
-    topk_weights: [M, topk] float32 output (selected softmax probs)
-    topk_ids: [M, topk] int32 output (selected expert indices)
-    token_expert_indices: [M, topk] int32 output (flat index = i * E + expert_id)
-    gating_output: [M, E] float input (raw router logits)
-    """
-    M, E = gating_output.shape
-    K = topk_weights.shape[1]
-    scores = torch.softmax(gating_output.float(), dim=-1)
-    tk_w, tk_i = torch.topk(scores, K, dim=-1)
-    if renormalize:
-        tk_w = tk_w / tk_w.sum(dim=-1, keepdim=True)
-    topk_weights.copy_(tk_w)
-    topk_ids.copy_(tk_i.to(topk_ids.dtype))
-    # token_expert_indices[i, j] = i * E + topk_ids[i, j]
-    row_offsets = torch.arange(M, device=gating_output.device, dtype=torch.int32).unsqueeze(1) * E
-    token_expert_indices.copy_(row_offsets + tk_i.to(torch.int32))
-
-
-# Apply monkey-patches only on glibc < 2.29 (needed for old RHEL 8.10 systems)
-if _needs_moe_patch:
-    _vllm_ops.moe_align_block_size = _moe_align_block_size_torch
-    _vllm_ops.moe_sum = _moe_sum_torch
-    _vllm_ops.topk_softmax = _topk_softmax_torch
-    import vllm.model_executor.layers.fused_moe.moe_align_block_size as _mabs_mod
-    _mabs_mod.ops.moe_align_block_size = _moe_align_block_size_torch
-    import vllm.model_executor.layers.fused_moe.fused_moe as _fused_moe_mod
-    _fused_moe_mod.ops.topk_softmax = _topk_softmax_torch
-    _fused_moe_mod.ops.moe_sum = _moe_sum_torch
 
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 
@@ -1319,8 +1218,9 @@ class MoEEngine:
         """
         B = token_ids.shape[0]
 
-        if self.offload_engine or self.replay_controller:
+        if self.offload_engine or self.replay_controller or self.is_mla:
             # Route through mixed_step for piecewise graphs + offload/replay hook.
+            # MLA models must always use this path (no monolithic decode wrapper).
             return self.mixed_step(
                 decode_seq_ids=list(range(B)),
                 decode_token_ids=token_ids,

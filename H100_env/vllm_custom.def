@@ -1,0 +1,22 @@
+Bootstrap: docker
+From: vllm/vllm-openai:v0.17.1
+
+%labels
+    Author mw976
+    Description vLLM v0.17.1 with custom dependencies for GPU offloading research
+
+%post
+    # Add any extra packages your scripts need that aren't in the base image.
+    # The base image already has: vLLM, PyTorch 2.10, CUDA 12.8, FlashAttention, etc.
+    #
+    # Example:
+    # pip install some-extra-package
+
+    echo "Custom vLLM container build complete."
+
+%environment
+    # Disable vLLM V1 multiprocessing (subprocess won't have patches)
+    export VLLM_ENABLE_V1_MULTIPROCESSING=0
+
+%runscript
+    exec python "$@"

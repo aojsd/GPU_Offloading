@@ -26,9 +26,16 @@ maximize performance fidelity.
 ## Environment
 
 - **GPUs**: 2x NVIDIA H100 80GB HBM3 (SM90), **CUDA** 12.8, **System**: RHEL 8.10 (glibc 2.28)
-- **Python** 3.13.5, **PyTorch** 2.9.0+cu128, **Triton** 3.5.0
-- **vLLM** 0.11.2 (pip prebuilt wheel), includes **xformers** 0.0.33.post1 + **FlashInfer** 0.5.2
-- glibc 2.28 constrains us: vLLM 0.12+ wheels require glibc 2.31; 0.11.2 is the latest compatible.
+- **Container** (primary runtime): Apptainer with `vllm/vllm-openai:v0.17.1` — glibc 2.35, Python 3.12, PyTorch 2.10.0+cu129, vLLM 0.17.1
+- **Host** (legacy): Python 3.13.5, PyTorch 2.9.0+cu128, vLLM 0.11.2
+
+**On non-GH200/GB200 systems (e.g., H100 cluster), all GPU work MUST be executed
+inside the Apptainer container** via `../../H100_env/vllm_apptainer.sh`. The host
+glibc 2.28 is incompatible with vLLM native kernels — running GPU code directly on
+the host will fail. See [H100_env/vllm_apptainer.sh](../../H100_env/vllm_apptainer.sh)
+for usage.
+
+On GH200/GB200 systems, use `GH_GB200_env/pytorch_ngc.sh` (Docker) instead.
 
 ---
 
@@ -255,13 +262,6 @@ See [vLLM_comparison/README.md](vLLM_comparison/README.md) for full profiling da
 - Greedy generation: exact match vs HuggingFace (56/56 tokens on test prompt)
 - CUDA graph vs eager: exact match (30 tokens)
 - vs vLLM: 2/3 prompts exact match (1 diverges at BF16 tie-break, gap=0.0625)
-
-### glibc 2.28 Workaround
-
-vLLM's `_moe_C.abi3.so` requires glibc 2.29. Three ops monkey-patched in `moe_engine.py`:
-`moe_align_block_size` (vectorized, no `.item()`), `moe_sum`, `topk_softmax`.
-All CUDA-graph-capturable. Key detail: sorted_ids are **flat indices** into
-`topk_ids.flatten()`; expert_ids via `searchsorted(..., right=True)`.
 
 ---
 

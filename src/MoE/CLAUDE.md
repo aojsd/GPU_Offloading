@@ -16,8 +16,14 @@ it comes to real experiments or any test that is performance related.
 ## Environment
 
 - **GPUs**: 2x NVIDIA H100 80GB HBM3 (SM90), **CUDA** 12.8, **System**: RHEL 8.10 (glibc 2.28)
-- **Python** 3.13.5, **PyTorch** 2.9.0+cu128, **Triton** 3.5.0
-- **vLLM** 0.11.2 (pip prebuilt wheel; 0.12+ requires glibc 2.31)
+- **Container** (primary runtime): Apptainer with `vllm/vllm-openai:v0.17.1` — glibc 2.35, Python 3.12, PyTorch 2.10.0+cu129, vLLM 0.17.1
+- **Host** (legacy, not for GPU work): Python 3.13.5, PyTorch 2.9.0+cu128, vLLM 0.11.2
+
+**All GPU work on non-GH200/GB200 systems MUST run inside the Apptainer container**
+via `../../H100_env/vllm_apptainer.sh`. This includes tests, benchmarks, profiling,
+trace collection, and any script that imports PyTorch or touches the GPU.
+The host glibc 2.28 is incompatible with vLLM native kernels — running
+GPU code directly on the host will fail.
 
 ---
 
@@ -56,7 +62,6 @@ and end-to-end usage.
 ## Key Pitfalls
 
 - `VLLM_ENABLE_V1_MULTIPROCESSING=0` must be set **before** any vLLM import
-- glibc 2.28: three ops monkey-patched in `moe_engine.py` (`moe_align_block_size`, `moe_sum`, `topk_softmax`); `sorted_ids` are FLAT indices into `topk_ids.flatten()`
 - Q/K norm on flat `[B, 2048]` **before** head reshape, not per-head
 - norm_topk_prob: model-specific (OLMoE=False, Mixtral=True) — read from config.json
 - V tensor after QKV split is non-contiguous → needs `.contiguous()` or `.reshape()`
@@ -66,9 +71,5 @@ and end-to-end usage.
 - **FlashInfer `plan()` before every decode replay**: `_plan_info` tile counts depend on actual page count, not just buffer contents (applies to non-MLA FlashInfer decode and MLA continuation prefill)
 - **`_seq_lens_cpu += 1` BEFORE `plan()`**: FlashInfer must include the current token's K/V
 - **FlashInfer prefill incompatible with multi-graph**: `fmha_varlen_plan()` allocates fresh GPU tensors per call; use vLLM FA3 instead
-- **DS-V2-Lite (`is_mla=True`) LD_PRELOAD**: FlashInfer MLA JIT (GLIBCXX 3.4.32) is required
-  for continuation prefill (stage 3b) and `_layer_mixed_mla` eager fallback. Must prefix DS-V2-Lite runs with:
-  `LD_PRELOAD=/gpfs/radev/apps/avx512/software/GCCcore/13.3.0/lib64/libstdc++.so.6`
-  Piecewise decode (stage 2) uses vLLM FA3 and does NOT require LD_PRELOAD.
 - **All decode routes through piecewise** (`decode_step` → `mixed_step`); monolithic decode graph path removed
 - Eager mode is NOT for real experiments — only for sanity checks in test files

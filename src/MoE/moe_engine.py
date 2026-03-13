@@ -25,6 +25,8 @@ from vllm.v1.attention.backends.flashinfer import (
     BatchDecodeWithPagedKVCacheWrapper,
     BatchPrefillWithPagedKVCacheWrapper,
 )
+# Triton kernel that flattens paged block table into a contiguous index array
+# entirely on GPU, avoiding the GPU→CPU→GPU roundtrip of the naive approach
 from vllm.v1.attention.backends.flashinfer import _copy_page_indices_kernel
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 
@@ -180,7 +182,7 @@ class MoEEngine:
             self.moe_intermediate_size = self.intermediate_size
             self.rope_scaling_config = None
 
-        # FlashMLA requires page_size=64 for MLA models
+        # FlashMLA kernel requires page_size=64 (its tiling assumes 64-slot pages)
         if self.is_mla:
             self.page_size = 64
             page_size = 64
@@ -258,6 +260,11 @@ class MoEEngine:
             # KV cache: [total_pages, page_size, num_kv_heads, head_dim] per layer.
             # Layout required by reshape_and_cache_flash.
             if self.is_mla:
+                # Fused MLA cache: single mla_flat [slots, 576] buffer per layer.
+                # mla_cache is a 4D view [pages, 64, 1, 576] for FlashMLA.
+                # ckv_flat/kpe_flat/ckv_cache/kpe_cache are sliced views into the
+                # same storage so existing KV write paths (reshape_and_cache) and
+                # continuation prefill (FlashInfer MLA) still work without copies.
                 total_kv_slots = self.total_pages * self.page_size
                 self._scratch_slot = total_kv_slots  # index for sentinel writes
                 mla_head_dim = self.kv_lora_rank + self.qk_rope_head_dim  # 576
@@ -271,7 +278,6 @@ class MoEEngine:
                         self.total_pages, self.page_size, 1, mla_head_dim)
                     for f in self.mla_flat
                 ]
-                # Views for backward compat (continuation prefill uses FlashInfer MLA)
                 self.ckv_flat = [f[:, :self.kv_lora_rank] for f in self.mla_flat]
                 self.kpe_flat = [f[:, self.kv_lora_rank:] for f in self.mla_flat]
                 self.ckv_cache = [
@@ -364,7 +370,8 @@ class MoEEngine:
                 self._mla_decode_wrapper = None
                 self._mla_wrappers = None
 
-                # Pre-allocated plan metadata for GQA decode (PP)
+                # Pre-allocated plan metadata for GQA decode (PP).
+                # See single-GPU path below for rationale.
                 self._plan_indptr_cpu = torch.zeros(
                     max_seqs + 1, dtype=torch.int32).pin_memory()
                 self._plan_indptr_np = self._plan_indptr_cpu.numpy()
@@ -399,6 +406,7 @@ class MoEEngine:
             # KV cache: [total_pages, page_size, num_kv_heads, head_dim] per layer.
             # Layout required by reshape_and_cache_flash.
             if self.is_mla:
+                # Fused MLA cache layout — see PP path above for rationale
                 total_kv_slots = self.total_pages * self.page_size
                 self._scratch_slot = total_kv_slots  # index for sentinel writes
                 mla_head_dim = self.kv_lora_rank + self.qk_rope_head_dim  # 576
@@ -412,7 +420,6 @@ class MoEEngine:
                         self.total_pages, self.page_size, 1, mla_head_dim)
                     for f in self.mla_flat
                 ]
-                # Views for backward compat (continuation prefill uses FlashInfer MLA)
                 self.ckv_flat = [f[:, :self.kv_lora_rank] for f in self.mla_flat]
                 self.kpe_flat = [f[:, self.kv_lora_rank:] for f in self.mla_flat]
                 self.ckv_cache = [
@@ -493,7 +500,11 @@ class MoEEngine:
                 self._mla_decode_wrapper = None
                 self._mla_wrappers = None
 
-                # Pre-allocated plan metadata for GQA decode
+                # Pre-allocated plan metadata for GQA decode.
+                # Pinned CPU buffers with numpy views avoid per-step
+                # torch.tensor()/torch.zeros() allocation overhead (~30us).
+                # GPU buffers avoid the old GPU→CPU→GPU block table roundtrip
+                # by using _copy_page_indices_kernel to flatten pages on-device.
                 self._plan_indptr_cpu = torch.zeros(
                     max_seqs + 1, dtype=torch.int32).pin_memory()
                 self._plan_indptr_np = self._plan_indptr_cpu.numpy()
@@ -2190,7 +2201,12 @@ class MoEEngine:
                            q_nope_buf, q_fused_buf,
                            ckv_buf, kpe_buf, residual_buf):
         """Stage 1 for MLA: RMSNorm -> Q proj -> W_UK absorption -> KV compress
-        -> KV norm -> RoPE (pe only) -> KV cache write."""
+        -> KV norm -> RoPE (pe only) -> KV cache write.
+
+        Takes q_fused_buf [N, H, 576] (not separate q_absorbed/q_pe views)
+        because torch.compile can't handle aliased tensor inputs — passing two
+        views of the same storage as separate args fails synthetic base tracking.
+        """
         N = hidden.shape[0]
         H = self.hidden_size
 
@@ -3515,6 +3531,8 @@ class MoEEngine:
 
             if self.is_mla:
                 # MLA: Stage 2 (decode) using FlashMLA + Stage 3a (prefill)
+                # FlashMLA runs on all graph_N tokens (padded batch); padding
+                # tokens have cache_seqlens=0 and produce exact zero output.
                 if D > 0 and _HAS_FLASHMLA:
                     if _nvtx: torch.cuda.nvtx.range_push("stage2_mla")
                     # q_fused_buf is already [graph_N, H, 576] with q_absorbed

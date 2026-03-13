@@ -16,6 +16,7 @@ Usage:
     python tests/test_gpu_integration.py --model ../../models/Mixtral-8x7B --experts-per-layer 4
 """
 import argparse
+import json
 import math
 import sys
 import time
@@ -914,14 +915,19 @@ def main():
     pp = args.pp
     epl = args.experts_per_layer
     use_compile = not args.no_compile
-    page_size = 16
-
     if epl is not None and pp > 1:
         print("ERROR: --experts-per-layer and --pp > 1 are mutually exclusive")
         return 1
 
+    # Detect MLA to determine page_size (FlashMLA requires 64)
+    with open(Path(model) / "config.json") as _f:
+        _cfg = json.load(_f)
+    is_mla = "kv_lora_rank" in _cfg
+    page_size = 64 if is_mla else 16
+
     print(f"Model: {model}")
     print(f"PP size: {pp}")
+    print(f"page_size: {page_size} ({'MLA/FlashMLA' if is_mla else 'GQA'})")
     if epl is not None:
         print(f"experts_per_layer: {epl}")
     print(f"torch.compile: {use_compile}")
@@ -930,12 +936,11 @@ def main():
     max_seqs = 8
     max_seq_len = 2048
     max_pages_per_seq = math.ceil(max_seq_len / page_size)
-    generous_budget = max_seqs * max_pages_per_seq  # 1024 pages
+    generous_budget = max_seqs * max_pages_per_seq
 
-    # Tight budget: ~32 pages forces preemption with 12 conversations
-    # Each conversation wants ~20-31 pages (prompt + 256 output), so 32 pages
-    # can hold ~1-2 at once, forcing heavy preemption and multi-preemption.
-    tight_budget = 32
+    # Tight budget: forces preemption with 12 conversations.
+    # Each conversation wants ~20-31 pages (page_size=16) or ~5-8 (page_size=64).
+    tight_budget = max(8, 32 * 16 // page_size)
 
     graph_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512]
 

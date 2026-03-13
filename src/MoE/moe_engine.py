@@ -14,15 +14,28 @@ Uses the same kernels as vLLM 0.11.2 v1 engine on H100:
 import json
 import math
 from collections import deque
+import numpy as np
 import torch
 import torch.nn.functional as F
 from pathlib import Path
 from safetensors import safe_open
+from vllm.v1.worker.gpu.input_batch import prepare_pos_seq_lens
+from vllm.v1.worker.gpu.block_table import _compute_slot_mappings_kernel
 from vllm.v1.attention.backends.flashinfer import (
     BatchDecodeWithPagedKVCacheWrapper,
     BatchPrefillWithPagedKVCacheWrapper,
 )
+from vllm.v1.attention.backends.flashinfer import _copy_page_indices_kernel
 from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+# FlashMLA: fused MLA decode kernel (no plan() needed), used for MLA models
+try:
+    from vllm.third_party.flashmla.flash_mla_interface import (
+        flash_mla_with_kvcache, get_mla_metadata, FlashMLASchedMeta
+    )
+    _HAS_FLASHMLA = True
+except ImportError:
+    _HAS_FLASHMLA = False
 
 
 def _yarn_get_mscale(scale: float, mscale_coeff: float) -> float:
@@ -167,6 +180,11 @@ class MoEEngine:
             self.moe_intermediate_size = self.intermediate_size
             self.rope_scaling_config = None
 
+        # FlashMLA requires page_size=64 for MLA models
+        if self.is_mla:
+            self.page_size = 64
+            page_size = 64
+
         # Unsupported features — raise early rather than produce wrong results
         if cfg.get("sliding_window") is not None:
             raise NotImplementedError(
@@ -242,23 +260,27 @@ class MoEEngine:
             if self.is_mla:
                 total_kv_slots = self.total_pages * self.page_size
                 self._scratch_slot = total_kv_slots  # index for sentinel writes
-                self.ckv_flat = [
-                    torch.zeros(total_kv_slots + 1, self.kv_lora_rank, dtype=dtype,
+                mla_head_dim = self.kv_lora_rank + self.qk_rope_head_dim  # 576
+                self.mla_flat = [
+                    torch.zeros(total_kv_slots + 1, mla_head_dim, dtype=dtype,
                                 device=self.pp_layer_device[l])
                     for l in range(self.num_layers)
                 ]
-                self.kpe_flat = [
-                    torch.zeros(total_kv_slots + 1, self.qk_rope_head_dim, dtype=dtype,
-                                device=self.pp_layer_device[l])
-                    for l in range(self.num_layers)
+                self.mla_cache = [
+                    f[:total_kv_slots].view(
+                        self.total_pages, self.page_size, 1, mla_head_dim)
+                    for f in self.mla_flat
                 ]
+                # Views for backward compat (continuation prefill uses FlashInfer MLA)
+                self.ckv_flat = [f[:, :self.kv_lora_rank] for f in self.mla_flat]
+                self.kpe_flat = [f[:, self.kv_lora_rank:] for f in self.mla_flat]
                 self.ckv_cache = [
-                    f[:total_kv_slots].view(self.total_pages, self.page_size, self.kv_lora_rank)
-                    for f in self.ckv_flat
+                    c[:, :, :, :self.kv_lora_rank].squeeze(2)
+                    for c in self.mla_cache
                 ]
                 self.kpe_cache = [
-                    f[:total_kv_slots].view(self.total_pages, self.page_size, self.qk_rope_head_dim)
-                    for f in self.kpe_flat
+                    c[:, :, :, self.kv_lora_rank:].squeeze(2)
+                    for c in self.mla_cache
                 ]
                 self.k_cache = None
                 self.v_cache = None
@@ -295,6 +317,22 @@ class MoEEngine:
                         dtype=torch.int32)
             self.block_table = [bt.to(d) for d in self.pp_devices]
 
+            # GPU mirror of _seq_lens_cpu for Triton kernels (on GPU 0)
+            self._num_computed_tokens_gpu = torch.zeros(
+                max_seqs, dtype=torch.int32, device=self.pp_devices[0])
+
+            # Block table pointer/stride for Triton slot mapping kernel
+            # Only GPU 0's pointer — kernel runs on GPU 0, results replicated
+            self._block_table_ptrs = torch.tensor(
+                [self.block_table[0].data_ptr()], dtype=torch.uint64,
+                device=self.pp_devices[0])
+            self._block_table_strides = torch.tensor(
+                [self.block_table[0].stride(0)], dtype=torch.int64,
+                device=self.pp_devices[0])
+            self._block_sizes_tensor = torch.tensor(
+                [self.page_size], dtype=torch.int32,
+                device=self.pp_devices[0])
+
             # Sequence length tracker: replicated on each GPU
             self.seq_lens = [torch.zeros(max_seqs, dtype=torch.int32,
                                          device=d)
@@ -325,6 +363,28 @@ class MoEEngine:
                 self._decode_wrapper = self._decode_wrappers[0]
                 self._mla_decode_wrapper = None
                 self._mla_wrappers = None
+
+                # Pre-allocated plan metadata for GQA decode (PP)
+                self._plan_indptr_cpu = torch.zeros(
+                    max_seqs + 1, dtype=torch.int32).pin_memory()
+                self._plan_indptr_np = self._plan_indptr_cpu.numpy()
+                self._plan_lpl_cpu = torch.zeros(
+                    max_seqs, dtype=torch.int32).pin_memory()
+                self._plan_lpl_np = self._plan_lpl_cpu.numpy()
+                self._plan_indptr_gpu_pp = [
+                    torch.zeros(max_seqs + 1, dtype=torch.int32, device=d)
+                    for d in self.pp_devices]
+                self._plan_indices_gpu_pp = [
+                    torch.zeros(max_seqs * self.max_pages_per_seq,
+                                dtype=torch.int32, device=d)
+                    for d in self.pp_devices]
+                self._plan_gathered_bt_pp = [
+                    torch.zeros(max_seqs, self.max_pages_per_seq,
+                                dtype=torch.int32, device=d)
+                    for d in self.pp_devices]
+                self._plan_idx_long_pp = [
+                    torch.zeros(max_seqs, dtype=torch.int64, device=d)
+                    for d in self.pp_devices]
         else:
             # Single-GPU path (original)
             if self.is_mla:
@@ -341,23 +401,27 @@ class MoEEngine:
             if self.is_mla:
                 total_kv_slots = self.total_pages * self.page_size
                 self._scratch_slot = total_kv_slots  # index for sentinel writes
-                self.ckv_flat = [
-                    torch.zeros(total_kv_slots + 1, self.kv_lora_rank, dtype=dtype,
+                mla_head_dim = self.kv_lora_rank + self.qk_rope_head_dim  # 576
+                self.mla_flat = [
+                    torch.zeros(total_kv_slots + 1, mla_head_dim, dtype=dtype,
                                 device=device)
                     for _ in range(self.num_layers)
                 ]
-                self.kpe_flat = [
-                    torch.zeros(total_kv_slots + 1, self.qk_rope_head_dim, dtype=dtype,
-                                device=device)
-                    for _ in range(self.num_layers)
+                self.mla_cache = [
+                    f[:total_kv_slots].view(
+                        self.total_pages, self.page_size, 1, mla_head_dim)
+                    for f in self.mla_flat
                 ]
+                # Views for backward compat (continuation prefill uses FlashInfer MLA)
+                self.ckv_flat = [f[:, :self.kv_lora_rank] for f in self.mla_flat]
+                self.kpe_flat = [f[:, self.kv_lora_rank:] for f in self.mla_flat]
                 self.ckv_cache = [
-                    f[:total_kv_slots].view(self.total_pages, self.page_size, self.kv_lora_rank)
-                    for f in self.ckv_flat
+                    c[:, :, :, :self.kv_lora_rank].squeeze(2)
+                    for c in self.mla_cache
                 ]
                 self.kpe_cache = [
-                    f[:total_kv_slots].view(self.total_pages, self.page_size, self.qk_rope_head_dim)
-                    for f in self.kpe_flat
+                    c[:, :, :, self.kv_lora_rank:].squeeze(2)
+                    for c in self.mla_cache
                 ]
                 self.k_cache = None
                 self.v_cache = None
@@ -394,6 +458,20 @@ class MoEEngine:
                         (i + 1) * self.max_pages_per_seq,
                         dtype=torch.int32, device=device)
 
+            # GPU mirror of _seq_lens_cpu for Triton kernels
+            self._num_computed_tokens_gpu = torch.zeros(
+                max_seqs, dtype=torch.int32, device=device)
+
+            # Block table pointer/stride for Triton slot mapping kernel
+            self._block_table_ptrs = torch.tensor(
+                [self.block_table.data_ptr()], dtype=torch.uint64,
+                device=device)
+            self._block_table_strides = torch.tensor(
+                [self.block_table.stride(0)], dtype=torch.int64,
+                device=device)
+            self._block_sizes_tensor = torch.tensor(
+                [self.page_size], dtype=torch.int32, device=device)
+
             # Sequence length tracker
             self.seq_lens = torch.zeros(max_seqs, dtype=torch.int32,
                                         device=device)
@@ -414,6 +492,24 @@ class MoEEngine:
                     self._workspace_buf, kv_layout="NHD", use_cuda_graph=False)
                 self._mla_decode_wrapper = None
                 self._mla_wrappers = None
+
+                # Pre-allocated plan metadata for GQA decode
+                self._plan_indptr_cpu = torch.zeros(
+                    max_seqs + 1, dtype=torch.int32).pin_memory()
+                self._plan_indptr_np = self._plan_indptr_cpu.numpy()
+                self._plan_lpl_cpu = torch.zeros(
+                    max_seqs, dtype=torch.int32).pin_memory()
+                self._plan_lpl_np = self._plan_lpl_cpu.numpy()
+                self._plan_indptr_gpu = torch.zeros(
+                    max_seqs + 1, dtype=torch.int32, device=device)
+                self._plan_indices_gpu = torch.zeros(
+                    max_seqs * self.max_pages_per_seq, dtype=torch.int32,
+                    device=device)
+                self._plan_gathered_bt = torch.zeros(
+                    max_seqs, self.max_pages_per_seq, dtype=torch.int32,
+                    device=device)
+                self._plan_idx_long = torch.zeros(
+                    max_seqs, dtype=torch.int64, device=device)
 
         # Dynamic page allocation pool
         if self._dynamic_pages:
@@ -1107,38 +1203,44 @@ class MoEEngine:
         bt = self.block_table[0] if self.pp_size > 1 else self.block_table
         return (bt[batch_idx, page_idx].long() * self.page_size + offset)
 
-    def _compute_flashinfer_metadata(self, B):
-        """Compute FlashInfer paged KV metadata from CPU-side seq_lens.
-
-        Returns (indptr_cpu, indices_gpu, last_page_len_cpu) for plan().
-        Uses CPU seq_lens mirror to avoid GPU→CPU sync.
-        """
-        seq_lens = self._seq_lens_cpu[:B]
-        pages_per_seq = (seq_lens + self.page_size - 1) // self.page_size
-
-        indptr = torch.zeros(B + 1, dtype=torch.int32)
-        indptr[1:] = pages_per_seq.cumsum(0)
-
-        last_page_len = (seq_lens - 1) % self.page_size + 1
-
-        # Build indices: gather page numbers from block_table per sequence
-        total_pages = indptr[-1].item()
-        max_pages = pages_per_seq.max().item() if B > 0 else 0
-        if max_pages == 0:
-            return indptr, torch.zeros(0, dtype=torch.int32, device=self.device), last_page_len
-
-        page_range = torch.arange(max_pages, dtype=torch.int32)
-        valid = page_range.unsqueeze(0) < pages_per_seq.unsqueeze(1)
-        all_pages = self.block_table[:B, :max_pages].cpu()
-        indices = all_pages[valid].to(torch.int32).to(self.device)
-
-        return indptr, indices, last_page_len
-
     def _plan_flashinfer_decode(self, wrapper, B):
-        """Call FlashInfer plan() with current batch metadata."""
-        indptr, indices, last_page_len = self._compute_flashinfer_metadata(B)
+        """Call FlashInfer plan() with current batch metadata (contiguous [:B]).
+
+        Optimized: uses Triton kernel for page indices, pre-allocated buffers.
+        For contiguous [:B], block table rows are already in order — no gather.
+        """
+        if B == 0:
+            return
+
+        # 1. CPU metadata (contiguous [:B])
+        seq_lens_np = self._seq_lens_cpu[:B].numpy().astype(np.int32)
+        num_blocks_np = (seq_lens_np + self.page_size - 1) // self.page_size
+
+        self._plan_indptr_np[0] = 0
+        np.cumsum(num_blocks_np, out=self._plan_indptr_np[1:B + 1])
+        num_actual_pages = int(self._plan_indptr_np[B])
+
+        lpl_np = seq_lens_np % self.page_size
+        self._plan_lpl_np[:B] = np.where(
+            (lpl_np == 0) & (seq_lens_np != 0), self.page_size, lpl_np)
+
+        # 2. indptr to GPU
+        self._plan_indptr_gpu[:B + 1].copy_(
+            self._plan_indptr_cpu[:B + 1], non_blocking=True)
+
+        # 3. Contiguous path: block table rows 0..B-1 are in order, no gather
+        _copy_page_indices_kernel[(B,)](
+            self._plan_indices_gpu,
+            self.block_table,
+            self.block_table.stride(0),
+            self._plan_indptr_gpu,
+            BLOCK_SIZE=1024)
+
+        # 4. plan()
         wrapper.plan(
-            indptr, indices, last_page_len,
+            self._plan_indptr_cpu[:B + 1],
+            self._plan_indices_gpu[:num_actual_pages],
+            self._plan_lpl_cpu[:B],
             num_qo_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim, page_size=self.page_size,
             pos_encoding_mode="NONE", q_data_type=self.dtype)
@@ -1482,6 +1584,7 @@ class MoEEngine:
 
         # ── 4. Update _seq_lens_cpu for FlashInfer prefill plan ──
         self._seq_lens_cpu[seq_id] = total_seq_len
+        self._num_computed_tokens_gpu[seq_id] = total_seq_len
 
         # ── 5. Plan FlashInfer prefill-with-paged-KV for this chunk ──
         num_pages_used = math.ceil(total_seq_len / self.page_size)
@@ -1681,58 +1784,113 @@ class MoEEngine:
     def _plan_flashinfer_decode_for_subset(self, seq_ids):
         """Plan FlashInfer decode for a subset of sequence slots.
 
-        Unlike _plan_flashinfer_decode which assumes contiguous [:B],
-        this handles arbitrary slot indices.
+        Uses _copy_page_indices_kernel to flatten block table pages on GPU
+        (no GPU->CPU->GPU roundtrip). Pre-allocated buffers, numpy for small
+        CPU metadata, non_blocking H2D copies.
+
+        When called from _step_piecewise, _idx_mapping_buf[:B] already has
+        seq_ids on GPU (from section 2a). For eager fallback, fills GPU index
+        buffer directly.
         """
         B = len(seq_ids)
-        sid_tensor = torch.tensor(seq_ids, dtype=torch.long)
-        seq_lens = self._seq_lens_cpu[sid_tensor]
-        pages_per_seq = (seq_lens + self.page_size - 1) // self.page_size
+        if B == 0:
+            return
 
-        indptr = torch.zeros(B + 1, dtype=torch.int32)
-        indptr[1:] = pages_per_seq.cumsum(0)
+        # 1. Compute indptr and last_page_len on CPU (numpy)
+        seq_ids_np = np.array(seq_ids, dtype=np.int64)
+        seq_lens_np = self._seq_lens_cpu.numpy()[seq_ids_np].astype(np.int32)
+        num_blocks_np = (seq_lens_np + self.page_size - 1) // self.page_size
 
-        last_page_len = (seq_lens - 1) % self.page_size + 1
+        self._plan_indptr_np[0] = 0
+        np.cumsum(num_blocks_np, out=self._plan_indptr_np[1:B + 1])
+        num_actual_pages = int(self._plan_indptr_np[B])
 
-        max_pages = pages_per_seq.max().item() if B > 0 else 0
-        if max_pages == 0:
-            indices = torch.zeros(0, dtype=torch.int32, device=self.device)
+        lpl_np = seq_lens_np % self.page_size
+        self._plan_lpl_np[:B] = np.where(
+            (lpl_np == 0) & (seq_lens_np != 0), self.page_size, lpl_np)
+
+        # 2. Copy indptr to GPU for Triton kernel
+        self._plan_indptr_gpu[:B + 1].copy_(
+            self._plan_indptr_cpu[:B + 1], non_blocking=True)
+
+        # 3. Gather block table rows on GPU, flatten via Triton kernel
+        if hasattr(self, '_idx_mapping_buf'):
+            # Piecewise path: reuse _idx_mapping_buf[:B] (already on GPU)
+            self._plan_idx_long[:B].copy_(self._idx_mapping_buf[:B])
         else:
-            page_range = torch.arange(max_pages, dtype=torch.int32)
-            valid = page_range.unsqueeze(0) < pages_per_seq.unsqueeze(1)
-            all_pages = self.block_table[sid_tensor, :max_pages].cpu()
-            indices = all_pages[valid].to(torch.int32).to(self.device)
+            # Eager fallback: fill directly
+            self._plan_idx_long[:B] = torch.tensor(
+                seq_ids, dtype=torch.int64, device=self.device)
 
+        torch.index_select(
+            self.block_table, 0, self._plan_idx_long[:B],
+            out=self._plan_gathered_bt[:B])
+
+        _copy_page_indices_kernel[(B,)](
+            self._plan_indices_gpu,
+            self._plan_gathered_bt,
+            self._plan_gathered_bt.stride(0),
+            self._plan_indptr_gpu,
+            BLOCK_SIZE=1024)
+
+        # 4. Call plan() with CPU indptr/lpl + GPU indices
         self._decode_wrapper.plan(
-            indptr, indices, last_page_len,
+            self._plan_indptr_cpu[:B + 1],
+            self._plan_indices_gpu[:num_actual_pages],
+            self._plan_lpl_cpu[:B],
             num_qo_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim, page_size=self.page_size,
             pos_encoding_mode="NONE", q_data_type=self.dtype)
 
     def _plan_flashinfer_decode_pp(self, seq_ids, gpu_idx):
-        """Plan FlashInfer decode for a subset of slots on a specific PP GPU."""
+        """Plan FlashInfer decode for a subset of slots on a specific PP GPU.
+
+        Same optimization as single-GPU but uses per-GPU buffers and block table.
+        CPU metadata (indptr, lpl) computed once for gpu_idx==0, reused for others.
+        """
         B = len(seq_ids)
-        sid_tensor = torch.tensor(seq_ids, dtype=torch.long)
-        seq_lens = self._seq_lens_cpu[sid_tensor]
-        pages_per_seq = (seq_lens + self.page_size - 1) // self.page_size
+        if B == 0:
+            return
 
-        indptr = torch.zeros(B + 1, dtype=torch.int32)
-        indptr[1:] = pages_per_seq.cumsum(0)
-        last_page_len = (seq_lens - 1) % self.page_size + 1
-
-        dev = self.pp_devices[gpu_idx]
         bt = self.block_table[gpu_idx]
-        max_pages = pages_per_seq.max().item() if B > 0 else 0
-        if max_pages == 0:
-            indices = torch.zeros(0, dtype=torch.int32, device=dev)
-        else:
-            page_range = torch.arange(max_pages, dtype=torch.int32)
-            valid = page_range.unsqueeze(0) < pages_per_seq.unsqueeze(1)
-            all_pages = bt[sid_tensor, :max_pages].cpu()
-            indices = all_pages[valid].to(torch.int32).to(dev)
 
+        # 1. CPU metadata — only compute once for gpu_idx==0
+        if gpu_idx == 0:
+            seq_ids_np = np.array(seq_ids, dtype=np.int64)
+            seq_lens_np = self._seq_lens_cpu.numpy()[seq_ids_np].astype(np.int32)
+            num_blocks_np = (seq_lens_np + self.page_size - 1) // self.page_size
+
+            self._plan_indptr_np[0] = 0
+            np.cumsum(num_blocks_np, out=self._plan_indptr_np[1:B + 1])
+
+            lpl_np = seq_lens_np % self.page_size
+            self._plan_lpl_np[:B] = np.where(
+                (lpl_np == 0) & (seq_lens_np != 0), self.page_size, lpl_np)
+
+        num_actual_pages = int(self._plan_indptr_np[B])
+
+        # 2. Copy indptr to this GPU
+        indptr_gpu = self._plan_indptr_gpu_pp[gpu_idx]
+        indptr_gpu[:B + 1].copy_(
+            self._plan_indptr_cpu[:B + 1], non_blocking=True)
+
+        # 3. Gather block table rows on this GPU, flatten
+        idx_long = self._plan_idx_long_pp[gpu_idx]
+        gathered = self._plan_gathered_bt_pp[gpu_idx]
+        indices = self._plan_indices_gpu_pp[gpu_idx]
+
+        idx_long[:B].copy_(self._idx_mapping_buf[:B])
+
+        torch.index_select(bt, 0, idx_long[:B], out=gathered[:B])
+
+        _copy_page_indices_kernel[(B,)](
+            indices, gathered, gathered.stride(0), indptr_gpu, BLOCK_SIZE=1024)
+
+        # 4. plan()
         self._decode_wrappers[gpu_idx].plan(
-            indptr, indices, last_page_len,
+            self._plan_indptr_cpu[:B + 1],
+            indices[:num_actual_pages],
+            self._plan_lpl_cpu[:B],
             num_qo_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim, page_size=self.page_size,
             pos_encoding_mode="NONE", q_data_type=self.dtype)
@@ -2310,6 +2468,7 @@ class MoEEngine:
         if D > 0:
             for sid in decode_seq_ids:
                 self._seq_lens_cpu[sid] += 1
+                self._num_computed_tokens_gpu[sid] += 1
             if self.is_mla:
                 self._plan_mla_decode_for_subset(
                     self._mla_decode_wrapper, decode_seq_ids)
@@ -2379,6 +2538,7 @@ class MoEEngine:
         for sid, length in zip(prefill_seq_ids, prefill_lengths):
             self.seq_lens[sid] = length
             self._seq_lens_cpu[sid] = length
+            self._num_computed_tokens_gpu[sid] = length
 
         return logits
 
@@ -2426,7 +2586,7 @@ class MoEEngine:
                 'topk_weights_buf': torch.zeros(N, self.top_k, dtype=torch.float32, device=device),
                 'topk_ids_buf': torch.zeros(N, self.top_k, dtype=torch.int32, device=device),
                 'token_expert_indices': torch.zeros(N, self.top_k, dtype=torch.int32, device=device),
-                'static_positions': (torch.arange(N, dtype=torch.int32, device=device)
+                'static_positions': (torch.arange(N, dtype=torch.int64, device=device)
                                      % self.max_seq_len),
                 'static_slot_mapping': (torch.arange(N, dtype=torch.long, device=device)
                                         % total_kv_slots),
@@ -2456,7 +2616,7 @@ class MoEEngine:
                                         device=device),
             'token_expert_indices': torch.zeros(N, self.top_k, dtype=torch.int32,
                                                 device=device),
-            'static_positions': (torch.arange(N, dtype=torch.int32,
+            'static_positions': (torch.arange(N, dtype=torch.int64,
                                               device=device)
                                  % self.max_seq_len),
             'static_slot_mapping': (torch.arange(N, dtype=torch.long,
@@ -2559,6 +2719,25 @@ class MoEEngine:
                 stage2_out_fn(buf['attn_latent_buf'], layer, buf['attn_out_buf'])
             else:
                 buf['attn_out_buf'].copy_(buf['q_buf'].reshape(N, -1))
+
+        # ── Pre-allocate staging buffers for Triton kernel setup path ──
+        max_graph_N = max(total_token_sizes)
+        primary_dev = self.pp_devices[0] if self.pp_size > 1 else self.device
+        self._idx_mapping_buf = torch.zeros(
+            max_graph_N, dtype=torch.int32, device=primary_dev)
+        self._idx_mapping_cpu = torch.zeros(
+            max_graph_N, dtype=torch.int32).pin_memory()
+        self._query_start_loc_buf = torch.zeros(
+            max_graph_N + 1, dtype=torch.int32, device=primary_dev)
+        self._query_start_loc_cpu = torch.zeros(
+            max_graph_N + 1, dtype=torch.int32).pin_memory()
+        self._seq_lens_gpu_scratch = torch.zeros(
+            self.max_seqs, dtype=torch.int32, device=primary_dev)
+        # Pre-computed arange for pure-decode query_start_loc:
+        # Each decode request = 1 token, so qsl = [0, 1, 2, ..., D].
+        # Slice without any CPU work or H2D copy on the hot path.
+        self._decode_qsl_gpu = torch.arange(
+            max_graph_N + 1, dtype=torch.int32, device=primary_dev)
 
         for N in total_token_sizes:
             self.reset()
@@ -2719,6 +2898,34 @@ class MoEEngine:
                         }
                         for gpu_idx in range(self.pp_size)
                     }
+                    # FlashMLA: per-GPU sched_meta + block_table + seqlens
+                    if _HAS_FLASHMLA:
+                        mla_hd = self.kv_lora_rank + self.qk_rope_head_dim
+                        pp_flashmla = {}
+                        for gpu_idx in range(self.pp_size):
+                            dev = self.pp_devices[gpu_idx]
+                            sm, _ = get_mla_metadata()
+                            bt = torch.zeros(N, self.max_pages_per_seq,
+                                             dtype=torch.int32, device=dev)
+                            sl = torch.zeros(N, dtype=torch.int32, device=dev)
+                            _q_init = torch.zeros(
+                                N, 1, self.num_heads, mla_hd,
+                                dtype=self.dtype, device=dev)
+                            flash_mla_with_kvcache(
+                                q=_q_init,
+                                k_cache=self.mla_cache[0].to(dev),
+                                block_table=bt, cache_seqlens=sl,
+                                head_dim_v=self.kv_lora_rank,
+                                tile_scheduler_metadata=sm,
+                                softmax_scale=self._mla_sm_scale,
+                                causal=True)
+                            del _q_init
+                            pp_flashmla[gpu_idx] = {
+                                'sched_meta': sm,
+                                'block_table': bt,
+                                'seqlens': sl,
+                            }
+                        graph_dict['pp_flashmla'] = pp_flashmla
                 self._piecewise_graphs[N] = graph_dict
 
                 n_graphs = self.num_layers * (4 if self.is_mla else 3)
@@ -2853,6 +3060,32 @@ class MoEEngine:
                         'ckv_buf': bufs['ckv_buf'],
                         'kpe_buf': bufs['kpe_buf'],
                     }
+                    # FlashMLA: sched_meta + block_table + seqlens
+                    if _HAS_FLASHMLA:
+                        mla_hd = self.kv_lora_rank + self.qk_rope_head_dim
+                        flashmla_sched_meta, _ = get_mla_metadata()
+                        flashmla_block_table = torch.zeros(
+                            N, self.max_pages_per_seq,
+                            dtype=torch.int32, device=self.device)
+                        flashmla_seqlens = torch.zeros(
+                            N, dtype=torch.int32, device=self.device)
+                        # Initialize sched_meta with one dummy call
+                        _q_init = torch.zeros(
+                            N, 1, self.num_heads, mla_hd,
+                            dtype=self.dtype, device=self.device)
+                        flash_mla_with_kvcache(
+                            q=_q_init,
+                            k_cache=self.mla_cache[0],
+                            block_table=flashmla_block_table,
+                            cache_seqlens=flashmla_seqlens,
+                            head_dim_v=self.kv_lora_rank,
+                            tile_scheduler_metadata=flashmla_sched_meta,
+                            softmax_scale=self._mla_sm_scale,
+                            causal=True)
+                        del _q_init
+                        graph_dict['flashmla_sched_meta'] = flashmla_sched_meta
+                        graph_dict['flashmla_block_table'] = flashmla_block_table
+                        graph_dict['flashmla_seqlens'] = flashmla_seqlens
                 self._piecewise_graphs[N] = graph_dict
 
                 n_graphs = self.num_layers * (4 if self.is_mla else 3)
@@ -2954,108 +3187,135 @@ class MoEEngine:
 
         # ── 1. Build token_ids ──
         if _nvtx: torch.cuda.nvtx.range_push("setup")
-        # Ensure all on primary device (PP: inputs may arrive on any device)
         primary_dev = self.pp_devices[0] if pp else self.device
-        token_parts = []
-        if D > 0:
-            token_parts.append(decode_token_ids.to(primary_dev))
-        for ids in prefill_input_ids:
-            token_parts.append(ids.to(primary_dev))
-        for ids in continuation_input_ids:
-            token_parts.append(ids.to(primary_dev))
-        all_token_ids = torch.cat(token_parts)
+        primary_buf = info['pp_bufs'][0] if pp else info
 
-        # Copy into each GPU's static buffer
-        if pp:
-            for gpu_idx in range(self.pp_size):
-                b = info['pp_bufs'][gpu_idx]
-                b['static_token_ids'][:N_actual].copy_(all_token_ids)
-                if N_actual < graph_N:
-                    b['static_token_ids'][N_actual:].zero_()
+        if P == 0 and C == 0 and D > 0:
+            # Pure decode fast path: skip torch.cat
+            primary_buf['static_token_ids'][:D].copy_(
+                decode_token_ids.to(primary_dev))
+            if D < graph_N:
+                primary_buf['static_token_ids'][D:].zero_()
         else:
-            info['static_token_ids'][:N_actual].copy_(all_token_ids)
+            # Mixed batch: cat as before
+            token_parts = []
+            if D > 0:
+                token_parts.append(decode_token_ids.to(primary_dev))
+            for ids in prefill_input_ids:
+                token_parts.append(ids.to(primary_dev))
+            for ids in continuation_input_ids:
+                token_parts.append(ids.to(primary_dev))
+            all_token_ids = torch.cat(token_parts)
+            primary_buf['static_token_ids'][:N_actual].copy_(all_token_ids)
             if N_actual < graph_N:
-                info['static_token_ids'][N_actual:].zero_()
+                primary_buf['static_token_ids'][N_actual:].zero_()
 
-        # ── 2. Compute positions ──
-        # Build on CPU, then copy to each GPU
-        primary_dev = self.pp_devices[0] if pp else self.device
-        decode_positions = (self._seq_lens_cpu[decode_seq_ids].to(torch.int32)
-                            .to(primary_dev)) if D > 0 else torch.empty(
-                                0, dtype=torch.int32, device=primary_dev)
-        prefill_pos_parts = [
-            torch.arange(s, dtype=torch.int32, device=primary_dev)
-            for s in prefill_lengths
-        ]
-        cont_pos_parts = [
-            torch.arange(off, off + clen, dtype=torch.int32,
-                          device=primary_dev)
-            for off, clen in zip(continuation_offsets, cont_lengths)
-        ]
-        positions = torch.cat([decode_positions] + prefill_pos_parts
-                              + cont_pos_parts)
-
+        # PP: replicate token_ids to other GPUs
         if pp:
-            for gpu_idx in range(self.pp_size):
-                b = info['pp_bufs'][gpu_idx]
-                b['static_positions'][:N_actual].copy_(positions)
-                if N_actual < graph_N:
-                    b['static_positions'][N_actual:].zero_()
+            for gpu_idx in range(1, self.pp_size):
+                info['pp_bufs'][gpu_idx]['static_token_ids'].copy_(
+                    primary_buf['static_token_ids'])
+
+        # ── 2+3+4a. Positions + slot_mapping + seq_lens via Triton kernels ──
+        N_reqs = D + len(prefill_seq_ids) + len(continuation_seq_ids)
+
+        # 2a. Build idx_mapping: [decode_sids | prefill_sids | cont_sids]
+        if P == 0 and C == 0 and D <= 32:
+            # Pure decode fast path: write seq_ids directly, skip numpy
+            for i, sid in enumerate(decode_seq_ids):
+                self._idx_mapping_cpu[i] = sid
         else:
-            info['static_positions'][:N_actual].copy_(positions)
-            if N_actual < graph_N:
-                info['static_positions'][N_actual:].zero_()
+            seq_ids_all = decode_seq_ids + prefill_seq_ids + continuation_seq_ids
+            idx_np = np.array(seq_ids_all, dtype=np.int32)
+            self._idx_mapping_cpu[:N_reqs] = torch.from_numpy(idx_np)
+        self._idx_mapping_buf[:N_reqs].copy_(
+            self._idx_mapping_cpu[:N_reqs], non_blocking=True)
 
-        # ── 3. Compute slot_mapping ──
-        # Use GPU 0's block table for computation, then replicate
-        bt = self.block_table[0] if pp else self.block_table
-        if D > 0:
-            d_idx = torch.tensor(decode_seq_ids, device=primary_dev,
-                                 dtype=torch.long)
-            d_page = (decode_positions // self.page_size).long()
-            d_offset = (decode_positions % self.page_size).long()
-            decode_slots = (bt[d_idx, d_page].long()
-                            * self.page_size + d_offset)
+        # 2b. Build query_start_loc: prefix sum of per-request token counts
+        if P == 0 and C == 0:
+            # Pure decode fast path: each request = 1 token → qsl = arange
+            setup_qsl = self._decode_qsl_gpu[:D + 1]
         else:
-            decode_slots = torch.empty(0, dtype=torch.long,
-                                       device=primary_dev)
+            # Mixed batch: compute cumulative token counts via numpy
+            tokens_per_req = [1] * D + prefill_lengths + cont_lengths
+            qsl_np = np.zeros(N_reqs + 1, dtype=np.int32)
+            np.cumsum(tokens_per_req, out=qsl_np[1:])
+            self._query_start_loc_cpu[:N_reqs + 1] = torch.from_numpy(qsl_np)
+            self._query_start_loc_buf[:N_reqs + 1].copy_(
+                self._query_start_loc_cpu[:N_reqs + 1], non_blocking=True)
+            setup_qsl = self._query_start_loc_buf[:N_reqs + 1]
 
-        prefill_slot_parts = []
-        for sid, length in zip(prefill_seq_ids, prefill_lengths):
-            pos = torch.arange(length, device=primary_dev)
-            pg = (pos // self.page_size).long()
-            off = (pos % self.page_size).long()
-            prefill_slot_parts.append(
-                bt[sid, pg].long() * self.page_size + off)
+        # Safety sync: GPU seq_lens ← CPU (belt-and-suspenders, ~1us)
+        self._num_computed_tokens_gpu.copy_(self._seq_lens_cpu)
 
-        cont_slot_parts = []
-        for sid, offset, clen in zip(continuation_seq_ids,
-                                     continuation_offsets, cont_lengths):
-            pos = torch.arange(offset, offset + clen, device=primary_dev)
-            pg = (pos // self.page_size).long()
-            off = (pos % self.page_size).long()
-            cont_slot_parts.append(
-                bt[sid, pg].long() * self.page_size + off)
+        # 2c. Compute positions + seq_lens on GPU
+        prepare_pos_seq_lens(
+            idx_mapping=self._idx_mapping_buf[:N_reqs],
+            query_start_loc=setup_qsl,
+            num_computed_tokens=self._num_computed_tokens_gpu,
+            pos=primary_buf['static_positions'],
+            seq_lens=self._seq_lens_gpu_scratch,
+        )
+        # Zero padding positions for safety
+        if N_actual < graph_N:
+            primary_buf['static_positions'][N_actual:].zero_()
 
-        slot_mapping = torch.cat([decode_slots] + prefill_slot_parts
-                                 + cont_slot_parts)
+        # 2d. Compute slot_mapping on GPU
+        slot_2d = primary_buf['static_slot_mapping'].unsqueeze(0)
+        _compute_slot_mappings_kernel[(1, N_reqs + 1)](
+            graph_N,
+            self._idx_mapping_buf[:N_reqs],
+            setup_qsl,
+            primary_buf['static_positions'],
+            self._block_table_ptrs,
+            self._block_table_strides,
+            self._block_sizes_tensor,
+            slot_2d,
+            slot_2d.stride(0),
+            0,
+            CP_SIZE=1, CP_INTERLEAVE=1,
+            PAD_ID=-1, TRITON_BLOCK_SIZE=1024,
+        )
 
+        # PP: replicate positions + slot_mapping to other GPUs
         if pp:
-            for gpu_idx in range(self.pp_size):
+            for gpu_idx in range(1, self.pp_size):
                 b = info['pp_bufs'][gpu_idx]
-                b['static_slot_mapping'][:N_actual].copy_(slot_mapping)
-                if N_actual < graph_N:
-                    b['static_slot_mapping'][N_actual:].fill_(-1)
-        else:
-            info['static_slot_mapping'][:N_actual].copy_(slot_mapping)
-            if N_actual < graph_N:
-                info['static_slot_mapping'][N_actual:].fill_(-1)
+                b['static_positions'].copy_(primary_buf['static_positions'])
+                b['static_slot_mapping'].copy_(primary_buf['static_slot_mapping'])
 
         # ── 4. Increment decode seq_lens and plan FlashInfer / MLA ──
+        # GPU mirror is kept in sync by the safety sync at step start
+        # (self._num_computed_tokens_gpu.copy_(self._seq_lens_cpu)),
+        # so we only need to update _seq_lens_cpu here.
         if D > 0:
             for sid in decode_seq_ids:
                 self._seq_lens_cpu[sid] += 1
-            if self.is_mla:
+            if self.is_mla and _HAS_FLASHMLA:
+                # FlashMLA: copy block_table + seqlens to pre-allocated GPU buffers
+                sid_cpu = torch.tensor(decode_seq_ids, dtype=torch.long)
+                if pp:
+                    for gpu_idx in range(self.pp_size):
+                        fm = info['pp_flashmla'][gpu_idx]
+                        bt = self.block_table[gpu_idx]
+                        fm['seqlens'][:D] = self._seq_lens_cpu[sid_cpu].to(
+                            torch.int32).to(fm['seqlens'].device)
+                        if D < graph_N:
+                            fm['seqlens'][D:].zero_()
+                        fm['block_table'][:D] = bt[sid_cpu.to(bt.device)]
+                        if D < graph_N:
+                            fm['block_table'][D:].zero_()
+                else:
+                    info['flashmla_seqlens'][:D] = self._seq_lens_cpu[
+                        sid_cpu].to(torch.int32).to(self.device)
+                    if D < graph_N:
+                        info['flashmla_seqlens'][D:].zero_()
+                    info['flashmla_block_table'][:D] = self.block_table[
+                        sid_cpu.to(self.device)]
+                    if D < graph_N:
+                        info['flashmla_block_table'][D:].zero_()
+            elif self.is_mla:
+                # Fallback: FlashInfer MLA plan (no FlashMLA available)
                 if pp:
                     for gpu_idx in range(self.pp_size):
                         self._plan_mla_decode_for_subset(
@@ -3085,6 +3345,7 @@ class MoEEngine:
             )
             total_sl = offset + clen
             self._seq_lens_cpu[sid] = total_sl
+            self._num_computed_tokens_gpu[sid] = total_sl
             cont_total_seq_lens.append(total_sl)
 
         # ── 5a. Build prefill cu_seqlens for FA3 (new prefills only) ──
@@ -3222,21 +3483,51 @@ class MoEEngine:
             if _pt: _pt.after_stage1(layer)
 
             if self.is_mla:
-                # MLA: Stage 2 (decode) and Stage 3a (prefill) using MLA kernels
-                if D > 0:
+                # MLA: Stage 2 (decode) using FlashMLA + Stage 3a (prefill)
+                if D > 0 and _HAS_FLASHMLA:
+                    if _nvtx: torch.cuda.nvtx.range_push("stage2_mla")
+                    # FlashMLA: fuse q_absorbed + q_pe, padded batch
+                    q_fused = torch.cat(
+                        [buf['q_absorbed_buf'], buf['q_pe_buf']],
+                        dim=-1).unsqueeze(1)  # [graph_N, 1, H, 576]
+                    if pp:
+                        gpu_idx = self.pp_layer_gpu[layer]
+                        fm = info['pp_flashmla'][gpu_idx]
+                        o, _lse = flash_mla_with_kvcache(
+                            q=q_fused,
+                            k_cache=self.mla_cache[layer],
+                            block_table=fm['block_table'],
+                            cache_seqlens=fm['seqlens'],
+                            head_dim_v=self.kv_lora_rank,
+                            tile_scheduler_metadata=fm['sched_meta'],
+                            softmax_scale=self._mla_sm_scale,
+                            causal=True)
+                    else:
+                        o, _lse = flash_mla_with_kvcache(
+                            q=q_fused,
+                            k_cache=self.mla_cache[layer],
+                            block_table=info['flashmla_block_table'],
+                            cache_seqlens=info['flashmla_seqlens'],
+                            head_dim_v=self.kv_lora_rank,
+                            tile_scheduler_metadata=info['flashmla_sched_meta'],
+                            softmax_scale=self._mla_sm_scale,
+                            causal=True)
+                    # o: [graph_N, 1, H, 512] -> squeeze -> [graph_N, H, 512]
+                    buf['attn_latent_buf'][:D].copy_(o.squeeze(1)[:D])
+                    if _nvtx: torch.cuda.nvtx.range_pop()  # stage2_mla
+                elif D > 0:
+                    # Fallback: FlashInfer MLA plan+run
                     if _nvtx: torch.cuda.nvtx.range_push("stage2_mla")
                     if pp:
                         gpu_idx = self.pp_layer_gpu[layer]
                         mla_wrapper = self._mla_wrappers[gpu_idx]
                     else:
                         mla_wrapper = self._mla_decode_wrapper
-                    # q_absorbed comes from stage1 graph (W_UK already applied)
                     q_absorbed_sl = buf['q_absorbed_buf'][:D]
                     q_pe_sl = buf['q_pe_buf'][:D]
                     attn_latent = mla_wrapper.run(
                         q_absorbed_sl, q_pe_sl,
                         self.ckv_cache[layer], self.kpe_cache[layer])
-                    # Copy to static buffer for stage2_out graph
                     buf['attn_latent_buf'][:D].copy_(attn_latent)
                     if _nvtx: torch.cuda.nvtx.range_pop()  # stage2_mla
                 # Stage 2 output: W_UV projection (CUDA graph)
@@ -3306,7 +3597,9 @@ class MoEEngine:
                         attn_v_cont.reshape(C, self.num_heads * self.v_head_dim))
 
                     # If also decode tokens, restore decode plan for next layer
-                    if D > 0:
+                    # (FlashMLA doesn't need plan restoration — metadata is
+                    # set once in setup and stays valid across all layers)
+                    if D > 0 and not _HAS_FLASHMLA:
                         if pp:
                             for _gidx in range(self.pp_size):
                                 self._plan_mla_decode_for_subset(
@@ -3486,6 +3779,7 @@ class MoEEngine:
                 self.seq_lens[sid] = total_sl
         for sid, length in zip(prefill_seq_ids, prefill_lengths):
             self._seq_lens_cpu[sid] = length
+            self._num_computed_tokens_gpu[sid] = length
         # _seq_lens_cpu for continuations already set in step 4b
 
         # When selective lm_head was used, logits is already the right size:
@@ -3512,6 +3806,7 @@ class MoEEngine:
         else:
             self.seq_lens[:B] = 0
         self._seq_lens_cpu[:B] = 0
+        self._num_computed_tokens_gpu[:B] = 0
 
         logits = self.prefill(input_ids)  # [B, vocab_size]
         next_token = logits.argmax(dim=-1)
@@ -3569,6 +3864,8 @@ class MoEEngine:
         else:
             self.seq_lens.zero_()
         self._seq_lens_cpu.zero_()
+        if hasattr(self, '_num_computed_tokens_gpu'):
+            self._num_computed_tokens_gpu.zero_()
         if self.is_mla:
             for l in range(self.num_layers):
                 self.ckv_flat[l].zero_()
@@ -3593,6 +3890,8 @@ class MoEEngine:
         physical pages to the free pool.
         """
         self._seq_lens_cpu[seq_id] = 0
+        if hasattr(self, '_num_computed_tokens_gpu'):
+            self._num_computed_tokens_gpu[seq_id] = 0
         if self.pp_size > 1:
             for sl in self.seq_lens:
                 sl[seq_id] = 0

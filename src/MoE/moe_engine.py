@@ -2410,6 +2410,10 @@ class MoEEngine:
         stage4a_fn = self._layer_stage4a_router
         stage4b_fn = self._layer_stage4b_moe
         if use_torch_compile:
+            # Raise dynamo cache limits like vLLM does — default 8/64 is too
+            # low for multi-layer models with varying tensor shapes.
+            torch._dynamo.config.cache_size_limit = 2048
+            torch._dynamo.config.accumulated_cache_size_limit = 8192
             stage1_fn = torch.compile(stage1_fn, fullgraph=False)
             stage4a_fn = torch.compile(stage4a_fn, fullgraph=False)
             stage4b_fn = torch.compile(stage4b_fn, fullgraph=False)

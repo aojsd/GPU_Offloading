@@ -989,6 +989,7 @@ def main():
 
     del engine
     torch.cuda.empty_cache()
+    torch._dynamo.reset()
 
     # ── Create engine (tight budget for tests 3-5) ──
     print("\n" + "=" * 60)
@@ -1035,6 +1036,7 @@ def main():
 
     del engine
     torch.cuda.empty_cache()
+    torch._dynamo.reset()
 
     # ── Tests 9-10: Full pipeline (collect → simulate → offloaded replay) ──
     #

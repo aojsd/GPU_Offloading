@@ -2029,9 +2029,10 @@ class MoEEngine:
         residual_buf.copy_(hidden)
 
     def _layer_stage1_mla(self, hidden, positions, slot_mapping, layer,
-                           q_nope_buf, q_pe_buf, ckv_buf, kpe_buf, residual_buf):
-        """Stage 1 for MLA: RMSNorm -> Q proj -> KV compress -> KV norm ->
-        RoPE (pe only) -> KV cache write."""
+                           q_nope_buf, q_pe_buf, q_absorbed_buf,
+                           ckv_buf, kpe_buf, residual_buf):
+        """Stage 1 for MLA: RMSNorm -> Q proj -> W_UK absorption -> KV compress
+        -> KV norm -> RoPE (pe only) -> KV cache write."""
         N = hidden.shape[0]
         H = self.hidden_size
 
@@ -2073,12 +2074,34 @@ class MoEEngine:
         self.ckv_flat[layer][safe_slots] = c_kv_normed   # [N, 512]
         self.kpe_flat[layer][safe_slots] = k_pe_rot       # [N, 64]
 
+        # W_UK absorption: q_absorbed = q_nope @ W_UK_T (was eager, now in graph)
+        q_absorbed = torch.einsum('bhp,hpc->bhc', q_nope, self.W_UK_T[layer])
+
         # Output to buffers
-        q_nope_buf.copy_(q_nope)        # [N, H, P=128]
+        q_nope_buf.copy_(q_nope)        # [N, H, P=128] (still needed for prefill)
         q_pe_buf.copy_(q_pe_3d)         # [N, H, R=64]
+        q_absorbed_buf.copy_(q_absorbed)  # [N, H, C=512]
         ckv_buf.copy_(c_kv_normed)      # [N, 512]
         kpe_buf.copy_(k_pe_rot)         # [N, 64]
         residual_buf.copy_(hidden)
+
+    def _layer_stage2_mla_out(self, attn_latent_buf, layer, attn_out_buf):
+        """Stage 2 output for MLA: W_UV projection from attn_latent to attn_out.
+
+        Captured as a CUDA graph. Operates on full buffer (graph_N tokens).
+        For decode-only: valid results in [:D], rest is garbage/zero.
+        For mixed: stages 3a/3b overwrite [D:D+P] and [D+P:D+P+C] after this.
+        """
+        N = attn_latent_buf.shape[0]
+        attn_v = torch.einsum('bhc,hcv->bhv', attn_latent_buf, self.W_UV[layer])
+        attn_out_buf.copy_(attn_v.reshape(N, self.num_heads * self.v_head_dim))
+
+    def _final_norm_lmhead(self, hidden_buf, logits_buf):
+        """Final: RMSNorm + lm_head. Captured as CUDA graph for decode."""
+        normed = F.rms_norm(hidden_buf, (self.hidden_size,),
+                             self.final_norm, self.rms_norm_eps)
+        logits = F.linear(normed, self.lm_head)
+        logits_buf.copy_(logits)
 
     def _layer_stage4a_router(self, attn_out, residual, layer,
                               moe_input_buf, moe_residual_buf,
@@ -2375,8 +2398,9 @@ class MoEEngine:
           Stage 4b: moe_input_buf + topk → hidden_buf (MoE + residual)
         hidden_buf becomes residual_buf for the next layer.
 
-        For MLA models, stage 1 produces q_nope_buf, q_pe_buf, ckv_buf,
-        kpe_buf instead of q_buf/k_buf/v_buf.
+        For MLA models, stage 1 produces q_nope_buf, q_pe_buf, q_absorbed_buf,
+        ckv_buf, kpe_buf instead of q_buf/k_buf/v_buf. Stage 2 output uses
+        attn_latent_buf for the W_UV projection graph.
         """
         total_kv_slots = self.total_pages * self.page_size
         if self.is_mla:
@@ -2385,6 +2409,10 @@ class MoEEngine:
                                            dtype=self.dtype, device=device),
                 'q_pe_buf': torch.zeros(N, self.num_heads, self.qk_rope_head_dim,
                                          dtype=self.dtype, device=device),
+                'q_absorbed_buf': torch.zeros(N, self.num_heads, self.kv_lora_rank,
+                                               dtype=self.dtype, device=device),
+                'attn_latent_buf': torch.zeros(N, self.num_heads, self.kv_lora_rank,
+                                                dtype=self.dtype, device=device),
                 'ckv_buf': torch.zeros(N, self.kv_lora_rank,
                                         dtype=self.dtype, device=device),
                 'kpe_buf': torch.zeros(N, self.qk_rope_head_dim,
@@ -2487,6 +2515,8 @@ class MoEEngine:
                      else self._layer_stage1_pre_attn)
         stage4a_fn = self._layer_stage4a_router
         stage4b_fn = self._layer_stage4b_moe
+        stage2_out_fn = self._layer_stage2_mla_out if self.is_mla else None
+        final_fn = self._final_norm_lmhead
         if use_torch_compile:
             # Raise dynamo cache limits like vLLM does — default 8/64 is too
             # low for multi-layer models with varying tensor shapes.
@@ -2495,6 +2525,13 @@ class MoEEngine:
             stage1_fn = torch.compile(stage1_fn, fullgraph=False)
             stage4a_fn = torch.compile(stage4a_fn, fullgraph=False)
             stage4b_fn = torch.compile(stage4b_fn, fullgraph=False)
+            if stage2_out_fn is not None:
+                stage2_out_fn = torch.compile(stage2_out_fn, fullgraph=False)
+            final_fn = torch.compile(final_fn, fullgraph=False)
+
+        # Max N for which we capture the final norm+lm_head graph.
+        # Beyond this, logits_buf memory becomes excessive (N*vocab*2B).
+        _MAX_FINAL_GRAPH_N = 64
 
         def _call_stage1(stage1_fn, buf, layer):
             """Call stage1_fn with correct signature based on is_mla."""
@@ -2503,6 +2540,7 @@ class MoEEngine:
                           buf['static_positions'],
                           buf['static_slot_mapping'], layer,
                           buf['q_nope_buf'], buf['q_pe_buf'],
+                          buf['q_absorbed_buf'],
                           buf['ckv_buf'], buf['kpe_buf'],
                           buf['residual_buf'])
             else:
@@ -2512,10 +2550,13 @@ class MoEEngine:
                           buf['q_buf'], buf['k_buf'],
                           buf['v_buf'], buf['residual_buf'])
 
-        def _fill_attn_out_dummy(buf, N):
-            """Fill attn_out_buf with dummy data after stage1 (between stage1 and stage4a)."""
+        def _fill_attn_out_dummy(buf, N, layer=0):
+            """Fill attn_out_buf with dummy data after stage1 (between stage1 and stage4a).
+            For MLA: also fills attn_latent_buf and runs stage2_out to produce attn_out.
+            Must pass correct layer for torch.compile warmup."""
             if self.is_mla:
-                buf['attn_out_buf'].copy_(buf['q_nope_buf'].reshape(N, -1))
+                buf['attn_latent_buf'].copy_(buf['q_absorbed_buf'])
+                stage2_out_fn(buf['attn_latent_buf'], layer, buf['attn_out_buf'])
             else:
                 buf['attn_out_buf'].copy_(buf['q_buf'].reshape(N, -1))
 
@@ -2545,7 +2586,7 @@ class MoEEngine:
                                 pp_bufs[prev_gpu]['hidden_buf'])
                         with torch.cuda.device(dev):
                             _call_stage1(stage1_fn, buf, layer)
-                            _fill_attn_out_dummy(buf, N)
+                            _fill_attn_out_dummy(buf, N, layer)
                             stage4a_fn(buf['attn_out_buf'],
                                        buf['residual_buf'], layer,
                                        buf['moe_input_buf'],
@@ -2558,6 +2599,16 @@ class MoEEngine:
                                        buf['topk_weights_buf'],
                                        buf['topk_ids_buf'],
                                        buf['hidden_buf'], layer)
+                # Warmup final graph on last GPU
+                if N <= _MAX_FINAL_GRAPH_N:
+                    last_gpu = self.pp_layer_gpu[self.num_layers - 1]
+                    last_dev = self.pp_devices[last_gpu]
+                    last_buf = pp_bufs[last_gpu]
+                    logits_buf = torch.zeros(N, self.vocab_size,
+                                             dtype=self.dtype, device=last_dev)
+                    with torch.cuda.device(last_dev):
+                        for _ in range(n_warmup):
+                            final_fn(last_buf['hidden_buf'], logits_buf)
                 for d in self.pp_devices:
                     torch.cuda.synchronize(d)
 
@@ -2570,6 +2621,7 @@ class MoEEngine:
                     for gpu_idx, dev in enumerate(self.pp_devices)
                 }
                 stage1_graphs = []
+                stage2_out_graphs = []
                 stage4a_graphs = []
                 stage4b_graphs = []
 
@@ -2594,7 +2646,18 @@ class MoEEngine:
                             _call_stage1(stage1_fn, buf, layer)
                         stage1_graphs.append(g1)
 
-                    _fill_attn_out_dummy(buf, N)
+                    if self.is_mla:
+                        buf['attn_latent_buf'].copy_(buf['q_absorbed_buf'])
+                        with torch.cuda.device(dev):
+                            g2out = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(g2out,
+                                                  pool=graph_pools[gpu_idx],
+                                                  stream=stream):
+                                stage2_out_fn(buf['attn_latent_buf'], layer,
+                                              buf['attn_out_buf'])
+                            stage2_out_graphs.append(g2out)
+                    else:
+                        _fill_attn_out_dummy(buf, N, layer)
 
                     with torch.cuda.device(dev):
                         g4a = torch.cuda.CUDAGraph()
@@ -2620,18 +2683,37 @@ class MoEEngine:
                                        buf['hidden_buf'], layer)
                         stage4b_graphs.append(g4b)
 
+                # Capture final graph on last GPU
+                if N <= _MAX_FINAL_GRAPH_N:
+                    last_gpu = self.pp_layer_gpu[self.num_layers - 1]
+                    last_dev = self.pp_devices[last_gpu]
+                    stream = pp_streams[last_gpu]
+                    with torch.cuda.device(last_dev):
+                        g_final = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(g_final,
+                                              pool=graph_pools[last_gpu],
+                                              stream=stream):
+                            final_fn(pp_bufs[last_gpu]['hidden_buf'],
+                                     logits_buf)
+
                 graph_dict = {
                     'stage1_graphs': stage1_graphs,
+                    'stage2_out_graphs': stage2_out_graphs,
                     'stage4a_graphs': stage4a_graphs,
                     'stage4b_graphs': stage4b_graphs,
                     'pp_bufs': pp_bufs,
                 }
+                if N <= _MAX_FINAL_GRAPH_N:
+                    graph_dict['final_graph'] = g_final
+                    graph_dict['logits_buf'] = logits_buf
                 if self.is_mla:
                     # Save MLA buffers per GPU to prevent GC
                     graph_dict['mla_buffers'] = {
                         gpu_idx: {
                             'q_nope_buf': pp_bufs[gpu_idx]['q_nope_buf'],
                             'q_pe_buf': pp_bufs[gpu_idx]['q_pe_buf'],
+                            'q_absorbed_buf': pp_bufs[gpu_idx]['q_absorbed_buf'],
+                            'attn_latent_buf': pp_bufs[gpu_idx]['attn_latent_buf'],
                             'ckv_buf': pp_bufs[gpu_idx]['ckv_buf'],
                             'kpe_buf': pp_bufs[gpu_idx]['kpe_buf'],
                         }
@@ -2639,13 +2721,23 @@ class MoEEngine:
                     }
                 self._piecewise_graphs[N] = graph_dict
 
+                n_graphs = self.num_layers * (4 if self.is_mla else 3)
+                if N <= _MAX_FINAL_GRAPH_N:
+                    n_graphs += 1
                 compile_str = " + torch.compile" if use_torch_compile else ""
                 print(f"  Piecewise CUDA graphs{compile_str} captured for "
-                      f"N={N} ({self.num_layers * 3} graphs, "
+                      f"N={N} ({n_graphs} graphs, "
                       f"PP={self.pp_size})")
             else:
                 # Single-GPU path (original)
                 bufs = self._create_intermediate_buffers(N, self.device)
+
+                # Allocate logits_buf for final graph (outside bufs dict)
+                logits_buf = None
+                if N <= _MAX_FINAL_GRAPH_N:
+                    logits_buf = torch.zeros(N, self.vocab_size,
+                                             dtype=self.dtype,
+                                             device=self.device)
 
                 # ── Warmup all layers ──
                 n_warmup = 5 if use_torch_compile else 3
@@ -2655,7 +2747,7 @@ class MoEEngine:
                                     self.embed_tokens))
                     for layer in range(self.num_layers):
                         _call_stage1(stage1_fn, bufs, layer)
-                        _fill_attn_out_dummy(bufs, N)
+                        _fill_attn_out_dummy(bufs, N, layer)
                         stage4a_fn(bufs['attn_out_buf'],
                                    bufs['residual_buf'], layer,
                                    bufs['moe_input_buf'],
@@ -2671,12 +2763,16 @@ class MoEEngine:
                                    bufs['topk_weights_buf'],
                                    bufs['topk_ids_buf'],
                                    bufs['hidden_buf'], layer)
+                    # Warmup final graph
+                    if logits_buf is not None:
+                        final_fn(bufs['hidden_buf'], logits_buf)
                 torch.cuda.synchronize()
 
                 # ── Capture per-layer graphs ──
                 # Use explicit stream to avoid cross-device CUDA graph pool issues
                 capture_stream = torch.cuda.Stream(device=self.device)
                 stage1_graphs = []
+                stage2_out_graphs = []
                 stage4a_graphs = []
                 stage4b_graphs = []
 
@@ -2691,7 +2787,17 @@ class MoEEngine:
                         _call_stage1(stage1_fn, bufs, layer)
                     stage1_graphs.append(g1)
 
-                    _fill_attn_out_dummy(bufs, N)
+                    if self.is_mla:
+                        bufs['attn_latent_buf'].copy_(
+                            bufs['q_absorbed_buf'])
+                        g2out = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(g2out, pool=graph_pool,
+                                              stream=capture_stream):
+                            stage2_out_fn(bufs['attn_latent_buf'], layer,
+                                          bufs['attn_out_buf'])
+                        stage2_out_graphs.append(g2out)
+                    else:
+                        _fill_attn_out_dummy(bufs, N, layer)
 
                     g4a = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(g4a, pool=graph_pool,
@@ -2719,26 +2825,42 @@ class MoEEngine:
                                    bufs['hidden_buf'], layer)
                     stage4b_graphs.append(g4b)
 
+                # Capture final norm+lm_head graph
+                if logits_buf is not None:
+                    g_final = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g_final, pool=graph_pool,
+                                          stream=capture_stream):
+                        final_fn(bufs['hidden_buf'], logits_buf)
+
                 # Store buffers directly in dict for single-GPU compat
                 graph_dict = {
                     'stage1_graphs': stage1_graphs,
+                    'stage2_out_graphs': stage2_out_graphs,
                     'stage4a_graphs': stage4a_graphs,
                     'stage4b_graphs': stage4b_graphs,
                     **bufs,
                 }
+                if logits_buf is not None:
+                    graph_dict['final_graph'] = g_final
+                    graph_dict['logits_buf'] = logits_buf
                 if self.is_mla:
                     # Save MLA buffers explicitly to prevent GC
                     graph_dict['mla_buffers'] = {
                         'q_nope_buf': bufs['q_nope_buf'],
                         'q_pe_buf': bufs['q_pe_buf'],
+                        'q_absorbed_buf': bufs['q_absorbed_buf'],
+                        'attn_latent_buf': bufs['attn_latent_buf'],
                         'ckv_buf': bufs['ckv_buf'],
                         'kpe_buf': bufs['kpe_buf'],
                     }
                 self._piecewise_graphs[N] = graph_dict
 
+                n_graphs = self.num_layers * (4 if self.is_mla else 3)
+                if logits_buf is not None:
+                    n_graphs += 1
                 compile_str = " + torch.compile" if use_torch_compile else ""
                 print(f"  Piecewise CUDA graphs{compile_str} captured for "
-                      f"N={N} ({self.num_layers * 3} graphs)")
+                      f"N={N} ({n_graphs} graphs)")
 
     @staticmethod
     def vllm_graph_sizes(max_graph_size: int) -> list[int]:
@@ -3108,16 +3230,18 @@ class MoEEngine:
                         mla_wrapper = self._mla_wrappers[gpu_idx]
                     else:
                         mla_wrapper = self._mla_decode_wrapper
-                    q_nope_sl = buf['q_nope_buf'][:D]
+                    # q_absorbed comes from stage1 graph (W_UK already applied)
+                    q_absorbed_sl = buf['q_absorbed_buf'][:D]
                     q_pe_sl = buf['q_pe_buf'][:D]
-                    q_absorbed = torch.einsum('bhp,hpc->bhc', q_nope_sl, self.W_UK_T[layer])
                     attn_latent = mla_wrapper.run(
-                        q_absorbed, q_pe_sl,
+                        q_absorbed_sl, q_pe_sl,
                         self.ckv_cache[layer], self.kpe_cache[layer])
-                    attn_v = torch.einsum('bhc,hcv->bhv', attn_latent, self.W_UV[layer])
-                    attn_out_buf[:D].copy_(
-                        attn_v.reshape(D, self.num_heads * self.v_head_dim))
+                    # Copy to static buffer for stage2_out graph
+                    buf['attn_latent_buf'][:D].copy_(attn_latent)
                     if _nvtx: torch.cuda.nvtx.range_pop()  # stage2_mla
+                # Stage 2 output: W_UV projection (CUDA graph)
+                if D > 0:
+                    info['stage2_out_graphs'][layer].replay()
 
                 # Stage 3a: MLA prefill (FA3 decompressed) for new prefills
                 if P > 0:
@@ -3154,12 +3278,9 @@ class MoEEngine:
                 # Attends to full paged KV cache (prior chunks + current chunk).
                 if C > 0:
                     if _nvtx: torch.cuda.nvtx.range_push("stage3b_mla")
-                    q_nope_cont = buf['q_nope_buf'][D + P:D + P + C]  # [C, H, P]
+                    # q_absorbed already computed by stage1 graph
+                    q_absorbed_cont = buf['q_absorbed_buf'][D + P:D + P + C]
                     q_pe_cont = buf['q_pe_buf'][D + P:D + P + C]       # [C, H, R]
-
-                    # Absorbed Q: q_nope @ W_UK → [C, H, kv_lora_rank=512]
-                    q_absorbed_cont = torch.einsum(
-                        'bhp,hpc->bhc', q_nope_cont, self.W_UK_T[layer])
 
                     # Plan MLA wrapper for continuation (overwrites decode plan)
                     if pp:
@@ -3303,43 +3424,45 @@ class MoEEngine:
             if _nvtx: torch.cuda.nvtx.range_pop()  # layer_N
 
         # ── 8. Final norm + lm_head (on last GPU for PP) ──
-        # Only compute lm_head for tokens that need logits: all decode tokens,
-        # plus the last token of each prefill/continuation sequence.
-        # This avoids running the expensive vocab projection on all prefill
-        # tokens (e.g. 2048→1 at seq_len=2048).
         if _nvtx: torch.cuda.nvtx.range_push("final")
         last_buf = _buf(self.num_layers - 1)
         hidden_all = last_buf['hidden_buf']
 
-        # Build indices of tokens that need logits
-        logit_token_indices = list(range(D))  # all decode tokens
-        offset = D
-        for length in prefill_lengths:
-            logit_token_indices.append(offset + length - 1)  # last token
-            offset += length
-        for length in cont_lengths:
-            logit_token_indices.append(offset + length - 1)  # last token
-            offset += length
-        num_logit_tokens = len(logit_token_indices)
-
-        if num_logit_tokens < N_actual:
-            # Selective: norm + lm_head only on needed tokens
-            idx = torch.tensor(logit_token_indices, dtype=torch.long,
-                               device=hidden_all.device)
-            hidden = hidden_all[idx]
-            hidden = F.rms_norm(hidden, (self.hidden_size,), self.final_norm,
-                                self.rms_norm_eps)
-            logits = F.linear(hidden, self.lm_head)
+        if P == 0 and C == 0 and 'final_graph' in info:
+            # Pure decode — use captured final graph (zero dispatch overhead)
+            info['final_graph'].replay()
+            logits = info['logits_buf'][:N_actual]
+            if pp:
+                logits = logits.to(self.pp_devices[0])
         else:
-            # Pure decode or single-token sequences — no savings
-            hidden = hidden_all[:N_actual]
-            hidden = F.rms_norm(hidden, (self.hidden_size,), self.final_norm,
-                                self.rms_norm_eps)
-            logits = F.linear(hidden, self.lm_head)
+            # Mixed batch — eager selective lm_head
+            # Only compute lm_head for tokens that need logits: all decode
+            # tokens, plus the last token of each prefill/continuation seq.
+            logit_token_indices = list(range(D))  # all decode tokens
+            offset = D
+            for length in prefill_lengths:
+                logit_token_indices.append(offset + length - 1)
+                offset += length
+            for length in cont_lengths:
+                logit_token_indices.append(offset + length - 1)
+                offset += length
+            num_logit_tokens = len(logit_token_indices)
 
-        # Transfer logits back to primary device for consistent API
-        if pp:
-            logits = logits.to(self.pp_devices[0])
+            if num_logit_tokens < N_actual:
+                idx = torch.tensor(logit_token_indices, dtype=torch.long,
+                                   device=hidden_all.device)
+                hidden = hidden_all[idx]
+                hidden = F.rms_norm(hidden, (self.hidden_size,),
+                                    self.final_norm, self.rms_norm_eps)
+                logits = F.linear(hidden, self.lm_head)
+            else:
+                hidden = hidden_all[:N_actual]
+                hidden = F.rms_norm(hidden, (self.hidden_size,),
+                                    self.final_norm, self.rms_norm_eps)
+                logits = F.linear(hidden, self.lm_head)
+            if pp:
+                logits = logits.to(self.pp_devices[0])
+
         if _nvtx: torch.cuda.nvtx.range_pop()  # final
         if _pt: _pt.after_final()
 
@@ -3368,8 +3491,10 @@ class MoEEngine:
         # When selective lm_head was used, logits is already the right size:
         # [D + num_prefill_seqs + num_cont_seqs, vocab_size]
         # Layout: logits[:D] = decode, then one row per prefill seq, one per cont seq.
-        if num_logit_tokens < N_actual:
-            return logits
+        if P > 0 or C > 0:
+            num_logit_tokens = D + len(prefill_lengths) + len(cont_lengths)
+            if num_logit_tokens < N_actual:
+                return logits
         return logits[:N_actual]
 
     # ── Generation ───────────────────────────────────────────────────

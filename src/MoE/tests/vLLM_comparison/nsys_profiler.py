@@ -35,6 +35,7 @@ SEQ_LENS = [128, 256, 512, 1024, 2048]
 NUM_WARMUP = 10
 NUM_DECODE = 30  # decode steps to profile (enough for stats, short enough for traces)
 NUM_PREFILL_STEPS = 10  # prefill repetitions to profile
+GPU_MEM_UTIL = 0.95     # vLLM gpu_memory_utilization (lower for large models)
 
 
 # =====================================================================
@@ -162,7 +163,7 @@ def write_vllm_driver(path, seq_len, model_dir):
             model="{model_dir}",
             dtype="bfloat16",
             max_model_len=4096,
-            gpu_memory_utilization=0.95,
+            gpu_memory_utilization={GPU_MEM_UTIL},
             enable_prefix_caching=False,  # Disable prefix caching for fair comparison
         )
         sp = SamplingParams(max_tokens=1, temperature=0)
@@ -261,7 +262,7 @@ def write_vllm_prefill_driver(path, seq_len, model_dir):
             model="{model_dir}",
             dtype="bfloat16",
             max_model_len=4096,
-            gpu_memory_utilization=0.95,
+            gpu_memory_utilization={GPU_MEM_UTIL},
             enable_prefix_caching=False,  # Disable prefix caching for fair comparison
         )
         sp = SamplingParams(max_tokens=1, temperature=0)

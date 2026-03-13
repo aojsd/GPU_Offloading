@@ -9,6 +9,10 @@ bin/*
 # Model weights (downloaded via models/download.sh)
 models/*
 !models/download.sh
+!models/truncated/
+models/truncated/*
+!models/truncated/truncate_model.py
+!models/truncated/README.md
 
 # Datasets (downloaded via datasets/download.sh)
 datasets/*

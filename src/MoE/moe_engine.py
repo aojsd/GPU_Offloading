@@ -44,6 +44,7 @@ _vllm_so = Path(_vllm_ops.__file__).parent / "_C.abi3.so"
 if _vllm_so.exists():
     torch.ops.load_library(str(_vllm_so))
 
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 
 
@@ -138,12 +139,20 @@ class MoEEngine:
             self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim  # 192
             self.routed_scaling_factor = cfg.get("routed_scaling_factor", 1.0)
 
-            # Forward-compat guard: DS-V3 uses grouped top-k (n_group=8) which is
-            # fundamentally different routing. Block unsupported configs early.
-            if cfg.get("n_group", 1) > 1:
+            # Grouped top-k routing (DS-V2: n_group=8, topk_group=3)
+            self.n_group = cfg.get("n_group", 1)
+            self.topk_group = cfg.get("topk_group", 1)
+
+            # Forward-compat guard: reject DS-V3+ features we don't support
+            if cfg.get("scoring_func", "softmax") != "softmax":
                 raise NotImplementedError(
-                    f"Grouped top-k routing (n_group={cfg['n_group']}) not yet supported. "
-                    "DS-V2-Lite uses n_group=1 (standard greedy top-k).")
+                    f"scoring_func={cfg['scoring_func']!r} not supported (only 'softmax').")
+            if cfg.get("e_score_correction_bias") is not None:
+                raise NotImplementedError(
+                    "e_score_correction_bias (DS-V3) not supported.")
+            if cfg.get("num_nextn_predict_layers", 0) > 0:
+                raise NotImplementedError(
+                    "Multi-token prediction (num_nextn_predict_layers > 0) not supported.")
 
             # Pre-compute sm_scale with mscale² correction (vLLM-verified formula)
             mscale_all_dim_coeff = float(self.rope_scaling_config.get("mscale_all_dim", 0))
@@ -153,6 +162,8 @@ class MoEEngine:
         else:
             self.first_k_dense_replace = 0
             self.n_shared_experts = 0
+            self.n_group = 1
+            self.topk_group = 1
             self.moe_intermediate_size = self.intermediate_size
             self.rope_scaling_config = None
 
@@ -470,6 +481,38 @@ class MoEEngine:
             topk_ids=topk_ids.to(torch.int32),
             **kwargs)
 
+    def _route(self, hidden, layer):
+        """Compute top-k routing weights and expert IDs for a layer.
+
+        Returns (topk_weights: [N, K] float32, topk_ids: [N, K] int64).
+        Handles standard top-k (OLMoE, Mixtral, DS-V2-Lite) and grouped
+        top-k (DS-V2) via vLLM's fused grouped_topk CUDA kernel.
+        """
+        router_logits = F.linear(hidden, self.router[layer])
+        if self.n_group > 1:
+            # vLLM fused CUDA kernel (ops.grouped_topk): no Inductor
+            # involvement, deterministic C++ dispatch. Opaque to Dynamo
+            # so both collection and replay engines produce identical results.
+            scores = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+            topk_w, topk_ids = ops.grouped_topk(
+                scores,
+                self.n_group,
+                self.topk_group,
+                self.top_k,
+                self.norm_topk_prob,       # renormalize
+                self.routed_scaling_factor,
+                self._zero_routing_bias,   # zero bias (no correction)
+                0,                         # scoring_func=0: scores pre-computed
+            )
+            return topk_w, topk_ids.to(torch.int64)
+        scores = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+        topk_w, topk_ids = torch.topk(scores, self.top_k, dim=-1)
+        if self.norm_topk_prob:
+            topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
+        elif self.is_mla:
+            topk_w = topk_w * self.routed_scaling_factor
+        return topk_w, topk_ids
+
     # ── PP Device Helpers ──────────────────────────────────────────
 
     def _get_cos_sin_cache(self, layer):
@@ -537,7 +580,14 @@ class MoEEngine:
             self.kv_b_proj = []        # [4096, 512] per layer
             self.W_UK_T = []           # [num_heads, qk_nope_head_dim, kv_lora_rank] per layer
             self.W_UV = []             # [num_heads, kv_lora_rank, v_head_dim] per layer
-            self.q_proj = []
+            if self.q_lora_rank is not None:
+                # DS-V2: Q compression via q_a_proj -> layernorm -> q_b_proj
+                self.q_a_proj = []
+                self.q_a_layernorm = []
+                self.q_b_proj = []
+            else:
+                # DS-V2-Lite: direct q_proj
+                self.q_proj = []
             self.k_proj = None  # signal to skip in QKV fusion
             self.v_proj = None
         else:
@@ -632,9 +682,17 @@ class MoEEngine:
                 weights.pop(f"{p}.self_attn.o_proj.weight").to(layer_dev))
 
             if self.is_mla:
-                # MLA attention projections
-                self.q_proj.append(
-                    weights.pop(f"{p}.self_attn.q_proj.weight").to(layer_dev))
+                # MLA attention projections — Q compression branch
+                if self.q_lora_rank is not None:
+                    self.q_a_proj.append(
+                        weights.pop(f"{p}.self_attn.q_a_proj.weight").to(layer_dev))
+                    self.q_a_layernorm.append(
+                        weights.pop(f"{p}.self_attn.q_a_layernorm.weight").to(layer_dev))
+                    self.q_b_proj.append(
+                        weights.pop(f"{p}.self_attn.q_b_proj.weight").to(layer_dev))
+                else:
+                    self.q_proj.append(
+                        weights.pop(f"{p}.self_attn.q_proj.weight").to(layer_dev))
                 self.kv_a_proj.append(
                     weights.pop(f"{p}.self_attn.kv_a_proj_with_mqa.weight").to(layer_dev))
                 self.kv_a_layernorm.append(
@@ -870,7 +928,12 @@ class MoEEngine:
             if self.pp_size == 1:
                 self.input_layernorm = torch.stack(self.input_layernorm)
                 self.post_attn_layernorm = torch.stack(self.post_attn_layernorm)
-                self.q_proj = torch.stack(self.q_proj)          # [L, 3072, 2048]
+                if self.q_lora_rank is not None:
+                    self.q_a_proj = torch.stack(self.q_a_proj)
+                    self.q_a_layernorm = torch.stack(self.q_a_layernorm)
+                    self.q_b_proj = torch.stack(self.q_b_proj)
+                else:
+                    self.q_proj = torch.stack(self.q_proj)      # [L, 3072, 2048]
                 self.kv_a_proj = torch.stack(self.kv_a_proj)    # [L, 576, 2048]
                 self.kv_a_layernorm = torch.stack(self.kv_a_layernorm)  # [L, 512]
                 self.kv_b_proj = torch.stack(self.kv_b_proj)    # [L, 4096, 512]
@@ -878,6 +941,11 @@ class MoEEngine:
                 self.W_UK_T = torch.stack(self.W_UK_T)          # [L, H, P, C]
                 self.W_UV = torch.stack(self.W_UV)              # [L, H, C, V]
             # PP: keep as lists (weights on different GPUs can't be stacked)
+            if self.n_group > 1:
+                # Zero bias for ops.grouped_topk (fused CUDA kernel requires
+                # non-None bias; zero bias = no correction, DS-V2 semantics).
+                self._zero_routing_bias = torch.zeros(
+                    self.num_experts, device=self.device, dtype=torch.float32)
             self.qkv_proj = None  # Not used for MLA
         elif self.pp_size > 1:
             # Fuse QKV per-layer (keep as list since weights span GPUs)
@@ -1780,11 +1848,7 @@ class MoEEngine:
         hidden = F.rms_norm(hidden, (H,), self.post_attn_layernorm[layer],
                             self.rms_norm_eps)
 
-        router_logits = F.linear(hidden, self.router[layer])
-        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-        topk_weights, topk_ids = torch.topk(routing_weights, self.top_k, dim=-1)
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights, topk_ids = self._route(hidden, layer)
 
         expert_map = (self.expert_map[layer]
                       if self.experts_per_layer is not None else None)
@@ -1812,7 +1876,14 @@ class MoEEngine:
         residual = hidden
         hidden = F.rms_norm(hidden, (H,), self.input_layernorm[layer], self.rms_norm_eps)
 
-        q_full = F.linear(hidden, self.q_proj[layer]).view(N, self.num_heads, self.qk_head_dim)
+        if self.q_lora_rank is not None:
+            q_compressed = F.linear(hidden, self.q_a_proj[layer])
+            q_compressed = F.rms_norm(q_compressed, (self.q_lora_rank,),
+                                      self.q_a_layernorm[layer], self.rms_norm_eps)
+            q_full = F.linear(q_compressed, self.q_b_proj[layer])
+        else:
+            q_full = F.linear(hidden, self.q_proj[layer])
+        q_full = q_full.view(N, self.num_heads, self.qk_head_dim)
         q_nope = q_full[:, :, :self.qk_nope_head_dim]
         q_pe = q_full[:, :, self.qk_nope_head_dim:]
 
@@ -1902,13 +1973,7 @@ class MoEEngine:
             hidden = F.linear(F.silu(gate_up[:, :I]) * gate_up[:, I:], self.dense_w2[layer])
         else:
             # MoE: router + fused_moe + shared experts
-            router_logits = F.linear(hidden, self.router[layer])
-            routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-            topk_weights, topk_ids = torch.topk(routing_weights, self.top_k, dim=-1)
-            if self.norm_topk_prob:
-                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-            else:
-                topk_weights = topk_weights * self.routed_scaling_factor
+            topk_weights, topk_ids = self._route(hidden, layer)
             routed = self._moe_experts(hidden, self.w1[layer], self.w2[layer],
                                         topk_weights, topk_ids)
             shared_gu = F.linear(hidden, self.shared_w1[layer])
@@ -1973,8 +2038,14 @@ class MoEEngine:
         # RMSNorm
         normed = F.rms_norm(hidden, (H,), self.input_layernorm[layer], self.rms_norm_eps)
 
-        # Q projection: [N, 3072] -> split into q_nope [N, num_heads, P] and q_pe [N, num_heads, R]
-        q_full = F.linear(normed, self.q_proj[layer])  # [N, num_heads*(P+R)]
+        # Q projection (with optional compression for DS-V2)
+        if self.q_lora_rank is not None:
+            q_compressed = F.linear(normed, self.q_a_proj[layer])
+            q_compressed = F.rms_norm(q_compressed, (self.q_lora_rank,),
+                                      self.q_a_layernorm[layer], self.rms_norm_eps)
+            q_full = F.linear(q_compressed, self.q_b_proj[layer])
+        else:
+            q_full = F.linear(normed, self.q_proj[layer])
         q_full = q_full.view(N, self.num_heads, self.qk_head_dim)  # [N, H, P+R]
         q_nope = q_full[:, :, :self.qk_nope_head_dim]  # [N, H, P=128]
         q_pe = q_full[:, :, self.qk_nope_head_dim:]     # [N, H, R=64]
@@ -2019,8 +2090,9 @@ class MoEEngine:
         stage4a and stage4b. Used for expert offloading (demand loading between
         the two sub-stages).
 
-        Uses vLLM's fused topk_softmax kernel (softmax + topk + optional
-        renormalize in a single CUDA kernel) instead of separate PyTorch ops.
+        Standard models: vLLM fused topk_softmax kernel (softmax + topk +
+        renormalize in one CUDA kernel). DS-V2 grouped routing (n_group > 1):
+        falls back to _route() with ops.grouped_topk.
         """
         H = self.hidden_size
         hidden = residual + F.linear(attn_out, self.o_proj[layer])
@@ -2033,14 +2105,20 @@ class MoEEngine:
             # Dense layer: no routing. topk buffers stay zero (unused).
             return
 
-        router_logits = F.linear(hidden, self.router[layer])
-        # Fused softmax + topk + optional renormalize — writes directly into
-        # topk_weights_buf and topk_ids_buf (no intermediate tensors or copies).
-        _vllm_ops.topk_softmax(topk_weights_buf, topk_ids_buf,
-                               token_expert_indices,
-                               router_logits.float(), self.norm_topk_prob)
-        if not self.norm_topk_prob and self.is_mla:
-            topk_weights_buf.mul_(self.routed_scaling_factor)
+        if self.n_group > 1:
+            # DS-V2 grouped routing — topk_softmax doesn't support groups
+            topk_weights, topk_ids = self._route(hidden, layer)
+            topk_weights_buf.copy_(topk_weights)
+            topk_ids_buf.copy_(topk_ids.to(torch.int32))
+        else:
+            # Fused softmax + topk + optional renormalize — writes directly
+            # into topk_weights_buf and topk_ids_buf (no intermediate tensors).
+            router_logits = F.linear(hidden, self.router[layer])
+            _vllm_ops.topk_softmax(topk_weights_buf, topk_ids_buf,
+                                   token_expert_indices,
+                                   router_logits.float(), self.norm_topk_prob)
+            if not self.norm_topk_prob and self.is_mla:
+                topk_weights_buf.mul_(self.routed_scaling_factor)
 
     def _layer_stage4b_moe(self, moe_input_buf, moe_residual_buf,
                            topk_weights_buf, topk_ids_buf, hidden_out, layer):
@@ -3210,13 +3288,6 @@ class MoEEngine:
             # Trace recorder slices topk_ids_buf[:n_tokens], unaffected.
             if N_actual < graph_N:
                 buf['topk_weights_buf'][N_actual:].zero_()
-                # In offloading mode, also route padding to an uncached
-                # expert so expert_map lookup doesn't hit -1.
-                if self.offloading:
-                    emap = self.expert_map_buf
-                    uncached = (emap == -1).nonzero(as_tuple=True)[0]
-                    if len(uncached) > 0:
-                        buf['topk_ids_buf'][N_actual:].fill_(uncached[0].item())
 
             # Stage 4b: MoE (CUDA graph)
             if _nvtx: torch.cuda.nvtx.range_push("stage4b")

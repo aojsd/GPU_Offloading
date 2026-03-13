@@ -267,7 +267,7 @@ def benchmark_prefill_custom_graph(engine, seq_lens, batch_size=1,
     return results
 
 
-def benchmark_prefill_vllm(model_path, seq_lens):
+def benchmark_prefill_vllm(model_path, seq_lens, async_scheduling=True):
     """Benchmark vLLM prefill at each seq_len using step-by-step API."""
     from vllm import LLM, SamplingParams
 
@@ -279,6 +279,7 @@ def benchmark_prefill_vllm(model_path, seq_lens):
         gpu_memory_utilization=0.95,
         disable_log_stats=True,
         enable_prefix_caching=False,
+        async_scheduling=async_scheduling,
     )
     sp = SamplingParams(max_tokens=1, temperature=0)
 
@@ -366,7 +367,7 @@ def benchmark_prefill_decode_custom(engine, prefill_len, decode_steps, batch_siz
         torch.cuda.synchronize()
         t_prefill = start_evt.elapsed_time(end_evt)
 
-        next_token = logits[:, -1, :].argmax(dim=-1)
+        next_token = logits.argmax(dim=-1) if logits.dim() == 2 else logits[:, -1, :].argmax(dim=-1)
         start_evt.record()
         for step in range(decode_steps):
             positions = engine.seq_lens[:batch_size].clone()
@@ -386,7 +387,8 @@ def benchmark_prefill_decode_custom(engine, prefill_len, decode_steps, batch_siz
     return med_p, med_d, med_t
 
 
-def benchmark_prefill_decode_vllm(model_path, prefill_len, decode_steps):
+def benchmark_prefill_decode_vllm(model_path, prefill_len, decode_steps,
+                                  async_scheduling=True):
     """Benchmark combined prefill + decode for vLLM."""
     from vllm import LLM, SamplingParams
 
@@ -398,6 +400,7 @@ def benchmark_prefill_decode_vllm(model_path, prefill_len, decode_steps):
         gpu_memory_utilization=0.95,
         disable_log_stats=True,
         enable_prefix_caching=False,
+        async_scheduling=async_scheduling,
     )
     sp_gen = SamplingParams(max_tokens=decode_steps, temperature=0)
 
@@ -994,6 +997,7 @@ def cmd_decode(args):
             gpu_memory_utilization=0.95,
             dtype="bfloat16",
             enable_prefix_caching=False,
+            async_scheduling=not args.no_async,
         )
 
         sp_warmup = SamplingParams(max_tokens=10, temperature=0)
@@ -1177,7 +1181,8 @@ def cmd_prefill(args):
     vllm_results = {}
     if not args.skip_vllm:
         print("\n── vLLM Prefill ──")
-        vllm_results = benchmark_prefill_vllm(args.model, args.seq_lens)
+        vllm_results = benchmark_prefill_vllm(args.model, args.seq_lens,
+                                               async_scheduling=not args.no_async)
 
     # Comparison table
     print("\n" + "=" * 80)
@@ -1454,6 +1459,7 @@ def cmd_pp_decode(args):
             enable_prefix_caching=False,
             pipeline_parallel_size=pp_size,
             disable_log_stats=True,
+            async_scheduling=not args.no_async,
         )
 
         sp_warmup = SamplingParams(max_tokens=10, temperature=0)
@@ -1575,6 +1581,7 @@ def cmd_pp_prefill(args):
             disable_log_stats=True,
             enable_prefix_caching=False,
             pipeline_parallel_size=pp_size,
+            async_scheduling=not args.no_async,
         )
         sp = SamplingParams(max_tokens=1, temperature=0)
 
@@ -1691,6 +1698,8 @@ def main():
         description="Microbenchmarks for custom MoE engine")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL_DIR,
                         help="Path to HuggingFace model directory")
+    parser.add_argument("--no-async", action="store_true",
+                        help="Disable vLLM async scheduling (fair comparison)")
     subparsers = parser.add_subparsers(dest="command")
 
     # decode

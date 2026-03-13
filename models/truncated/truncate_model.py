@@ -5,11 +5,16 @@ Creates a new model directory with only the first N layers, preserving all
 global weights (embeddings, final norm, LM head) and tokenizer files.
 Processes one safetensors shard at a time for memory efficiency.
 
+The truncated model is created in the same physical directory as the source
+(following symlinks), and a symlink is created in models/truncated/ pointing
+to the physical output.
+
 Usage:
-    python truncate_model.py <source_dir> <output_dir> --num-layers 20
+    python truncate_model.py <source_dir> --num-layers 20
 """
 import argparse
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -35,10 +40,25 @@ def get_layer_index(tensor_name: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def truncate_model(source_dir: str, output_dir: str, num_layers: int):
+def truncate_model(source_dir: str, num_layers: int):
     source = Path(source_dir)
-    output = Path(output_dir)
+
+    # Resolve symlinks to find the physical location of the source model
+    physical_source = Path(os.path.realpath(source))
+    model_name = physical_source.name
+    physical_parent = physical_source.parent
+
+    # Create output alongside the physical source directory
+    output_name = f"{model_name}-{num_layers}L"
+    output = physical_parent / output_name
     output.mkdir(parents=True, exist_ok=True)
+
+    # Determine symlink location: models/truncated/ relative to this script
+    script_dir = Path(__file__).resolve().parent
+    symlink_path = script_dir / output_name
+    if symlink_path.exists() or symlink_path.is_symlink():
+        symlink_path.unlink()
+    symlink_path.symlink_to(output)
 
     # Load config
     with open(source / "config.json") as f:
@@ -146,14 +166,14 @@ def truncate_model(source_dir: str, output_dir: str, num_layers: int):
 
     total_gb = total_size / 1024**3
     print(f"\nDone: {num_layers}-layer model at {output}")
+    print(f"Symlink: {symlink_path} -> {output}")
     print(f"Total size: {total_gb:.1f} GB ({num_shards} shards)")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Truncate transformer model layers")
-    parser.add_argument("source", help="Source model directory")
-    parser.add_argument("output", help="Output directory for truncated model")
+    parser.add_argument("source", help="Source model directory (symlinks followed)")
     parser.add_argument("--num-layers", type=int, required=True,
                         help="Number of layers to keep")
     args = parser.parse_args()
-    truncate_model(args.source, args.output, args.num_layers)
+    truncate_model(args.source, args.num_layers)

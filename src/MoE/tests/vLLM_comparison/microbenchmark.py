@@ -23,7 +23,9 @@ os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
 
 import argparse
+import json
 import statistics
+import subprocess
 import sys
 import time
 from functools import lru_cache
@@ -83,39 +85,166 @@ PREFILL_N_TRIALS = 5
 #  Correctness helpers (decode)
 # =====================================================================
 
-def custom_greedy_generate(engine, prompt_ids, max_new_tokens):
+def custom_greedy_generate(engine, prompt_ids, max_new_tokens, force_tokens=None):
     """Run greedy generation with custom engine.
 
-    Returns (tokens, logits_list) where logits_list[i] is the top-k logit
-    info dict for step i: {token_id: logit_value} for the top 10 tokens.
+    Returns (tokens, logits_list, full_logits_list) where:
+      - tokens: greedy-chosen token ids (argmax at each step)
+      - logits_list[i]: {token_id: logit_value} for top 10 at step i
+      - full_logits_list[i]: full [vocab] float32 CPU tensor at step i
+
+    If force_tokens is provided, the engine is fed force_tokens[i] at each step
+    instead of the greedy token, but tokens still records the argmax choice.
+    This keeps the decode aligned with an external reference (e.g. vLLM).
     """
     engine.reset()
     input_ids = torch.tensor([prompt_ids], device="cuda")
 
     logits = engine.prefill(input_ids)
-    step_logits_raw = logits[0, -1, :]
+    # prefill returns [B, vocab] (last-token only) or [B, S, vocab]
+    step_logits_raw = logits[0] if logits.dim() == 2 else logits[0, -1, :]
     next_token = step_logits_raw.argmax().item()
 
     tokens = [next_token]
     logits_per_step = [_extract_topk_logits(step_logits_raw, k=10)]
+    full_logits_per_step = [step_logits_raw.float().cpu()]
 
-    for _ in range(max_new_tokens - 1):
+    feed_token = force_tokens[0] if force_tokens else next_token
+
+    for step in range(max_new_tokens - 1):
         positions = engine.seq_lens[:1].clone()
-        token_t = torch.tensor([next_token], device="cuda")
+        token_t = torch.tensor([feed_token], device="cuda")
         step_logits_raw = engine.decode_step(token_t, positions)[0]
         next_token = step_logits_raw.argmax().item()
         tokens.append(next_token)
         logits_per_step.append(_extract_topk_logits(step_logits_raw, k=10))
-        if next_token == engine.eos_token_id:
+        full_logits_per_step.append(step_logits_raw.float().cpu())
+
+        if force_tokens and step + 1 < len(force_tokens):
+            feed_token = force_tokens[step + 1]
+        else:
+            feed_token = next_token
+
+        if feed_token == engine.eos_token_id:
             break
 
-    return tokens, logits_per_step
+    return tokens, logits_per_step, full_logits_per_step
 
 
 def _extract_topk_logits(logits_1d, k=10):
     """Extract top-k (token_id, logit_value) from a [vocab] logits tensor."""
     topk = torch.topk(logits_1d.float(), k)
     return {tid.item(): val.item() for tid, val in zip(topk.indices, topk.values)}
+
+
+def _cosine_sim_sparse(full_logits_cpu, logprobs_dict):
+    """Cosine similarity between custom full logits and vLLM sparse logprobs.
+
+    Compares log_softmax(full_logits) at vLLM's top-k positions against
+    vLLM's logprob values. Both are in log-probability space.
+    """
+    tids = list(logprobs_dict.keys())
+    if len(tids) < 2:
+        return float('nan')
+    log_probs = torch.log_softmax(full_logits_cpu, dim=-1)
+    custom_vals = log_probs[tids].unsqueeze(0)
+    vllm_vals = torch.tensor([logprobs_dict[t] for t in tids],
+                             dtype=torch.float32).unsqueeze(0)
+    return torch.nn.functional.cosine_similarity(custom_vals, vllm_vals).item()
+
+
+def _vllm_correctness_subprocess(model_path, prompts, max_new_tokens,
+                                  async_sched=False):
+    """Run vLLM greedy generation in a subprocess to avoid GPU memory leaks.
+
+    Returns dict: {prompt_idx: {"tokens": [...], "logprobs": [...]}}
+    where each logprobs entry is a dict {token_id_str: logprob_value}.
+    """
+    import tempfile
+    out_file = tempfile.mktemp(suffix=".json", prefix="vllm_correctness_")
+    prompts_file = tempfile.mktemp(suffix=".json", prefix="vllm_prompts_")
+
+    # Write prompts to temp file
+    with open(prompts_file, "w") as f:
+        json.dump(prompts, f)
+
+    script = f'''
+import os
+os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+import json
+import torch
+from vllm import LLM, SamplingParams
+
+with open("{prompts_file}") as f:
+    prompts = json.load(f)
+
+llm = LLM(
+    model="{model_path}",
+    max_model_len=4096,
+    max_num_seqs=64,
+    gpu_memory_utilization=0.95,
+    dtype="bfloat16",
+    enable_prefix_caching=False,
+    async_scheduling={async_sched},
+)
+
+sp_warmup = SamplingParams(max_tokens=10, temperature=0)
+for j in range(3):
+    warmup_ids = torch.randint(1, 1000, (256,)).tolist()
+    llm.generate([{{"prompt_token_ids": warmup_ids}}], sampling_params=sp_warmup)
+
+results = {{}}
+for i, prompt_ids in enumerate(prompts):
+    sp = SamplingParams(max_tokens={max_new_tokens}, temperature=0, logprobs=20)
+    out = llm.generate([{{"prompt_token_ids": prompt_ids}}], sampling_params=sp)
+    tokens = list(out[0].outputs[0].token_ids)
+    logprobs_per_step = []
+    if out[0].outputs[0].logprobs is not None:
+        for step_lp in out[0].outputs[0].logprobs:
+            logprobs_per_step.append(
+                {{str(tid): lp.logprob for tid, lp in step_lp.items()}})
+    results[i] = {{"tokens": tokens, "logprobs": logprobs_per_step}}
+
+with open("{out_file}", "w") as f:
+    json.dump(results, f)
+'''
+    script_file = tempfile.mktemp(suffix=".py", prefix="vllm_sub_")
+    with open(script_file, "w") as f:
+        f.write(script)
+
+    print("  Running vLLM in subprocess...")
+    result = subprocess.run(
+        [sys.executable, script_file],
+        capture_output=True, text=True, timeout=600)
+
+    if result.returncode != 0:
+        print(f"  vLLM subprocess failed (exit {result.returncode}):")
+        # Print last 20 lines of stderr
+        for line in result.stderr.strip().split("\n")[-20:]:
+            print(f"    {line}")
+        return {}
+
+    with open(out_file) as f:
+        raw = json.load(f)
+
+    # Clean up temp files
+    for p in (script_file, prompts_file, out_file):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+    # Convert string keys back to int
+    parsed = {}
+    for idx_str, data in raw.items():
+        idx = int(idx_str)
+        logprobs = []
+        for step_lp in data["logprobs"]:
+            logprobs.append({int(tid): val for tid, val in step_lp.items()})
+        parsed[idx] = {"tokens": data["tokens"], "logprobs": logprobs}
+
+    return parsed
 
 
 def vllm_greedy_generate(llm, prompt_ids, max_new_tokens):
@@ -125,7 +254,7 @@ def vllm_greedy_generate(llm, prompt_ids, max_new_tokens):
     {token_id: logprob} for the top tokens at step i.
     """
     from vllm import SamplingParams
-    sp = SamplingParams(max_tokens=max_new_tokens, temperature=0, logprobs=10)
+    sp = SamplingParams(max_tokens=max_new_tokens, temperature=0, logprobs=20)
     outputs = llm.generate(
         [{"prompt_token_ids": prompt_ids}],
         sampling_params=sp,
@@ -912,11 +1041,27 @@ def cmd_decode(args):
     custom_tokens = {}
     custom_logits = {}
     custom_gen_ms = {}
+    custom_forced_logits = {}  # full logits from forced decode (for cosine sim)
     vllm_tokens = {}
     vllm_logprobs = {}
     vllm_gen_ms = {}
     custom_perf = {}
     vllm_perf = {}
+
+    # Get vLLM reference tokens via subprocess first (if needed for forced decode)
+    vllm_sub_results = {}
+    if run_correctness and run_custom and run_vllm:
+        print("=" * 70)
+        print("vLLM CORRECTNESS (subprocess)")
+        print("=" * 70)
+        vllm_sub_results = _vllm_correctness_subprocess(
+            args.model, correctness_prompts, MAX_NEW_TOKENS,
+            async_sched=args.async_sched)
+        for idx, data in vllm_sub_results.items():
+            vllm_tokens[idx] = data["tokens"]
+            vllm_logprobs[idx] = data["logprobs"]
+            print(f"  Prompt {idx}: {len(data['tokens'])} tokens generated")
+        print()
 
     if run_custom:
         print("=" * 70)
@@ -948,7 +1093,8 @@ def cmd_decode(args):
         if run_correctness:
             print("── Correctness (greedy generation) ──")
             for i, prompt in enumerate(correctness_prompts):
-                tokens, logits = custom_greedy_generate(engine, prompt, MAX_NEW_TOKENS)
+                tokens, logits, full_lgt = custom_greedy_generate(
+                    engine, prompt, MAX_NEW_TOKENS)
                 custom_tokens[i] = tokens
                 custom_logits[i] = logits
 
@@ -967,6 +1113,18 @@ def cmd_decode(args):
                       f"({n_tok / med_ms * 1000:.0f} tok/s)")
             print()
 
+            # Forced decode: follow vLLM tokens to collect logits for cosine sim
+            if vllm_tokens:
+                print("── Forced Decode (custom follows vLLM tokens) ──")
+                for i in sorted(vllm_tokens):
+                    vt = vllm_tokens[i]
+                    prompt = correctness_prompts[i]
+                    _, _, forced_full = custom_greedy_generate(
+                        engine, prompt, MAX_NEW_TOKENS, force_tokens=vt)
+                    custom_forced_logits[i] = forced_full
+                    print(f"  Prompt {i}: {len(forced_full)} steps collected")
+                print()
+
         if run_perf:
             print(f"── Performance (batch=1, {args.n_steps} steps/trial, "
                   f"{args.n_trials} trials, {N_WARMUP} warmup) ──")
@@ -983,7 +1141,10 @@ def cmd_decode(args):
         del engine
         torch.cuda.empty_cache()
 
-    if run_vllm:
+    # vLLM in-process: correctness (if not already via subprocess) + perf
+    need_vllm_correctness = run_vllm and run_correctness and not vllm_sub_results
+    need_vllm_perf = run_vllm and run_perf
+    if need_vllm_correctness or need_vllm_perf:
         print("=" * 70)
         print("vLLM")
         print("=" * 70)
@@ -997,7 +1158,7 @@ def cmd_decode(args):
             gpu_memory_utilization=0.95,
             dtype="bfloat16",
             enable_prefix_caching=False,
-            async_scheduling=not args.no_async,
+            async_scheduling=args.async_sched,
         )
 
         sp_warmup = SamplingParams(max_tokens=10, temperature=0)
@@ -1008,7 +1169,7 @@ def cmd_decode(args):
         torch.cuda.synchronize()
         print("Warmup complete\n")
 
-        if run_correctness:
+        if need_vllm_correctness:
             print("── Correctness (greedy generation) ──")
             for i, prompt in enumerate(correctness_prompts):
                 tokens, logprobs = vllm_greedy_generate(llm, prompt, MAX_NEW_TOKENS)
@@ -1032,7 +1193,7 @@ def cmd_decode(args):
                       f"({n_tok / med_ms * 1000:.0f} tok/s)")
             print()
 
-        if run_perf:
+        if need_vllm_perf:
             print(f"── Performance (batch=1, {args.n_steps} steps/trial, "
                   f"{args.n_trials} trials, {N_WARMUP} warmup) ──")
             print(f"{'seq_len':>10s}  {'median':>8s}  {'stdev':>8s}  {'tok/s':>8s}")
@@ -1134,6 +1295,33 @@ def cmd_decode(args):
             elif v is not None:
                 print(f"{sl:>10,d}  {'—':>10s}  {v:>10.2f}  {'—':>10s}")
 
+    # Cosine similarity: forced decode (custom engine followed vLLM tokens)
+    if run_correctness and custom_forced_logits and vllm_logprobs:
+        print("\n── Cosine Similarity (forced decode, custom followed vLLM tokens) ──")
+        print("  log_softmax(custom) vs vLLM logprobs at vLLM's top-20 positions")
+        for i in sorted(custom_forced_logits):
+            fl = custom_forced_logits[i]
+            vl = vllm_logprobs.get(i, [])
+            n_steps = min(len(fl), len(vl))
+            cos_sims = []
+            for s in range(n_steps):
+                sim = _cosine_sim_sparse(fl[s], vl[s])
+                cos_sims.append(sim)
+
+            if cos_sims:
+                mean_sim = sum(cos_sims) / len(cos_sims)
+                min_sim = min(cos_sims)
+                min_idx = cos_sims.index(min_sim)
+                print(f"  Prompt {i}: {n_steps} steps, "
+                      f"mean={mean_sim:.6f}, min={min_sim:.6f} (step {min_idx})")
+                show_steps = [0, n_steps // 4, n_steps // 2,
+                              3 * n_steps // 4, n_steps - 1]
+                show_steps = sorted(set(s for s in show_steps if 0 <= s < n_steps))
+                detail = "    "
+                for s in show_steps:
+                    detail += f"step {s}={cos_sims[s]:.4f}  "
+                print(detail)
+
     print()
 
 
@@ -1141,10 +1329,98 @@ def cmd_decode(args):
 #  Subcommand: prefill
 # =====================================================================
 
+def _prefill_correctness_custom(engine, prompts):
+    """Collect prefill top-1, top-10, and full logits from custom engine."""
+    results = []
+    for prompt_ids in prompts:
+        engine.reset()
+        input_ids = torch.tensor([prompt_ids], device="cuda")
+        logits = engine.prefill(input_ids)
+        logits_1d = logits[0] if logits.dim() == 2 else logits[0, -1, :]
+        top1 = logits_1d.argmax().item()
+        topk = set(torch.topk(logits_1d.float(), 10).indices.tolist())
+        full_logits = logits_1d.float().cpu()
+        results.append((top1, topk, full_logits))
+    return results
+
+
+def _prefill_correctness_vllm(model_path, prompts):
+    """Collect prefill top-1, top-10, and logprobs dict from vLLM."""
+    from vllm import LLM, SamplingParams
+
+    llm = LLM(
+        model=model_path,
+        max_model_len=4096,
+        max_num_seqs=64,
+        gpu_memory_utilization=0.95,
+        dtype="bfloat16",
+        enable_prefix_caching=False,
+        async_scheduling=False,
+    )
+
+    results = []
+    for prompt_ids in prompts:
+        sp = SamplingParams(max_tokens=1, temperature=0, logprobs=20)
+        out = llm.generate([{"prompt_token_ids": prompt_ids}],
+                           sampling_params=sp)
+        top1 = out[0].outputs[0].token_ids[0]
+        topk = set()
+        logprobs_dict = {}
+        if out[0].outputs[0].logprobs:
+            topk = set(out[0].outputs[0].logprobs[0].keys())
+            logprobs_dict = {tid: lp.logprob
+                             for tid, lp in out[0].outputs[0].logprobs[0].items()}
+        results.append((top1, topk, logprobs_dict))
+
+    del llm
+    torch.cuda.empty_cache()
+    return results
+
+
 def cmd_prefill(args):
     print("=" * 80)
     print("  PREFILL BENCHMARK: Custom (CUDA graph / compile+graph) vs vLLM")
     print("=" * 80)
+
+    # Correctness check — run engines sequentially to avoid OOM
+    if not args.perf_only:
+        print("\n── Prefill Correctness (custom vs vLLM, greedy top-1) ──")
+        prompts = _make_correctness_prompts(args.model)
+
+        # Custom engine first
+        engine = MoEEngine(args.model, max_seqs=4, max_seq_len=4096,
+                           use_torch_compile=False)
+        prefill_sizes = sorted(set(len(p) for p in prompts)) + [4]
+        engine.capture_prefill_cuda_graph(
+            total_token_sizes=prefill_sizes, use_torch_compile=False)
+        custom_results = _prefill_correctness_custom(engine, prompts)
+        del engine
+        torch.cuda.empty_cache()
+
+        # vLLM second (needs full GPU)
+        vllm_results = _prefill_correctness_vllm(args.model, prompts)
+
+        # Compare
+        total = len(prompts)
+        match = 0
+        for i, prompt_ids in enumerate(prompts):
+            c_top1, c_topk, c_full_logits = custom_results[i]
+            v_top1, v_topk, v_logprobs = vllm_results[i]
+            top1_match = c_top1 == v_top1
+            topk_overlap = len(c_topk & v_topk) if v_topk else -1
+            cos_sim = _cosine_sim_sparse(c_full_logits, v_logprobs) if v_logprobs else float('nan')
+            if top1_match:
+                match += 1
+            status = "MATCH" if top1_match else "MISMATCH"
+            print(f"  Prompt {i} ({len(prompt_ids)} tok): top-1 {status}"
+                  f"  (custom={c_top1}, vllm={v_top1})"
+                  f"  top-10 overlap={topk_overlap}/10"
+                  f"  cos_sim={cos_sim:.6f}")
+        print(f"\n  Top-1 match rate: {match}/{total}"
+              f" ({match / total * 100:.1f}%)")
+
+    if args.correctness_only:
+        return
 
     # CUDA graph only (no torch.compile)
     print("\n── Custom Engine Prefill (CUDA graph, no compile) ──")
@@ -1182,7 +1458,7 @@ def cmd_prefill(args):
     if not args.skip_vllm:
         print("\n── vLLM Prefill ──")
         vllm_results = benchmark_prefill_vllm(args.model, args.seq_lens,
-                                               async_scheduling=not args.no_async)
+                                               async_scheduling=args.async_sched)
 
     # Comparison table
     print("\n" + "=" * 80)
@@ -1459,7 +1735,7 @@ def cmd_pp_decode(args):
             enable_prefix_caching=False,
             pipeline_parallel_size=pp_size,
             disable_log_stats=True,
-            async_scheduling=not args.no_async,
+            async_scheduling=args.async_sched,
         )
 
         sp_warmup = SamplingParams(max_tokens=10, temperature=0)
@@ -1581,7 +1857,7 @@ def cmd_pp_prefill(args):
             disable_log_stats=True,
             enable_prefix_caching=False,
             pipeline_parallel_size=pp_size,
-            async_scheduling=not args.no_async,
+            async_scheduling=args.async_sched,
         )
         sp = SamplingParams(max_tokens=1, temperature=0)
 
@@ -1698,8 +1974,8 @@ def main():
         description="Microbenchmarks for custom MoE engine")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL_DIR,
                         help="Path to HuggingFace model directory")
-    parser.add_argument("--no-async", action="store_true",
-                        help="Disable vLLM async scheduling (fair comparison)")
+    parser.add_argument("--async", dest="async_sched", action="store_true",
+                        help="Enable vLLM async scheduling (unfair comparison)")
     subparsers = parser.add_subparsers(dest="command")
 
     # decode
@@ -1721,6 +1997,8 @@ def main():
         help="Prefill performance vs vLLM")
     p_prefill.add_argument("--seq-lens", nargs="+", type=int,
                            default=PREFILL_SEQ_LENS)
+    p_prefill.add_argument("--correctness-only", action="store_true")
+    p_prefill.add_argument("--perf-only", action="store_true")
     p_prefill.add_argument("--skip-vllm", action="store_true")
     p_prefill.add_argument("--skip-combined", action="store_true")
 

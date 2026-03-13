@@ -8,6 +8,7 @@ WORKDIR /workspace
 # We also set MAX_JOBS to avoid running out of RAM during compilation.
 RUN git clone https://github.com/vllm-project/vllm.git \
     && cd vllm \
+    && git checkout v0.17.1 \
     && python use_existing_torch.py \
     && pip install -r requirements/build.txt \
     && export CFLAGS="-w" \

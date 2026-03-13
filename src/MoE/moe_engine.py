@@ -2187,7 +2187,7 @@ class MoEEngine:
         residual_buf.copy_(hidden)
 
     def _layer_stage1_mla(self, hidden, positions, slot_mapping, layer,
-                           q_nope_buf, q_pe_buf, q_absorbed_buf,
+                           q_nope_buf, q_fused_buf,
                            ckv_buf, kpe_buf, residual_buf):
         """Stage 1 for MLA: RMSNorm -> Q proj -> W_UK absorption -> KV compress
         -> KV norm -> RoPE (pe only) -> KV cache write."""
@@ -2235,10 +2235,10 @@ class MoEEngine:
         # W_UK absorption: q_absorbed = q_nope @ W_UK_T (was eager, now in graph)
         q_absorbed = torch.einsum('bhp,hpc->bhc', q_nope, self.W_UK_T[layer])
 
-        # Output to buffers
+        # Output to buffers — q_fused_buf[:, :, :512] = absorbed, [:, :, 512:] = pe
         q_nope_buf.copy_(q_nope)        # [N, H, P=128] (still needed for prefill)
-        q_pe_buf.copy_(q_pe_3d)         # [N, H, R=64]
-        q_absorbed_buf.copy_(q_absorbed)  # [N, H, C=512]
+        q_fused_buf[:, :, self.kv_lora_rank:].copy_(q_pe_3d)     # [N, H, R=64]
+        q_fused_buf[:, :, :self.kv_lora_rank].copy_(q_absorbed)  # [N, H, C=512]
         ckv_buf.copy_(c_kv_normed)      # [N, 512]
         kpe_buf.copy_(k_pe_rot)         # [N, 64]
         residual_buf.copy_(hidden)
@@ -2564,13 +2564,12 @@ class MoEEngine:
         """
         total_kv_slots = self.total_pages * self.page_size
         if self.is_mla:
-            return {
+            bufs = {
                 'q_nope_buf': torch.zeros(N, self.num_heads, self.qk_nope_head_dim,
                                            dtype=self.dtype, device=device),
-                'q_pe_buf': torch.zeros(N, self.num_heads, self.qk_rope_head_dim,
-                                         dtype=self.dtype, device=device),
-                'q_absorbed_buf': torch.zeros(N, self.num_heads, self.kv_lora_rank,
-                                               dtype=self.dtype, device=device),
+                'q_fused_buf': torch.zeros(N, self.num_heads,
+                                            self.kv_lora_rank + self.qk_rope_head_dim,
+                                            dtype=self.dtype, device=device),
                 'attn_latent_buf': torch.zeros(N, self.num_heads, self.kv_lora_rank,
                                                 dtype=self.dtype, device=device),
                 'ckv_buf': torch.zeros(N, self.kv_lora_rank,
@@ -2592,6 +2591,12 @@ class MoEEngine:
                                         % total_kv_slots),
                 'static_token_ids': torch.randint(1, 1000, (N,), device=device),
             }
+            # q_absorbed_buf and q_pe_buf are views into q_fused_buf so that
+            # stage1 CUDA graph .copy_() writes populate the fused layout and
+            # stage2 can pass q_fused_buf directly to FlashMLA without torch.cat.
+            bufs['q_absorbed_buf'] = bufs['q_fused_buf'][:, :, :self.kv_lora_rank]
+            bufs['q_pe_buf'] = bufs['q_fused_buf'][:, :, self.kv_lora_rank:]
+            return bufs
         return {
             'q_buf': torch.zeros(N, self.num_heads, self.head_dim,
                                  dtype=self.dtype, device=device),
@@ -2699,8 +2704,7 @@ class MoEEngine:
                 stage1_fn(buf['hidden_buf'],
                           buf['static_positions'],
                           buf['static_slot_mapping'], layer,
-                          buf['q_nope_buf'], buf['q_pe_buf'],
-                          buf['q_absorbed_buf'],
+                          buf['q_nope_buf'], buf['q_fused_buf'],
                           buf['ckv_buf'], buf['kpe_buf'],
                           buf['residual_buf'])
             else:
@@ -2738,6 +2742,15 @@ class MoEEngine:
         # Slice without any CPU work or H2D copy on the hot path.
         self._decode_qsl_gpu = torch.arange(
             max_graph_N + 1, dtype=torch.int32, device=primary_dev)
+
+        # Pre-allocate FlashMLA setup buffers (Phase 5 optimization)
+        if self.is_mla and _HAS_FLASHMLA:
+            self._flashmla_sid_cpu = torch.zeros(
+                max_graph_N, dtype=torch.long).pin_memory()
+            self._flashmla_sid_gpu = torch.zeros(
+                max_graph_N, dtype=torch.long, device=primary_dev)
+            self._flashmla_sl_staging = torch.zeros(
+                max_graph_N, dtype=torch.int32).pin_memory()
 
         for N in total_token_sizes:
             self.reset()
@@ -2890,6 +2903,7 @@ class MoEEngine:
                     graph_dict['mla_buffers'] = {
                         gpu_idx: {
                             'q_nope_buf': pp_bufs[gpu_idx]['q_nope_buf'],
+                            'q_fused_buf': pp_bufs[gpu_idx]['q_fused_buf'],
                             'q_pe_buf': pp_bufs[gpu_idx]['q_pe_buf'],
                             'q_absorbed_buf': pp_bufs[gpu_idx]['q_absorbed_buf'],
                             'attn_latent_buf': pp_bufs[gpu_idx]['attn_latent_buf'],
@@ -3054,6 +3068,7 @@ class MoEEngine:
                     # Save MLA buffers explicitly to prevent GC
                     graph_dict['mla_buffers'] = {
                         'q_nope_buf': bufs['q_nope_buf'],
+                        'q_fused_buf': bufs['q_fused_buf'],
                         'q_pe_buf': bufs['q_pe_buf'],
                         'q_absorbed_buf': bufs['q_absorbed_buf'],
                         'attn_latent_buf': bufs['attn_latent_buf'],
@@ -3292,26 +3307,42 @@ class MoEEngine:
             for sid in decode_seq_ids:
                 self._seq_lens_cpu[sid] += 1
             if self.is_mla and _HAS_FLASHMLA:
-                # FlashMLA: copy block_table + seqlens to pre-allocated GPU buffers
-                sid_cpu = torch.tensor(decode_seq_ids, dtype=torch.long)
+                # FlashMLA: copy block_table + seqlens using pre-allocated buffers
+                sid_buf = self._flashmla_sid_cpu
+                for i, sid in enumerate(decode_seq_ids):
+                    sid_buf[i] = sid
+                sid_sl = sid_buf[:D]
+
+                # Gather seqlens on CPU into pinned staging buffer
+                torch.index_select(self._seq_lens_cpu, 0, sid_sl,
+                                   out=self._flashmla_sl_staging[:D])
+
                 if pp:
                     for gpu_idx in range(self.pp_size):
                         fm = info['pp_flashmla'][gpu_idx]
-                        bt = self.block_table[gpu_idx]
-                        fm['seqlens'][:D] = self._seq_lens_cpu[sid_cpu].to(
-                            torch.int32).to(fm['seqlens'].device)
+                        fm['seqlens'][:D].copy_(
+                            self._flashmla_sl_staging[:D], non_blocking=True)
                         if D < graph_N:
                             fm['seqlens'][D:].zero_()
-                        fm['block_table'][:D] = bt[sid_cpu.to(bt.device)]
+                        # Copy sid to GPU, gather block_table rows
+                        self._flashmla_sid_gpu[:D].copy_(sid_sl, non_blocking=True)
+                        torch.index_select(
+                            self.block_table[gpu_idx], 0,
+                            self._flashmla_sid_gpu[:D],
+                            out=fm['block_table'][:D])
                         if D < graph_N:
                             fm['block_table'][D:].zero_()
                 else:
-                    info['flashmla_seqlens'][:D] = self._seq_lens_cpu[
-                        sid_cpu].to(torch.int32).to(self.device)
+                    # Seqlens: pinned H2D copy
+                    info['flashmla_seqlens'][:D].copy_(
+                        self._flashmla_sl_staging[:D], non_blocking=True)
                     if D < graph_N:
                         info['flashmla_seqlens'][D:].zero_()
-                    info['flashmla_block_table'][:D] = self.block_table[
-                        sid_cpu.to(self.device)]
+                    # Sid to GPU + gather block_table via index_select
+                    self._flashmla_sid_gpu[:D].copy_(sid_sl, non_blocking=True)
+                    torch.index_select(
+                        self.block_table, 0, self._flashmla_sid_gpu[:D],
+                        out=info['flashmla_block_table'][:D])
                     if D < graph_N:
                         info['flashmla_block_table'][D:].zero_()
             elif self.is_mla:
@@ -3486,10 +3517,9 @@ class MoEEngine:
                 # MLA: Stage 2 (decode) using FlashMLA + Stage 3a (prefill)
                 if D > 0 and _HAS_FLASHMLA:
                     if _nvtx: torch.cuda.nvtx.range_push("stage2_mla")
-                    # FlashMLA: fuse q_absorbed + q_pe, padded batch
-                    q_fused = torch.cat(
-                        [buf['q_absorbed_buf'], buf['q_pe_buf']],
-                        dim=-1).unsqueeze(1)  # [graph_N, 1, H, 576]
+                    # q_fused_buf is already [graph_N, H, 576] with q_absorbed
+                    # and q_pe as contiguous views — no torch.cat needed
+                    q_fused = buf['q_fused_buf'].unsqueeze(1)  # [graph_N, 1, H, 576]
                     if pp:
                         gpu_idx = self.pp_layer_gpu[layer]
                         fm = info['pp_flashmla'][gpu_idx]

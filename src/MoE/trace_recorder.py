@@ -53,6 +53,7 @@ class TraceRecorder:
             'step': self._step,
             'layer': layer,
             'expert_ids': unique_experts,
+            'topk_ids': ids,
         })
         if self.record_router_inputs and router_input_buf is not None:
             self._router_inputs.append({

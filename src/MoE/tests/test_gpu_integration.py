@@ -528,20 +528,39 @@ def test_replay_faithfulness(engine, page_size=16):
     else:
         routing_ok, n_mismatch = replayed.compare_routing(collection_trace)
         if not routing_ok:
-            # Print first few mismatches for debugging
             count = 0
             for i, (rt, ct) in enumerate(
                     zip(replayed.trace_data, collection_trace)):
                 if rt['expert_ids'] != ct['expert_ids']:
                     if count < 5:
-                        print(f"  ROUTING MISMATCH step {rt['step']} "
+                        print(f"  ROUTING SET MISMATCH step {rt['step']} "
                               f"layer {rt['layer']}: replay={rt['expert_ids']} "
                               f"vs collection={ct['expert_ids']}")
                     count += 1
-            print(f"  {n_mismatch}/{len(collection_trace)} routing mismatches")
+            print(f"  {n_mismatch}/{len(collection_trace)} routing set mismatches")
             passed = False
         else:
-            print(f"  Expert routing: {len(collection_trace)} entries all match")
+            print(f"  Expert routing sets: {len(collection_trace)} entries all match")
+
+        # Per-token routing check (topk_ids per token, not just unique sets)
+        tok_routing_ok, tok_n_mismatch = replayed.compare_per_token_routing(
+            collection_trace)
+        if not tok_routing_ok:
+            count = 0
+            for i, (rt, ct) in enumerate(
+                    zip(replayed.trace_data, collection_trace)):
+                if rt.get('topk_ids') != ct.get('topk_ids'):
+                    if count < 5:
+                        print(f"  PER-TOKEN ROUTING MISMATCH step {rt['step']} "
+                              f"layer {rt['layer']}: "
+                              f"replay topk_ids={rt.get('topk_ids', '?')}, "
+                              f"collection topk_ids={ct.get('topk_ids', '?')}")
+                    count += 1
+            print(f"  {tok_n_mismatch}/{len(collection_trace)} "
+                  f"per-token routing mismatches")
+            passed = False
+        else:
+            print(f"  Per-token routing: {len(collection_trace)} entries all match")
 
     # Phase 5: Compare output tokens
     tokens_ok, token_mismatches = replayed.compare_tokens(collected)
@@ -552,13 +571,13 @@ def test_replay_faithfulness(engine, page_size=16):
         n = min(len(collected_toks), len(replayed_toks))
         if rid in token_mismatches:
             first_diff = token_mismatches[rid]
-            print(f"  TOKEN MISMATCH conv {conv['conversation_id']}: "
+            print(f"  OUTPUT TOKEN MISMATCH conv {conv['conversation_id']}: "
                   f"first diff at token {first_diff} "
                   f"(collected={collected_toks[first_diff]}, "
                   f"replayed={replayed_toks[first_diff]})")
             passed = False
         else:
-            print(f"  Tokens conv {conv['conversation_id']}: "
+            print(f"  Output tokens conv {conv['conversation_id']}: "
                   f"{n} tokens match")
 
     print(f"  Result: {'PASS' if passed else 'FAIL'}")
@@ -680,14 +699,34 @@ def test_replay_faithfulness_with_preemption(engine, kv_page_budget, page_size=1
                     zip(replayed.trace_data, collection_trace)):
                 if rt['expert_ids'] != ct['expert_ids']:
                     if count < 5:
-                        print(f"  ROUTING MISMATCH step {rt['step']} "
+                        print(f"  ROUTING SET MISMATCH step {rt['step']} "
                               f"layer {rt['layer']}: replay={rt['expert_ids']} "
                               f"vs collection={ct['expert_ids']}")
                     count += 1
-            print(f"  {n_mismatch}/{len(collection_trace)} routing mismatches")
+            print(f"  {n_mismatch}/{len(collection_trace)} routing set mismatches")
             passed = False
         else:
-            print(f"  Expert routing: {len(collection_trace)} entries all match")
+            print(f"  Expert routing sets: {len(collection_trace)} entries all match")
+
+        # Per-token routing check
+        tok_routing_ok, tok_n_mismatch = replayed.compare_per_token_routing(
+            collection_trace)
+        if not tok_routing_ok:
+            count = 0
+            for i, (rt, ct) in enumerate(
+                    zip(replayed.trace_data, collection_trace)):
+                if rt.get('topk_ids') != ct.get('topk_ids'):
+                    if count < 5:
+                        print(f"  PER-TOKEN ROUTING MISMATCH step {rt['step']} "
+                              f"layer {rt['layer']}: "
+                              f"replay topk_ids={rt.get('topk_ids', '?')}, "
+                              f"collection topk_ids={ct.get('topk_ids', '?')}")
+                    count += 1
+            print(f"  {tok_n_mismatch}/{len(collection_trace)} "
+                  f"per-token routing mismatches")
+            passed = False
+        else:
+            print(f"  Per-token routing: {len(collection_trace)} entries all match")
 
     # Phase 5: Compare output tokens
     tokens_ok, token_mismatches = replayed.compare_tokens(collected)
@@ -698,12 +737,12 @@ def test_replay_faithfulness_with_preemption(engine, kv_page_budget, page_size=1
         n = min(len(collected_toks), len(replayed_toks))
         if rid in token_mismatches:
             first_diff = token_mismatches[rid]
-            print(f"  TOKEN MISMATCH conv {conv['conversation_id']}: "
+            print(f"  OUTPUT TOKEN MISMATCH conv {conv['conversation_id']}: "
                   f"first diff at token {first_diff}")
             passed = False
         else:
             preempt_count = conv['num_preemptions']
-            print(f"  Tokens conv {conv['conversation_id']}: "
+            print(f"  Output tokens conv {conv['conversation_id']}: "
                   f"{n} tokens match "
                   f"(preemptions={preempt_count})")
 

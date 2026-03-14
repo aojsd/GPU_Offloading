@@ -1170,13 +1170,33 @@ class ReplayResult:
         return (len(mismatches) == 0, mismatches)
 
     def compare_routing(self, collection_trace: list[dict]) -> tuple[bool, int]:
-        """Compare expert routing. Returns (all_match, mismatch_count)."""
+        """Compare expert routing (unique expert sets).
+
+        Returns (all_match, mismatch_count).
+        """
         if self.trace_data is None:
             raise ValueError("No trace_data — replay() was called without "
                              "record_routing=True")
         count = 0
         for rt, ct in zip(self.trace_data, collection_trace):
             if rt['expert_ids'] != ct['expert_ids']:
+                count += 1
+        return (count == 0, count)
+
+    def compare_per_token_routing(
+        self, collection_trace: list[dict],
+    ) -> tuple[bool, int]:
+        """Compare per-token expert routing (topk_ids per token).
+
+        Returns (all_match, mismatch_count). Requires both traces to have
+        'topk_ids' keys (recorded by TraceRecorder).
+        """
+        if self.trace_data is None:
+            raise ValueError("No trace_data — replay() was called without "
+                             "record_routing=True")
+        count = 0
+        for rt, ct in zip(self.trace_data, collection_trace):
+            if rt.get('topk_ids') != ct.get('topk_ids'):
                 count += 1
         return (count == 0, count)
 

@@ -200,10 +200,13 @@ def test_multiple_no_preemption(engine, page_size=16):
                        engine.total_pages * page_size - prompt_lens[ridx])
         actual = len(conv['output_token_ids'])
         preemptions += conv['num_preemptions']
-        ok = (actual == expected)
+        hit_eos = conv.get('hit_eos', False)
+        ok = (actual == expected) or (hit_eos and actual < expected)
         if not ok:
             print(f"  FAIL: conv {ridx}: expected {expected} tokens, got {actual}")
             passed = False
+        elif hit_eos and actual < expected:
+            print(f"  conv {ridx}: hit EOS at token {actual} (max was {expected})")
 
     print(f"  Conversations: {len(conversations)}, all completed: {passed}")
     print(f"  Total preemptions: {preemptions} (expected 0)")
@@ -251,10 +254,13 @@ def test_with_preemption(engine, kv_page_budget, page_size=16):
                        kv_page_budget * page_size - prompt_lens[ridx])
         actual = len(conv['output_token_ids'])
         total_preemptions += conv['num_preemptions']
-        ok = (actual == expected)
+        hit_eos = conv.get('hit_eos', False)
+        ok = (actual == expected) or (hit_eos and actual < expected)
         if not ok:
             print(f"  FAIL: conv {ridx}: expected {expected} tokens, got {actual}")
             passed = False
+        elif hit_eos and actual < expected:
+            print(f"  conv {ridx}: hit EOS at token {actual} (max was {expected})")
 
     print(f"  Conversations: {len(conversations)}, all completed: {passed}")
     print(f"  Total preemptions: {total_preemptions}")

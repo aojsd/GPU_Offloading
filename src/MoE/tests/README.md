@@ -45,7 +45,7 @@ python tests/test_gpu_integration.py --model ../../models/Mixtral-8x7B --pp 2
 | `test_piecewise_prefill.py` | yes | **no** | Tests 2-3 use `experts_per_layer` (offloading) |
 | `test_offload_correctness.py` | yes | **no** | Tests 2-3 use `experts_per_layer` (offloading) |
 | `test_pipeline_parallel.py` | **no** | 2x H100 | Compares PP=2 vs single-GPU offloaded; needs full Mixtral |
-| `test_pcie_contention.py` | **no** | **no** | Hardcoded Mixtral-8x7B single-GPU offloading benchmark |
+| `test_pcie_contention.py` | — | — | Removed; replaced by `system_profiling/profile_interconnect.py` |
 | `verify_expert_residency.py` | **no** | **no** | Hardcoded Mixtral-8x7B offloading validation |
 | `verify_unified_cache.py` | **no** | **no** | Hardcoded Mixtral-8x7B offloading validation |
 
@@ -288,13 +288,6 @@ single-GPU offloaded, which requires a model too large for one GPU.
 python tests/test_pipeline_parallel.py --model ../../models/Mixtral-8x7B
 ```
 
-#### `test_pcie_contention.py` — PCIe bandwidth contention (Mixtral single-GPU only)
-
-Hardcoded Mixtral-8x7B single-GPU offloading benchmark measuring PCIe
-transfer overlap with MoE compute. No CLI args.
-
-**Not applicable to OLMoE or PP=2.**
-
 ### GPU verification (standalone scripts)
 
 #### `verify_expert_residency.py` — Demand loading validation
@@ -317,6 +310,7 @@ Test 2 (20L): Compares all-resident unified cache vs no offloading.
 - [profiling/](../profiling/) — Nsight Systems and per-phase kernel profiling
 - [scripts/](../scripts/) — Experiment runners
 - [vLLM_comparison/](vLLM_comparison/) — Custom engine vs vLLM benchmarks
+- [system_profiling/](../../../system_profiling/) — PCIe/NVLink bandwidth and cross-contention profiling
 
 ## Models
 

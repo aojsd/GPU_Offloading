@@ -4,10 +4,13 @@
 # Each fraction constrains KV budget to match single-GPU replay memory.
 #
 # Auto-detects GPU configuration:
-#   - Multi-GPU (H100):  PP=NUM_GPUS, cache fractions 0.6/0.7/0.8
-#   - Single large GPU (GH200): experts-per-layer offloading, fractions 0.7/0.8/0.9
+#   - Multi-GPU (H100):  PP=NUM_GPUS, default cache percents 60,70,80
+#   - Single large GPU (GH200): experts-per-layer offloading, default 70,80,90
 #
-# Usage: bash scripts/01_collect_traces.sh [NUM_CONVERSATIONS]
+# Usage:
+#   bash scripts/01_collect_traces.sh                          # auto-detect defaults
+#   bash scripts/01_collect_traces.sh --cache-pct 70,80,90     # explicit sweep
+#   bash scripts/01_collect_traces.sh --cache-pct 85 -n 100    # single point, 100 convos
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
@@ -16,9 +19,19 @@ MODEL=${MODEL:-../../models/Mixtral-8x7B}
 MODEL_TAG=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
 DATASET=../../datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json
 OUTPUT_BASE=../../datasets/ShareGPT_Vicuna/expert_traces/${MODEL_TAG}
-NUM_CONVERSATIONS=${1:-200}
+NUM_CONVERSATIONS=200
 MAX_OUTPUT_TOKENS=4096
 MAX_SEQS=32
+
+# Parse args
+USER_CACHE_PCTS=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cache-pct) USER_CACHE_PCTS="$2"; shift 2 ;;
+        -n)          NUM_CONVERSATIONS="$2"; shift 2 ;;
+        *)           echo "Unknown arg: $1"; exit 1 ;;
+    esac
+done
 
 # Detect GPUs
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
@@ -42,13 +55,17 @@ echo "GPU memory: ${GPU_MEM_GB} GB, ${NUM_GPUS} GPU(s)"
 if [ "$NUM_GPUS" -eq 1 ] && [ "$GPU_MEM_GB" -ge 90 ]; then
     MODE="offload"
     EPL=5  # experts_per_layer: keeps ~57GB of experts on GPU, leaves room for KV
-    CACHE_FRACTIONS="0.7 0.8 0.9"
-    echo "Mode: single-GPU offloading (epl=$EPL), fractions: $CACHE_FRACTIONS"
+    DEFAULT_CACHE_PCTS="70,80,90"
 else
     MODE="pp"
-    CACHE_FRACTIONS="0.6 0.7 0.8"
-    echo "Mode: pipeline parallel (PP=$NUM_GPUS), fractions: $CACHE_FRACTIONS"
+    DEFAULT_CACHE_PCTS="60,70,80"
 fi
+
+# Use user-specified cache percents or defaults
+CACHE_PCTS="${USER_CACHE_PCTS:-$DEFAULT_CACHE_PCTS}"
+# Convert comma-separated percents to space-separated fractions
+CACHE_FRACTIONS=$(python3 -c "print(' '.join(str(int(p)/100) for p in '${CACHE_PCTS}'.split(',')))")
+echo "Mode: ${MODE}, cache percents: ${CACHE_PCTS}, fractions: ${CACHE_FRACTIONS}"
 
 for frac in $CACHE_FRACTIONS; do
     pct=$(python3 -c "v=$frac*100; print(int(v) if v==int(v) else f'{v:g}')")

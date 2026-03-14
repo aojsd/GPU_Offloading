@@ -9,9 +9,10 @@
 # Each (policy_group, cache%) job is dispatched to the next free GPU.
 #
 # Usage:
-#   bash scripts/03_gpu_replay.sh                    # auto-detect GPUs
-#   bash scripts/03_gpu_replay.sh --cache-pct 80     # single cache%
-#   bash scripts/03_gpu_replay.sh --resume           # skip completed jobs
+#   bash scripts/03_gpu_replay.sh                        # auto-detect GPUs + cache%
+#   bash scripts/03_gpu_replay.sh --cache-pct 70,80,90   # specific cache percents
+#   bash scripts/03_gpu_replay.sh --cache-pct 80         # single cache%
+#   bash scripts/03_gpu_replay.sh --resume               # skip completed jobs
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
@@ -30,16 +31,34 @@ POLICY_GROUPS=(
 )
 GROUP_NAMES=("SF" "Belady" "LFU" "LRU")
 
-# Cache percentages: auto-detect from existing trace directories
-CACHE_PCTS=()
-for d in "$TRACE_BASE"/cache*pct; do
-    [ -d "$d" ] || continue
-    [ -f "$d/batched_trace.json" ] || continue
-    pct="${d##*/}"            # cache80pct
-    pct="${pct#cache}"        # 80pct
-    pct="${pct%pct}"          # 80
-    CACHE_PCTS+=("$pct")
+# Results directory for resume checking
+RESULTS_TMP="../../results/MoE/mixtral-8x7B/tmp"
+
+# Parse args
+USER_CACHE_PCTS=""
+RESUME=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cache-pct) USER_CACHE_PCTS="$2"; shift 2 ;;
+        --resume)    RESUME=1; shift ;;
+        *)           echo "Unknown arg: $1"; exit 1 ;;
+    esac
 done
+
+# Cache percentages: use user-specified or auto-detect from existing trace directories
+if [ -n "$USER_CACHE_PCTS" ]; then
+    IFS=',' read -ra CACHE_PCTS <<< "$USER_CACHE_PCTS"
+else
+    CACHE_PCTS=()
+    for d in "$TRACE_BASE"/cache*pct; do
+        [ -d "$d" ] || continue
+        [ -f "$d/batched_trace.json" ] || continue
+        pct="${d##*/}"            # cache80pct
+        pct="${pct#cache}"        # 80pct
+        pct="${pct%pct}"          # 80
+        CACHE_PCTS+=("$pct")
+    done
+fi
 # Sort descending (highest cache% first = fastest jobs first)
 IFS=$'\n' CACHE_PCTS=($(printf '%s\n' "${CACHE_PCTS[@]}" | sort -rn)); unset IFS
 if [ ${#CACHE_PCTS[@]} -eq 0 ]; then
@@ -48,27 +67,6 @@ if [ ${#CACHE_PCTS[@]} -eq 0 ]; then
     exit 1
 fi
 echo "Cache percentages: ${CACHE_PCTS[*]}"
-
-# Results directory for resume checking
-RESULTS_TMP="../../results/MoE/mixtral-8x7B/tmp"
-
-# Parse args
-SINGLE_PCT=""
-RESUME=0
-for arg in "$@"; do
-    if [ "$arg" = "--cache-pct" ]; then
-        shift_next=1
-        continue
-    fi
-    if [ "$arg" = "--resume" ]; then
-        RESUME=1
-        continue
-    fi
-    if [ "${shift_next:-}" = "1" ]; then
-        SINGLE_PCT="$arg"
-        shift_next=0
-    fi
-done
 
 # Detect GPUs
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
@@ -99,20 +97,6 @@ if cs is None:
 print(cs)
 "
 }
-
-# Single cache% mode (all policies)
-if [ -n "$SINGLE_PCT" ]; then
-    echo "Running single cache% = $SINGLE_PCT"
-    CS=$(get_cache_size "$SINGLE_PCT")
-    python3 -u scripts/batched_replay.py \
-        --model "$MODEL" \
-        --trace-dir "$TRACE_BASE/cache${SINGLE_PCT}pct" \
-        --batched-trace "$TRACE_BASE/cache${SINGLE_PCT}pct/batched_trace.json" \
-        --cache-size "$CS" \
-        --warmup-steps "$WARMUP" \
-        --output-dir "$RESULTS_TMP"
-    exit 0
-fi
 
 # Pre-check: all trace dirs exist and have cache_size
 declare -A CACHE_SIZE_MAP

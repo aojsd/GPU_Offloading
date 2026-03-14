@@ -11,8 +11,9 @@ Usage:
     # Parallel (one process per cache%):
     python scripts/run_all_policies.py --parallel
 
-    # Single cache%:
+    # Single or multiple cache%:
     python scripts/run_all_policies.py --cache-pct 85
+    python scripts/run_all_policies.py --cache-pct 70,80,90
 """
 
 import argparse
@@ -167,8 +168,9 @@ def main():
                     "batched_replay.py or 03_gpu_replay.sh.")
     parser.add_argument("--parallel", action="store_true",
                         help="Run cache%% simulations in parallel processes")
-    parser.add_argument("--cache-pct", type=int, default=None,
-                        help="Run only this cache%% (default: all)")
+    parser.add_argument("--cache-pct", type=str, default=None,
+                        help="Cache percents to simulate, comma-separated "
+                             "(e.g. 70,80,90). Default: all auto-detected.")
     parser.add_argument("--model", type=str, default=None,
                         help="Path to model directory (used to derive trace "
                              "base directory, default: ../../models/Mixtral-8x7B)")
@@ -183,7 +185,7 @@ def main():
         CACHE_PCTS = _auto_detect_cache_pcts() or [80, 70, 60]
 
     if args.cache_pct is not None:
-        CACHE_PCTS = [args.cache_pct]
+        CACHE_PCTS = [int(p) for p in args.cache_pct.split(",")]
 
     run_simulations(parallel=args.parallel)
 

@@ -153,20 +153,55 @@ def _cosine_sim_sparse(full_logits_cpu, logprobs_dict):
     return torch.nn.functional.cosine_similarity(custom_vals, vllm_vals).item()
 
 
+def _cosine_sim_full_vocab(custom_logits_cpu, vllm_full_logprobs_cpu):
+    """Full-vocabulary cosine similarity between custom logits and vLLM logprobs.
+
+    custom_logits_cpu: [vocab] raw logits from custom engine (float32 CPU)
+    vllm_full_logprobs_cpu: [vocab] log-probabilities from vLLM (float32 CPU)
+
+    Applies log_softmax to custom logits so both vectors are in log-prob space,
+    then computes cosine similarity over the full vocabulary.
+    """
+    custom_log_probs = torch.log_softmax(custom_logits_cpu, dim=-1)
+    return torch.nn.functional.cosine_similarity(
+        custom_log_probs.unsqueeze(0),
+        vllm_full_logprobs_cpu.unsqueeze(0)).item()
+
+
 def _vllm_correctness_subprocess(model_path, prompts, max_new_tokens,
-                                  async_sched=False):
+                                  async_sched=False, full_logprobs=False):
     """Run vLLM greedy generation in a subprocess to avoid GPU memory leaks.
 
     Returns dict: {prompt_idx: {"tokens": [...], "logprobs": [...]}}
     where each logprobs entry is a dict {token_id_str: logprob_value}.
+
+    If full_logprobs=True, also returns full-vocabulary log-probability tensors
+    saved via torch.save.  Each entry gets an additional key
+    "full_logprobs": list of [vocab_size] float32 CPU tensors.
     """
     import tempfile
     out_file = tempfile.mktemp(suffix=".json", prefix="vllm_correctness_")
     prompts_file = tempfile.mktemp(suffix=".json", prefix="vllm_prompts_")
+    full_logprobs_file = tempfile.mktemp(suffix=".pt", prefix="vllm_full_lp_")
 
     # Write prompts to temp file
     with open(prompts_file, "w") as f:
         json.dump(prompts, f)
+
+    # Build logprobs count: full vocab or top-20
+    logprobs_setup = ""
+    if full_logprobs:
+        logprobs_setup = f"""
+from transformers import AutoConfig
+_cfg = AutoConfig.from_pretrained("{model_path}")
+_vocab_size = _cfg.vocab_size
+_num_logprobs = _vocab_size
+"""
+    else:
+        logprobs_setup = """
+_vocab_size = None
+_num_logprobs = 20
+"""
 
     script = f'''
 import os
@@ -176,10 +211,12 @@ import json
 import torch
 from vllm import LLM, SamplingParams
 
+{logprobs_setup}
+
 with open("{prompts_file}") as f:
     prompts = json.load(f)
 
-llm = LLM(
+llm_kwargs = dict(
     model="{model_path}",
     max_model_len=4096,
     max_num_seqs=64,
@@ -188,6 +225,10 @@ llm = LLM(
     enable_prefix_caching=False,
     async_scheduling={async_sched},
 )
+if _vocab_size is not None:
+    llm_kwargs["max_logprobs"] = _vocab_size
+
+llm = LLM(**llm_kwargs)
 
 sp_warmup = SamplingParams(max_tokens=10, temperature=0)
 for j in range(3):
@@ -195,25 +236,45 @@ for j in range(3):
     llm.generate([{{"prompt_token_ids": warmup_ids}}], sampling_params=sp_warmup)
 
 results = {{}}
+full_lp_data = {{}}
 for i, prompt_ids in enumerate(prompts):
-    sp = SamplingParams(max_tokens={max_new_tokens}, temperature=0, logprobs=20)
+    sp = SamplingParams(max_tokens={max_new_tokens}, temperature=0,
+                        logprobs=_num_logprobs)
     out = llm.generate([{{"prompt_token_ids": prompt_ids}}], sampling_params=sp)
     tokens = list(out[0].outputs[0].token_ids)
+
     logprobs_per_step = []
+    full_logprobs_per_step = []
     if out[0].outputs[0].logprobs is not None:
         for step_lp in out[0].outputs[0].logprobs:
+            # Sparse dict (top-20 for JSON)
+            top_items = sorted(step_lp.items(), key=lambda x: -x[1].logprob)[:20]
             logprobs_per_step.append(
-                {{str(tid): lp.logprob for tid, lp in step_lp.items()}})
+                {{str(tid): lp.logprob for tid, lp in top_items}})
+            # Full-vocab tensor (if requested)
+            if _vocab_size is not None:
+                lp_tensor = torch.full((_vocab_size,), float('-inf'),
+                                       dtype=torch.float32)
+                for tid, lp in step_lp.items():
+                    lp_tensor[tid] = lp.logprob
+                full_logprobs_per_step.append(lp_tensor)
+
     results[i] = {{"tokens": tokens, "logprobs": logprobs_per_step}}
+    if full_logprobs_per_step:
+        full_lp_data[i] = full_logprobs_per_step
 
 with open("{out_file}", "w") as f:
     json.dump(results, f)
+
+if full_lp_data:
+    torch.save(full_lp_data, "{full_logprobs_file}")
 '''
     script_file = tempfile.mktemp(suffix=".py", prefix="vllm_sub_")
     with open(script_file, "w") as f:
         f.write(script)
 
-    print("  Running vLLM in subprocess...")
+    print("  Running vLLM in subprocess"
+          + (" (with full logprobs)" if full_logprobs else "") + "...")
     result = subprocess.run(
         [sys.executable, script_file],
         capture_output=True, text=True, timeout=600)
@@ -228,8 +289,13 @@ with open("{out_file}", "w") as f:
     with open(out_file) as f:
         raw = json.load(f)
 
+    # Load full logprobs if available
+    vllm_full_lp = {}
+    if full_logprobs and os.path.exists(full_logprobs_file):
+        vllm_full_lp = torch.load(full_logprobs_file, weights_only=True)
+
     # Clean up temp files
-    for p in (script_file, prompts_file, out_file):
+    for p in (script_file, prompts_file, out_file, full_logprobs_file):
         try:
             os.remove(p)
         except OSError:
@@ -242,7 +308,10 @@ with open("{out_file}", "w") as f:
         logprobs = []
         for step_lp in data["logprobs"]:
             logprobs.append({int(tid): val for tid, val in step_lp.items()})
-        parsed[idx] = {"tokens": data["tokens"], "logprobs": logprobs}
+        entry = {"tokens": data["tokens"], "logprobs": logprobs}
+        if idx in vllm_full_lp:
+            entry["full_logprobs"] = vllm_full_lp[idx]
+        parsed[idx] = entry
 
     return parsed
 
@@ -1044,6 +1113,7 @@ def cmd_decode(args):
     custom_forced_logits = {}  # full logits from forced decode (for cosine sim)
     vllm_tokens = {}
     vllm_logprobs = {}
+    vllm_full_logprobs = {}    # full-vocab log-prob tensors from vLLM
     vllm_gen_ms = {}
     custom_perf = {}
     vllm_perf = {}
@@ -1056,11 +1126,15 @@ def cmd_decode(args):
         print("=" * 70)
         vllm_sub_results = _vllm_correctness_subprocess(
             args.model, correctness_prompts, MAX_NEW_TOKENS,
-            async_sched=args.async_sched)
+            async_sched=args.async_sched, full_logprobs=True)
         for idx, data in vllm_sub_results.items():
             vllm_tokens[idx] = data["tokens"]
             vllm_logprobs[idx] = data["logprobs"]
-            print(f"  Prompt {idx}: {len(data['tokens'])} tokens generated")
+            if "full_logprobs" in data:
+                vllm_full_logprobs[idx] = data["full_logprobs"]
+            print(f"  Prompt {idx}: {len(data['tokens'])} tokens generated"
+                  + (f", {len(data.get('full_logprobs', []))} full-vocab steps"
+                     if 'full_logprobs' in data else ""))
         print()
 
     if run_custom:
@@ -1297,7 +1371,7 @@ def cmd_decode(args):
 
     # Cosine similarity: forced decode (custom engine followed vLLM tokens)
     if run_correctness and custom_forced_logits and vllm_logprobs:
-        print("\n── Cosine Similarity (forced decode, custom followed vLLM tokens) ──")
+        print("\n── Cosine Similarity: Sparse (forced decode, top-20 positions) ──")
         print("  log_softmax(custom) vs vLLM logprobs at vLLM's top-20 positions")
         for i in sorted(custom_forced_logits):
             fl = custom_forced_logits[i]
@@ -1306,6 +1380,33 @@ def cmd_decode(args):
             cos_sims = []
             for s in range(n_steps):
                 sim = _cosine_sim_sparse(fl[s], vl[s])
+                cos_sims.append(sim)
+
+            if cos_sims:
+                mean_sim = sum(cos_sims) / len(cos_sims)
+                min_sim = min(cos_sims)
+                min_idx = cos_sims.index(min_sim)
+                print(f"  Prompt {i}: {n_steps} steps, "
+                      f"mean={mean_sim:.6f}, min={min_sim:.6f} (step {min_idx})")
+                show_steps = [0, n_steps // 4, n_steps // 2,
+                              3 * n_steps // 4, n_steps - 1]
+                show_steps = sorted(set(s for s in show_steps if 0 <= s < n_steps))
+                detail = "    "
+                for s in show_steps:
+                    detail += f"step {s}={cos_sims[s]:.4f}  "
+                print(detail)
+
+    # Full-vocabulary cosine similarity: forced decode
+    if run_correctness and custom_forced_logits and vllm_full_logprobs:
+        print("\n── Cosine Similarity: Full Vocab (forced decode) ──")
+        print("  log_softmax(custom_logits) vs vLLM full log-probs, all vocab positions")
+        for i in sorted(custom_forced_logits):
+            fl = custom_forced_logits[i]
+            vfl = vllm_full_logprobs.get(i, [])
+            n_steps = min(len(fl), len(vfl))
+            cos_sims = []
+            for s in range(n_steps):
+                sim = _cosine_sim_full_vocab(fl[s], vfl[s])
                 cos_sims.append(sim)
 
             if cos_sims:
@@ -1344,11 +1445,17 @@ def _prefill_correctness_custom(engine, prompts):
     return results
 
 
-def _prefill_correctness_vllm(model_path, prompts):
-    """Collect prefill top-1, top-10, and logprobs dict from vLLM."""
-    from vllm import LLM, SamplingParams
+def _prefill_correctness_vllm(model_path, prompts, full_logprobs=False):
+    """Collect prefill top-1, top-10, logprobs dict, and optionally full
+    log-probability vectors from vLLM.
 
-    llm = LLM(
+    Returns list of tuples:
+      (top1, topk_set, sparse_logprobs_dict, full_logprobs_tensor_or_None)
+    """
+    from vllm import LLM, SamplingParams
+    from transformers import AutoConfig
+
+    llm_kwargs = dict(
         model=model_path,
         max_model_len=4096,
         max_num_seqs=64,
@@ -1357,20 +1464,37 @@ def _prefill_correctness_vllm(model_path, prompts):
         enable_prefix_caching=False,
         async_scheduling=False,
     )
+    vocab_size = None
+    if full_logprobs:
+        cfg = AutoConfig.from_pretrained(model_path)
+        vocab_size = cfg.vocab_size
+        llm_kwargs["max_logprobs"] = vocab_size
+
+    num_logprobs = vocab_size if vocab_size else 20
+    llm = LLM(**llm_kwargs)
 
     results = []
     for prompt_ids in prompts:
-        sp = SamplingParams(max_tokens=1, temperature=0, logprobs=20)
+        sp = SamplingParams(max_tokens=1, temperature=0, logprobs=num_logprobs)
         out = llm.generate([{"prompt_token_ids": prompt_ids}],
                            sampling_params=sp)
         top1 = out[0].outputs[0].token_ids[0]
         topk = set()
         logprobs_dict = {}
+        full_lp_tensor = None
         if out[0].outputs[0].logprobs:
-            topk = set(out[0].outputs[0].logprobs[0].keys())
-            logprobs_dict = {tid: lp.logprob
-                             for tid, lp in out[0].outputs[0].logprobs[0].items()}
-        results.append((top1, topk, logprobs_dict))
+            step_lp = out[0].outputs[0].logprobs[0]
+            # Sparse: always keep top-20 for backward compat
+            top_items = sorted(step_lp.items(), key=lambda x: -x[1].logprob)[:20]
+            topk = set(tid for tid, _ in top_items)
+            logprobs_dict = {tid: lp.logprob for tid, lp in top_items}
+            # Full-vocab tensor
+            if vocab_size is not None:
+                full_lp_tensor = torch.full((vocab_size,), float('-inf'),
+                                           dtype=torch.float32)
+                for tid, lp in step_lp.items():
+                    full_lp_tensor[tid] = lp.logprob
+        results.append((top1, topk, logprobs_dict, full_lp_tensor))
 
     del llm
     torch.cuda.empty_cache()
@@ -1398,24 +1522,27 @@ def cmd_prefill(args):
         torch.cuda.empty_cache()
 
         # vLLM second (needs full GPU)
-        vllm_results = _prefill_correctness_vllm(args.model, prompts)
+        vllm_results = _prefill_correctness_vllm(args.model, prompts,
+                                                  full_logprobs=True)
 
         # Compare
         total = len(prompts)
         match = 0
         for i, prompt_ids in enumerate(prompts):
             c_top1, c_topk, c_full_logits = custom_results[i]
-            v_top1, v_topk, v_logprobs = vllm_results[i]
+            v_top1, v_topk, v_logprobs, v_full_lp = vllm_results[i]
             top1_match = c_top1 == v_top1
             topk_overlap = len(c_topk & v_topk) if v_topk else -1
-            cos_sim = _cosine_sim_sparse(c_full_logits, v_logprobs) if v_logprobs else float('nan')
+            sparse_sim = _cosine_sim_sparse(c_full_logits, v_logprobs) if v_logprobs else float('nan')
+            full_sim = _cosine_sim_full_vocab(c_full_logits, v_full_lp) if v_full_lp is not None else float('nan')
             if top1_match:
                 match += 1
             status = "MATCH" if top1_match else "MISMATCH"
             print(f"  Prompt {i} ({len(prompt_ids)} tok): top-1 {status}"
                   f"  (custom={c_top1}, vllm={v_top1})"
                   f"  top-10 overlap={topk_overlap}/10"
-                  f"  cos_sim={cos_sim:.6f}")
+                  f"  cos_sim(sparse)={sparse_sim:.6f}"
+                  f"  cos_sim(full)={full_sim:.6f}")
         print(f"\n  Top-1 match rate: {match}/{total}"
               f" ({match / total * 100:.1f}%)")
 

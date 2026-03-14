@@ -16,9 +16,7 @@ cd "$(dirname "$0")/.."
 source scripts/env.sh
 
 MODEL=${MODEL:-../../models/Mixtral-8x7B}
-MODEL_TAG=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
 DATASET=../../datasets/ShareGPT_Vicuna/ShareGPT_V3_unfiltered_cleaned_split.json
-OUTPUT_BASE=../../datasets/ShareGPT_Vicuna/expert_traces/${MODEL_TAG}
 NUM_CONVERSATIONS=200
 MAX_OUTPUT_TOKENS=4096
 MAX_SEQS=32
@@ -28,10 +26,14 @@ USER_CACHE_PCTS=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --cache-pct) USER_CACHE_PCTS="$2"; shift 2 ;;
+        --model)     MODEL="$2"; shift 2 ;;
         -n)          NUM_CONVERSATIONS="$2"; shift 2 ;;
         *)           echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
+# Re-derive MODEL_TAG after arg parsing (--model may have changed it)
+MODEL_TAG=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
+OUTPUT_BASE=../../datasets/ShareGPT_Vicuna/expert_traces/${MODEL_TAG}
 
 # Detect GPUs
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
@@ -54,7 +56,14 @@ echo "GPU memory: ${GPU_MEM_GB} GB, ${NUM_GPUS} GPU(s)"
 # Multi-GPU (e.g. 2x H100 80GB): use pipeline parallelism
 if [ "$NUM_GPUS" -eq 1 ] && [ "$GPU_MEM_GB" -ge 90 ]; then
     MODE="offload"
-    EPL=5  # experts_per_layer: keeps ~57GB of experts on GPU, leaves room for KV
+    # experts_per_layer ≈ 60% of total experts (enough for collection, leaves room for KV)
+    EPL=$(python3 -c "
+import json, os
+cfg = json.load(open(os.path.join('$MODEL', 'config.json')))
+n_exp = cfg.get('n_routed_experts') or cfg.get('num_local_experts', 8)
+print(round(n_exp * 0.6))
+")
+    echo "experts_per_layer = $EPL (60% of total)"
     DEFAULT_CACHE_PCTS="70,80,90"
 else
     MODE="pp"
@@ -64,7 +73,7 @@ fi
 # Use user-specified cache percents or defaults
 CACHE_PCTS="${USER_CACHE_PCTS:-$DEFAULT_CACHE_PCTS}"
 # Convert comma-separated percents to space-separated fractions
-CACHE_FRACTIONS=$(python3 -c "print(' '.join(str(int(p)/100) for p in '${CACHE_PCTS}'.split(',')))")
+CACHE_FRACTIONS=$(python3 -c "print(' '.join(str(float(p)/100) for p in '${CACHE_PCTS}'.split(',')))")
 echo "Mode: ${MODE}, cache percents: ${CACHE_PCTS}, fractions: ${CACHE_FRACTIONS}"
 
 for frac in $CACHE_FRACTIONS; do

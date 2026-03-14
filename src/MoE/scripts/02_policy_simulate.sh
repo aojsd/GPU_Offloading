@@ -11,16 +11,17 @@ cd "$(dirname "$0")/.."
 source scripts/env.sh
 
 MODEL=${MODEL:-../../models/Mixtral-8x7B}
-MODEL_TAG=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
 
 # Parse args
 CACHE_PCT_ARG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --cache-pct) CACHE_PCT_ARG="$2"; shift 2 ;;
+        --model)     MODEL="$2"; shift 2 ;;
         *)           echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
+MODEL_TAG=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
 
 SIM_ARGS=(--parallel --model "$MODEL")
 if [ -n "$CACHE_PCT_ARG" ]; then

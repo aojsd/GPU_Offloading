@@ -18,9 +18,7 @@ cd "$(dirname "$0")/.."
 source scripts/env.sh
 
 MODEL=${MODEL:-../../models/Mixtral-8x7B}
-MODEL_TAG=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
 WARMUP=100
-TRACE_BASE=../../datasets/ShareGPT_Vicuna/expert_traces/${MODEL_TAG}
 
 # Policy groups in priority order
 POLICY_GROUPS=(
@@ -31,19 +29,21 @@ POLICY_GROUPS=(
 )
 GROUP_NAMES=("SF" "Belady" "LFU" "LRU")
 
-# Results directory for resume checking
-RESULTS_TMP="../../results/MoE/mixtral-8x7B/tmp"
-
 # Parse args
 USER_CACHE_PCTS=""
 RESUME=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --cache-pct) USER_CACHE_PCTS="$2"; shift 2 ;;
+        --model)     MODEL="$2"; shift 2 ;;
         --resume)    RESUME=1; shift ;;
         *)           echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
+# Re-derive MODEL_TAG after arg parsing
+MODEL_TAG=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
+TRACE_BASE=../../datasets/ShareGPT_Vicuna/expert_traces/${MODEL_TAG}
+RESULTS_TMP="../../results/MoE/${MODEL_TAG}/tmp"
 
 # Cache percentages: use user-specified or auto-detect from existing trace directories
 if [ -n "$USER_CACHE_PCTS" ]; then
@@ -142,7 +142,7 @@ done
 echo ""
 
 # Results aggregation: rebuild results_<GPU>.md from all JSONs so far
-RESULTS_DIR="../../results/MoE/mixtral-8x7B"
+RESULTS_DIR="../../results/MoE/${MODEL_TAG}"
 aggregate_results() {
     python3 -c "
 import json, glob, os, sys

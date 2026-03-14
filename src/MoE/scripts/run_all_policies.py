@@ -43,7 +43,8 @@ def _auto_detect_cache_pcts():
         base = os.path.basename(d)
         # Extract number from e.g. "cache70pct"
         try:
-            pct = int(base.replace("cache", "").replace("pct", ""))
+            pct_str = base.replace("cache", "").replace("pct", "")
+            pct = float(pct_str) if '.' in pct_str else int(pct_str)
             if os.path.exists(os.path.join(d, "batched_trace.json")):
                 pcts.append(pct)
         except ValueError:
@@ -185,7 +186,7 @@ def main():
         CACHE_PCTS = _auto_detect_cache_pcts() or [80, 70, 60]
 
     if args.cache_pct is not None:
-        CACHE_PCTS = [int(p) for p in args.cache_pct.split(",")]
+        CACHE_PCTS = [float(p) if '.' in p else int(p) for p in args.cache_pct.split(",")]
 
     run_simulations(parallel=args.parallel)
 

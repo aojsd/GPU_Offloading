@@ -572,11 +572,37 @@ class MoEEngine:
 
         Args:
             hidden_states: [N, H] input hidden states
-            w1: [E, 2*I, H] gate+up fused weights
-            w2: [E, H, I] down projection weights
+            w1: [E_buf, 2*I, H] gate+up fused weights (E_buf = buffer size)
+            w2: [E_buf, H, I] down projection weights
             topk_weights: [N, top_k] routing weights
-            topk_ids: [N, top_k] expert indices (global IDs)
-            expert_map: [E] int32 mapping global expert_id -> cache slot (or None)
+            topk_ids: [N, top_k] expert indices (global IDs, before remap)
+            expert_map: [num_experts] int32 mapping global_expert_id ->
+                buffer slot in [0, E_buf) or -1 (skip).  None when all
+                experts are in w1/w2 with identity indexing.
+
+        global_num_experts semantics (vLLM 0.17.1):
+            fused_experts_impl always calls moe_align_block_size with
+            ignore_invalid_experts=True, which applies expert_map BEFORE
+            token binning.  After remapping, valid IDs are buffer slot
+            indices in [0, E_buf), so the kernel allocates E_buf bins and
+            indexes w1/w2 by slot.  Therefore global_num_experts MUST be
+            w1.size(0) — the buffer dimension — NOT self.num_experts.
+
+            This matters in two cases:
+              - Offloading: w1_buf is [cache_size, ...], expert_map remaps
+                global IDs (0..63) to buffer slots (0..511).
+                global_num_experts = cache_size (512), not num_experts (64).
+                Passing num_experts causes cudaErrorIllegalAddress because
+                the kernel's internal arrays (size 64) overflow on slot
+                indices up to 511.
+              - EP: w1 is [local_E, ...], expert_map remaps global IDs
+                (0..7) to local slots (0..3).
+                global_num_experts = local_E (4) works correctly because
+                remapped IDs are all in [0, local_E).  Passing
+                num_experts (8) also works (extra empty bins) but wastes.
+
+            Empirically verified bit-identical for both values in EP case;
+            crashes with num_experts in offloading case (OLMoE, cache=512).
         """
         kwargs = {}
         if expert_map is not None:

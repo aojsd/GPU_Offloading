@@ -3294,7 +3294,8 @@ class MoEEngine:
         # 2d. Compute slot_mapping on GPU
         slot_2d = primary_buf['static_slot_mapping'].unsqueeze(0)
         _compute_slot_mappings_kernel[(1, N_reqs + 1)](
-            graph_N,
+            N_actual,
+            graph_N,  # max_num_tokens (pad slots [N_actual:] to PAD_ID)
             self._idx_mapping_buf[:N_reqs],
             setup_qsl,
             primary_buf['static_positions'],
@@ -3303,7 +3304,7 @@ class MoEEngine:
             self._block_sizes_tensor,
             slot_2d,
             slot_2d.stride(0),
-            0,
+            0,  # cp_rank (no context parallelism)
             CP_SIZE=1, CP_INTERLEAVE=1,
             PAD_ID=-1, TRITON_BLOCK_SIZE=1024,
         )

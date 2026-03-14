@@ -717,7 +717,8 @@ class Scheduler:
                  'request_idx': r.request_idx,
                  'prompt_token_ids': r.prompt_token_ids,
                  'output_token_ids': r.output_token_ids,
-                 'num_preemptions': r.num_preemptions}
+                 'num_preemptions': r.num_preemptions,
+                 'hit_eos': r.hit_eos}
                 for r in requests
             ],
             trace=recorder.trace,
@@ -834,7 +835,8 @@ class Scheduler:
                         if not free_seq_ids:
                             skipped_admissions += 1
                             continue
-                        sid = free_seq_ids.pop()
+                        sid = min(free_seq_ids)
+                        free_seq_ids.remove(sid)
                         request_to_slot[rid] = sid
                         if rid not in active_requests:
                             active_requests[rid] = {

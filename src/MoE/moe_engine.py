@@ -16,6 +16,7 @@ import math
 from collections import deque
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from pathlib import Path
 from safetensors import safe_open
@@ -61,6 +62,8 @@ if _vllm_so.exists():
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
+from ep_utils import determine_expert_map, local_expert_ids as _local_expert_ids
+from ep_utils import ep_allgather, ep_reducescatter
 
 # Patch moe_align_block_size to remove the 1024-expert-slot limit.
 # This replaces the CUDA kernel with our version that uses a serial scan
@@ -87,6 +90,8 @@ class MoEEngine:
         cache_size: int = None,
         pipeline_parallel_size: int = 1,
         kv_page_budget: int = None,
+        expert_parallel_size: int = 1,
+        expert_placement_strategy: str = "linear",
     ):
         # Resolve to a concrete device with index (e.g. "cuda" -> "cuda:0")
         self.device = torch.device(device)
@@ -119,6 +124,25 @@ class MoEEngine:
         self._pipeline_parallel_size = pipeline_parallel_size
         self.trace_recorder = None  # set to TraceRecorder for PP trace collection
         self._nvtx_enabled = False  # set True for NVTX profiling ranges
+
+        # Expert parallelism
+        self.ep_size = expert_parallel_size
+        self.ep_strategy = expert_placement_strategy
+        if self.ep_size > 1:
+            if not dist.is_initialized():
+                raise RuntimeError(
+                    "EP requires torch.distributed initialized before "
+                    "creating MoEEngine. Launch with torchrun --nproc_per_node=EP.")
+            self.ep_group = dist.new_group(ranks=list(range(self.ep_size)))
+            assert dist.get_world_size() == self.ep_size, (
+                f"EP currently requires world_size == ep_size, got "
+                f"{dist.get_world_size()} vs {self.ep_size}")
+            self.ep_rank = dist.get_rank(self.ep_group)
+            torch.cuda.set_device(self.ep_rank)
+            self.device = torch.device('cuda', self.ep_rank)
+        else:
+            self.ep_rank = 0
+            self.ep_group = None
 
         # Load config
         with open(Path(model_path) / "config.json") as f:
@@ -237,6 +261,28 @@ class MoEEngine:
             self.pp_layer_gpu = None
             self.pp_layer_device = None
             self.pp_boundaries = set()
+
+        # EP validation (after PP setup, before weight loading)
+        if self.ep_size > 1:
+            if self.pp_size > 1:
+                raise ValueError("EP + PP is not yet supported.")
+            if self.offloading:
+                raise ValueError(
+                    "EP + offloading is not yet supported. "
+                    "Use ep_size=1 with offloading, or ep_size>1 without.")
+
+        # EP expert map (needs self.num_experts from config)
+        if self.ep_size > 1:
+            self.local_num_experts, self.ep_expert_map = determine_expert_map(
+                self.ep_size, self.ep_rank, self.num_experts, self.ep_strategy)
+            self.local_expert_ids = _local_expert_ids(
+                self.ep_size, self.ep_rank, self.num_experts, self.ep_strategy)
+            print(f"EP rank {self.ep_rank}/{self.ep_size}: "
+                  f"{self.local_num_experts} local experts "
+                  f"{self.local_expert_ids} (strategy={self.ep_strategy})")
+        else:
+            self.local_num_experts = None
+            self.ep_expert_map = None
 
         # Load weights
         print("Loading weights...")
@@ -556,6 +602,12 @@ class MoEEngine:
             self.offload_engine = None
         self.replay_controller = None  # set to ReplayController for trace replay
 
+        # EP dispatcher setup
+        if self.ep_size > 1:
+            self._ep_expert_map_gpu = self.ep_expert_map.to(self.device)
+        else:
+            self._ep_expert_map_gpu = None
+
         model_type = cfg.get("model_type", "unknown")
         if self.experts_per_layer is not None:
             budget_str = f", experts_per_layer={self.experts_per_layer}"
@@ -563,6 +615,8 @@ class MoEEngine:
             budget_str = f", cache_size={self.cache_size}"
         elif self.pp_size > 1:
             budget_str = f", PP={self.pp_size}"
+        elif self.ep_size > 1:
+            budget_str = f", EP={self.ep_size}"
         else:
             budget_str = ""
         print(f"MoEEngine ready ({model_type}): {self.num_layers}L, "
@@ -588,33 +642,24 @@ class MoEEngine:
                 experts are in w1/w2 with identity indexing.
 
         global_num_experts semantics (vLLM 0.17.1):
-            fused_experts_impl always calls moe_align_block_size with
-            ignore_invalid_experts=True, which applies expert_map BEFORE
-            token binning.  After remapping, valid IDs are buffer slot
-            indices in [0, E_buf), so the kernel allocates E_buf bins and
-            indexes w1/w2 by slot.  Therefore global_num_experts MUST be
-            w1.size(0) — the buffer dimension — NOT self.num_experts.
-
-            This matters in two cases:
-              - Offloading: w1_buf is [cache_size, ...], expert_map remaps
-                global IDs (0..63) to buffer slots (0..511).
-                global_num_experts = cache_size (512), not num_experts (64).
-                Passing num_experts causes cudaErrorIllegalAddress because
-                the kernel's internal arrays (size 64) overflow on slot
-                indices up to 511.
-              - EP: w1 is [local_E, ...], expert_map remaps global IDs
-                (0..7) to local slots (0..3).
-                global_num_experts = local_E (4) works correctly because
-                remapped IDs are all in [0, local_E).  Passing
-                num_experts (8) also works (extra empty bins) but wastes.
-
-            Empirically verified bit-identical for both values in EP case;
-            crashes with num_experts in offloading case (OLMoE, cache=512).
+            fused_experts_impl calls moe_align_block_size which allocates
+            internal arrays of size global_num_experts.  expert_map remaps
+            global IDs to buffer slot indices.  global_num_experts must be
+            >= the largest valid slot index + 1, otherwise the kernel goes
+            OOB.  We use max(num_experts, w1.size(0)):
+              - Offloading: slots reach cache_size-1, w1.size(0)=cache_size
+              - EP: slots are in [0, local_E), but num_experts > local_E
+            Using num_experts in EP also preserves moe_align_block_size
+            binning structure to match EP=1 accumulation order.
         """
         kwargs = {}
         if expert_map is not None:
             kwargs['expert_map'] = expert_map
-            kwargs['global_num_experts'] = w1.size(0)
+            # Must be >= max valid slot index + 1 to avoid kernel OOB.
+            # EP: slots are in [0, local_E), but num_experts > local_E.
+            # Offloading: slots are in [0, cache_size), cache_size > num_experts.
+            # max() covers both.
+            kwargs['global_num_experts'] = max(self.num_experts, w1.size(0))
         return fused_experts(
             hidden_states=hidden_states, w1=w1, w2=w2,
             topk_weights=topk_weights,
@@ -689,7 +734,8 @@ class MoEEngine:
         # When offloading, load to CPU first to avoid GPU OOM on large models.
         # Non-expert weights (~3 GB) move to GPU; expert weights stay on CPU.
         # When PP, also load to CPU first so each layer goes to correct GPU.
-        load_device = ("cpu" if (offloading or self.pp_size > 1)
+        load_device = ("cpu" if (offloading or self.pp_size > 1
+                                  or self.ep_size > 1)
                        else self.device.type)
 
         weights = {}
@@ -944,11 +990,20 @@ class MoEEngine:
                         self.expert_map_abs.append(emap_abs)
                         print(f"  Layer {l}: w1_cpu {w1_full.shape} (unified cache, no pre-load)")
                 else:
-                    self.w1.append(torch.stack(w1_list).to(layer_dev))
-                    self.w2.append(torch.stack(w2_list).to(layer_dev))
-                    print(f"  Layer {l}: w1 {self.w1[-1].shape}, "
-                          f"w2 {self.w2[-1].shape}"
-                          f"{f' ({layer_dev})' if self.pp_size > 1 else ''}")
+                    if self.ep_size > 1:
+                        local_ids = self.local_expert_ids
+                        self.w1.append(torch.stack(
+                            [w1_list[e] for e in local_ids]).to(layer_dev))
+                        self.w2.append(torch.stack(
+                            [w2_list[e] for e in local_ids]).to(layer_dev))
+                        print(f"  Layer {l}: w1 {self.w1[-1].shape} "
+                              f"(EP rank {self.ep_rank}, experts {local_ids})")
+                    else:
+                        self.w1.append(torch.stack(w1_list).to(layer_dev))
+                        self.w2.append(torch.stack(w2_list).to(layer_dev))
+                        print(f"  Layer {l}: w1 {self.w1[-1].shape}, "
+                              f"w2 {self.w2[-1].shape}"
+                              f"{f' ({layer_dev})' if self.pp_size > 1 else ''}")
 
             else:
                 # ORIGINAL code path for OLMoE/Mixtral (UNCHANGED)
@@ -1026,11 +1081,20 @@ class MoEEngine:
                         print(f"  Layer {l}: w1_cpu {w1_full.shape} "
                               f"(unified cache, no pre-load)")
                 else:
-                    self.w1.append(torch.stack(w1_list).to(layer_dev))
-                    self.w2.append(torch.stack(w2_list).to(layer_dev))
-                    print(f"  Layer {l}: w1 {self.w1[-1].shape}, "
-                          f"w2 {self.w2[-1].shape}"
-                          f"{f' ({layer_dev})' if self.pp_size > 1 else ''}")
+                    if self.ep_size > 1:
+                        local_ids = self.local_expert_ids
+                        self.w1.append(torch.stack(
+                            [w1_list[e] for e in local_ids]).to(layer_dev))
+                        self.w2.append(torch.stack(
+                            [w2_list[e] for e in local_ids]).to(layer_dev))
+                        print(f"  Layer {l}: w1 {self.w1[-1].shape} "
+                              f"(EP rank {self.ep_rank}, experts {local_ids})")
+                    else:
+                        self.w1.append(torch.stack(w1_list).to(layer_dev))
+                        self.w2.append(torch.stack(w2_list).to(layer_dev))
+                        print(f"  Layer {l}: w1 {self.w1[-1].shape}, "
+                              f"w2 {self.w2[-1].shape}"
+                              f"{f' ({layer_dev})' if self.pp_size > 1 else ''}")
 
         del weights
         torch.cuda.empty_cache()
@@ -1046,8 +1110,9 @@ class MoEEngine:
             moe_I = self.moe_intermediate_size
             if not offloading:
                 first_moe = self.first_k_dense_replace
-                assert self.w1[first_moe].shape == (self.num_experts, 2 * moe_I, self.hidden_size)
-                assert self.w2[first_moe].shape == (self.num_experts, self.hidden_size, moe_I)
+                expected_E = self.local_num_experts if self.ep_size > 1 else self.num_experts
+                assert self.w1[first_moe].shape == (expected_E, 2 * moe_I, self.hidden_size)
+                assert self.w2[first_moe].shape == (expected_E, self.hidden_size, moe_I)
         elif offloading:
             if self.experts_per_layer is not None:
                 experts_per_layer = self.experts_per_layer
@@ -1057,6 +1122,9 @@ class MoEEngine:
             else:
                 assert self.w1_buf.shape[0] == self.cache_size
             assert self.w1_cpu[0].shape == (self.num_experts, 2 * self.moe_intermediate_size, self.hidden_size)
+        elif self.ep_size > 1:
+            assert self.w1[0].shape == (self.local_num_experts, 2 * self.moe_intermediate_size, self.hidden_size)
+            assert self.w2[0].shape == (self.local_num_experts, self.hidden_size, self.moe_intermediate_size)
         else:
             assert self.w1[0].shape == (self.num_experts, 2 * self.moe_intermediate_size, self.hidden_size)
             assert self.w2[0].shape == (self.num_experts, self.hidden_size, self.moe_intermediate_size)
@@ -2052,10 +2120,32 @@ class MoEEngine:
 
         topk_weights, topk_ids = self._route(hidden, layer)
 
-        expert_map = (self.expert_map[layer]
-                      if self.experts_per_layer is not None else None)
-        hidden = self._moe_experts(hidden, self.w1[layer], self.w2[layer],
-                                   topk_weights, topk_ids, expert_map)
+        if self.ep_size > 1:
+            orig_N = hidden.shape[0]
+            local_N = torch.tensor([orig_N], device=self.device)
+            dist.all_reduce(local_N, op=dist.ReduceOp.MAX,
+                            group=self.ep_group)
+            max_N = int(local_N.item())
+            if orig_N < max_N:
+                pad = max_N - orig_N
+                hidden = F.pad(hidden, (0, 0, 0, pad))
+                topk_weights = F.pad(topk_weights, (0, 0, 0, pad))
+                topk_ids = F.pad(topk_ids, (0, 0, 0, pad))
+
+            gathered_h = ep_allgather(hidden, self.ep_group, self.ep_size)
+            gathered_w = ep_allgather(topk_weights, self.ep_group, self.ep_size)
+            gathered_ids = ep_allgather(
+                topk_ids.to(torch.int32), self.ep_group, self.ep_size)
+            partial = self._moe_experts(
+                gathered_h, self.w1[layer], self.w2[layer],
+                gathered_w, gathered_ids, self._ep_expert_map_gpu)
+            hidden = ep_reducescatter(partial, self.ep_group, self.ep_size)
+            hidden = hidden[:orig_N]
+        else:
+            expert_map = (self.expert_map[layer]
+                          if self.experts_per_layer is not None else None)
+            hidden = self._moe_experts(hidden, self.w1[layer], self.w2[layer],
+                                       topk_weights, topk_ids, expert_map)
 
         return residual + hidden
 
@@ -2173,6 +2263,37 @@ class MoEEngine:
             gate_up = F.linear(hidden, self.dense_w1[layer])
             I = self.intermediate_size
             hidden = F.linear(F.silu(gate_up[:, :I]) * gate_up[:, I:], self.dense_w2[layer])
+        elif self.ep_size > 1:
+            topk_weights, topk_ids = self._route(hidden, layer)
+            orig_N = hidden.shape[0]
+            local_N = torch.tensor([orig_N], device=self.device)
+            dist.all_reduce(local_N, op=dist.ReduceOp.MAX,
+                            group=self.ep_group)
+            max_N = int(local_N.item())
+
+            hidden_padded = hidden
+            topk_weights_padded = topk_weights
+            topk_ids_padded = topk_ids
+            if orig_N < max_N:
+                pad = max_N - orig_N
+                hidden_padded = F.pad(hidden, (0, 0, 0, pad))
+                topk_weights_padded = F.pad(topk_weights, (0, 0, 0, pad))
+                topk_ids_padded = F.pad(topk_ids, (0, 0, 0, pad))
+
+            gathered_h = ep_allgather(hidden_padded, self.ep_group, self.ep_size)
+            gathered_w = ep_allgather(topk_weights_padded, self.ep_group, self.ep_size)
+            gathered_ids = ep_allgather(
+                topk_ids_padded.to(torch.int32), self.ep_group, self.ep_size)
+            partial = self._moe_experts(
+                gathered_h, self.w1[layer], self.w2[layer],
+                gathered_w, gathered_ids, self._ep_expert_map_gpu)
+            routed = ep_reducescatter(partial, self.ep_group, self.ep_size)[:orig_N]
+
+            shared_gu = F.linear(hidden, self.shared_w1[layer])
+            shared_I = self.moe_intermediate_size * self.n_shared_experts
+            shared = F.linear(F.silu(shared_gu[:, :shared_I]) * shared_gu[:, shared_I:],
+                              self.shared_w2[layer])
+            hidden = routed + shared
         else:
             # MoE: router + fused_moe + shared experts
             topk_weights, topk_ids = self._route(hidden, layer)
@@ -2376,6 +2497,9 @@ class MoEEngine:
         if self.offloading:
             w1, w2 = self.w1_buf, self.w2_buf
             expert_map = self.expert_map_buf
+        elif self.ep_size > 1:
+            w1, w2 = self.w1[layer], self.w2[layer]
+            expert_map = self._ep_expert_map_gpu
         else:
             w1, w2 = self.w1[layer], self.w2[layer]
             expert_map = None
@@ -2413,6 +2537,20 @@ class MoEEngine:
                                            num_decode_tokens, decode_wrapper,
                                            prefill_cu_seqlens, prefill_max_seqlen)
         return hidden
+
+    def _ep_sync_graph_N(self, local_graph_N):
+        """Sync graph_N to max across EP ranks."""
+        buf = torch.tensor([local_graph_N], dtype=torch.int64,
+                           device=self.device)
+        dist.all_reduce(buf, op=dist.ReduceOp.MAX, group=self.ep_group)
+        synced = int(buf.item())
+        if synced != local_graph_N:
+            synced = self._find_nearest_piecewise_graph(synced)
+            if synced is None:
+                raise RuntimeError(
+                    f"EP sync requires graph_N>={buf.item()} but largest "
+                    f"captured is {max(self._piecewise_graphs.keys())}")
+        return synced
 
     @torch.no_grad()
     def step(self, decode_seq_ids, decode_token_ids,
@@ -2475,6 +2613,18 @@ class MoEEngine:
 
         # ── Auto-dispatch to piecewise graphs if available ──
         graph_N = self._find_nearest_piecewise_graph(N_total)
+        if self.ep_size > 1:
+            has_graph = torch.tensor(
+                [0 if graph_N is None else 1],
+                dtype=torch.int32, device=self.device)
+            dist.all_reduce(has_graph, op=dist.ReduceOp.MIN,
+                            group=self.ep_group)
+            if has_graph.item() == 0:
+                raise RuntimeError(
+                    "EP requires all ranks to have a valid graph_N. "
+                    f"Local N_total={N_total}, graph_N={graph_N}. "
+                    "Capture larger graphs.")
+            graph_N = self._ep_sync_graph_N(graph_N)
         if graph_N is not None:
             return self._step_piecewise(
                 decode_seq_ids, decode_token_ids,
@@ -3002,6 +3152,21 @@ class MoEEngine:
                 # Single-GPU path (original)
                 bufs = self._create_intermediate_buffers(N, self.device)
 
+                # EP: pre-allocate dispatch/combine buffers
+                if self.ep_size > 1:
+                    bufs['ep_gathered_hidden'] = torch.zeros(
+                        N * self.ep_size, self.hidden_size,
+                        dtype=self.dtype, device=self.device)
+                    bufs['ep_gathered_weights'] = torch.zeros(
+                        N * self.ep_size, self.top_k,
+                        dtype=torch.float32, device=self.device)
+                    bufs['ep_gathered_ids'] = torch.zeros(
+                        N * self.ep_size, self.top_k,
+                        dtype=torch.int32, device=self.device)
+                    bufs['ep_combined_out'] = torch.zeros(
+                        N, self.hidden_size,
+                        dtype=self.dtype, device=self.device)
+
                 # Allocate logits_buf for final graph (outside bufs dict)
                 logits_buf = None
                 if N <= _MAX_FINAL_GRAPH_N:
@@ -3085,15 +3250,21 @@ class MoEEngine:
                         self.expert_map_buf.copy_(
                             self.expert_map_abs[layer])
 
-                    g4b = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(g4b, pool=graph_pool,
-                                          stream=capture_stream):
-                        stage4b_fn(bufs['moe_input_buf'],
-                                   bufs['moe_residual_buf'],
-                                   bufs['topk_weights_buf'],
-                                   bufs['topk_ids_buf'],
-                                   bufs['hidden_buf'], layer)
-                    stage4b_graphs.append(g4b)
+                    _layer_is_moe = (not self.is_mla
+                                     or layer >= self.first_k_dense_replace)
+                    if self.ep_size > 1 and _layer_is_moe:
+                        # EP: stage4b runs eagerly (NCCL not capturable)
+                        stage4b_graphs.append(None)
+                    else:
+                        g4b = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(g4b, pool=graph_pool,
+                                              stream=capture_stream):
+                            stage4b_fn(bufs['moe_input_buf'],
+                                       bufs['moe_residual_buf'],
+                                       bufs['topk_weights_buf'],
+                                       bufs['topk_ids_buf'],
+                                       bufs['hidden_buf'], layer)
+                        stage4b_graphs.append(g4b)
 
                 # Capture final norm+lm_head graph
                 if logits_buf is not None:
@@ -3158,6 +3329,24 @@ class MoEEngine:
                 compile_str = " + torch.compile" if use_torch_compile else ""
                 print(f"  Piecewise CUDA graphs{compile_str} captured for "
                       f"N={N} ({n_graphs} graphs)")
+
+        # EP: validate all ranks captured identical graph sizes
+        if self.ep_size > 1:
+            local_sizes = torch.tensor(
+                sorted(self._piecewise_graphs.keys()),
+                dtype=torch.int64, device=self.device)
+            n_sizes = torch.tensor([len(local_sizes)], device=self.device)
+            all_n = [torch.empty_like(n_sizes) for _ in range(self.ep_size)]
+            dist.all_gather(all_n, n_sizes, group=self.ep_group)
+            assert all(x.item() == n_sizes.item() for x in all_n), \
+                "EP ranks captured different NUMBER of graph sizes"
+            all_sizes = [torch.empty_like(local_sizes)
+                         for _ in range(self.ep_size)]
+            dist.all_gather(all_sizes, local_sizes, group=self.ep_group)
+            for r, other in enumerate(all_sizes):
+                assert torch.equal(local_sizes, other), (
+                    f"EP rank {r} captured different graph sizes: "
+                    f"{other.tolist()} vs local {local_sizes.tolist()}")
 
     @staticmethod
     def vllm_graph_sizes(max_graph_size: int) -> list[int]:
@@ -3254,7 +3443,10 @@ class MoEEngine:
         primary_dev = self.pp_devices[0] if pp else self.device
         primary_buf = info['pp_bufs'][0] if pp else info
 
-        if P == 0 and C == 0 and D > 0:
+        if N_actual == 0:
+            # EP dummy step: zero all tokens (padding only)
+            primary_buf['static_token_ids'].zero_()
+        elif P == 0 and C == 0 and D > 0:
             # Pure decode fast path: skip torch.cat
             primary_buf['static_token_ids'][:D].copy_(
                 decode_token_ids.to(primary_dev))
@@ -3283,64 +3475,70 @@ class MoEEngine:
         # ── 2+3+4a. Positions + slot_mapping + seq_lens via Triton kernels ──
         N_reqs = D + len(prefill_seq_ids) + len(continuation_seq_ids)
 
-        # 2a. Build idx_mapping: [decode_sids | prefill_sids | cont_sids]
-        if P == 0 and C == 0 and D <= 32:
-            # Pure decode fast path: write seq_ids directly, skip numpy
-            for i, sid in enumerate(decode_seq_ids):
-                self._idx_mapping_cpu[i] = sid
+        if N_reqs == 0:
+            # EP dummy step: zero positions and slot_mapping, skip Triton
+            primary_buf['static_positions'].zero_()
+            primary_buf['static_slot_mapping'].fill_(-1)
+            self._num_computed_tokens_gpu.copy_(self._seq_lens_cpu)
         else:
-            seq_ids_all = decode_seq_ids + prefill_seq_ids + continuation_seq_ids
-            idx_np = np.array(seq_ids_all, dtype=np.int32)
-            self._idx_mapping_cpu[:N_reqs] = torch.from_numpy(idx_np)
-        self._idx_mapping_buf[:N_reqs].copy_(
-            self._idx_mapping_cpu[:N_reqs], non_blocking=True)
+            # 2a. Build idx_mapping: [decode_sids | prefill_sids | cont_sids]
+            if P == 0 and C == 0 and D <= 32:
+                # Pure decode fast path: write seq_ids directly, skip numpy
+                for i, sid in enumerate(decode_seq_ids):
+                    self._idx_mapping_cpu[i] = sid
+            else:
+                seq_ids_all = decode_seq_ids + prefill_seq_ids + continuation_seq_ids
+                idx_np = np.array(seq_ids_all, dtype=np.int32)
+                self._idx_mapping_cpu[:N_reqs] = torch.from_numpy(idx_np)
+            self._idx_mapping_buf[:N_reqs].copy_(
+                self._idx_mapping_cpu[:N_reqs], non_blocking=True)
 
-        # 2b. Build query_start_loc: prefix sum of per-request token counts
-        if P == 0 and C == 0:
-            # Pure decode fast path: each request = 1 token → qsl = arange
-            setup_qsl = self._decode_qsl_gpu[:D + 1]
-        else:
-            # Mixed batch: compute cumulative token counts via numpy
-            tokens_per_req = [1] * D + prefill_lengths + cont_lengths
-            qsl_np = np.zeros(N_reqs + 1, dtype=np.int32)
-            np.cumsum(tokens_per_req, out=qsl_np[1:])
-            self._query_start_loc_cpu[:N_reqs + 1] = torch.from_numpy(qsl_np)
-            self._query_start_loc_buf[:N_reqs + 1].copy_(
-                self._query_start_loc_cpu[:N_reqs + 1], non_blocking=True)
-            setup_qsl = self._query_start_loc_buf[:N_reqs + 1]
+            # 2b. Build query_start_loc: prefix sum of per-request token counts
+            if P == 0 and C == 0:
+                # Pure decode fast path: each request = 1 token → qsl = arange
+                setup_qsl = self._decode_qsl_gpu[:D + 1]
+            else:
+                # Mixed batch: compute cumulative token counts via numpy
+                tokens_per_req = [1] * D + prefill_lengths + cont_lengths
+                qsl_np = np.zeros(N_reqs + 1, dtype=np.int32)
+                np.cumsum(tokens_per_req, out=qsl_np[1:])
+                self._query_start_loc_cpu[:N_reqs + 1] = torch.from_numpy(qsl_np)
+                self._query_start_loc_buf[:N_reqs + 1].copy_(
+                    self._query_start_loc_cpu[:N_reqs + 1], non_blocking=True)
+                setup_qsl = self._query_start_loc_buf[:N_reqs + 1]
 
-        # Safety sync: GPU seq_lens ← CPU (belt-and-suspenders, ~1us)
-        self._num_computed_tokens_gpu.copy_(self._seq_lens_cpu)
+            # Safety sync: GPU seq_lens ← CPU (belt-and-suspenders, ~1us)
+            self._num_computed_tokens_gpu.copy_(self._seq_lens_cpu)
 
-        # 2c. Compute positions + seq_lens on GPU
-        prepare_pos_seq_lens(
-            idx_mapping=self._idx_mapping_buf[:N_reqs],
-            query_start_loc=setup_qsl,
-            num_computed_tokens=self._num_computed_tokens_gpu,
-            pos=primary_buf['static_positions'],
-            seq_lens=self._seq_lens_gpu_scratch,
-        )
-        # Zero padding positions for safety
-        if N_actual < graph_N:
-            primary_buf['static_positions'][N_actual:].zero_()
+            # 2c. Compute positions + seq_lens on GPU
+            prepare_pos_seq_lens(
+                idx_mapping=self._idx_mapping_buf[:N_reqs],
+                query_start_loc=setup_qsl,
+                num_computed_tokens=self._num_computed_tokens_gpu,
+                pos=primary_buf['static_positions'],
+                seq_lens=self._seq_lens_gpu_scratch,
+            )
+            # Zero padding positions for safety
+            if N_actual < graph_N:
+                primary_buf['static_positions'][N_actual:].zero_()
 
-        # 2d. Compute slot_mapping on GPU
-        slot_2d = primary_buf['static_slot_mapping'].unsqueeze(0)
-        _compute_slot_mappings_kernel[(1, N_reqs + 1)](
-            N_actual,
-            graph_N,  # max_num_tokens (pad slots [N_actual:] to PAD_ID)
-            self._idx_mapping_buf[:N_reqs],
-            setup_qsl,
-            primary_buf['static_positions'],
-            self._block_table_ptrs,
-            self._block_table_strides,
-            self._block_sizes_tensor,
-            slot_2d,
-            slot_2d.stride(0),
-            0,  # cp_rank (no context parallelism)
-            CP_SIZE=1, CP_INTERLEAVE=1,
-            PAD_ID=-1, TRITON_BLOCK_SIZE=1024,
-        )
+            # 2d. Compute slot_mapping on GPU
+            slot_2d = primary_buf['static_slot_mapping'].unsqueeze(0)
+            _compute_slot_mappings_kernel[(1, N_reqs + 1)](
+                N_actual,
+                graph_N,  # max_num_tokens (pad slots [N_actual:] to PAD_ID)
+                self._idx_mapping_buf[:N_reqs],
+                setup_qsl,
+                primary_buf['static_positions'],
+                self._block_table_ptrs,
+                self._block_table_strides,
+                self._block_sizes_tensor,
+                slot_2d,
+                slot_2d.stride(0),
+                0,  # cp_rank (no context parallelism)
+                CP_SIZE=1, CP_INTERLEAVE=1,
+                PAD_ID=-1, TRITON_BLOCK_SIZE=1024,
+            )
 
         # PP: replicate positions + slot_mapping to other GPUs
         if pp:
@@ -3785,9 +3983,55 @@ class MoEEngine:
             if N_actual < graph_N:
                 buf['topk_weights_buf'][N_actual:].zero_()
 
-            # Stage 4b: MoE (CUDA graph)
+            # Stage 4b: MoE
             if _nvtx: torch.cuda.nvtx.range_push("stage4b")
-            info['stage4b_graphs'][layer].replay()
+            _layer_is_moe = (not self.is_mla
+                             or layer >= self.first_k_dense_replace)
+            if self.ep_size > 1 and _layer_is_moe:
+                # EP: AllGather → local fused_experts → ReduceScatter
+                gathered_h = ep_allgather(
+                    buf['moe_input_buf'], self.ep_group, self.ep_size,
+                    out=buf['ep_gathered_hidden'])
+                gathered_w = ep_allgather(
+                    buf['topk_weights_buf'], self.ep_group, self.ep_size,
+                    out=buf['ep_gathered_weights'])
+                gathered_ids = ep_allgather(
+                    buf['topk_ids_buf'], self.ep_group, self.ep_size,
+                    out=buf['ep_gathered_ids'])
+
+                w1, w2 = self.w1[layer], self.w2[layer]
+                partial_out = self._moe_experts(
+                    gathered_h, w1, w2, gathered_w, gathered_ids,
+                    self._ep_expert_map_gpu)
+
+                combined = ep_reducescatter(
+                    partial_out, self.ep_group, self.ep_size,
+                    out=buf['ep_combined_out'])
+
+                # Shared experts (MLA only) — local compute, no dispatch
+                if self.is_mla and self.n_shared_experts > 0:
+                    shared_gate_up = F.linear(
+                        buf['moe_input_buf'][:N_actual],
+                        self.shared_w1[layer])
+                    shared_I = (self.moe_intermediate_size
+                                * self.n_shared_experts)
+                    sg = shared_gate_up[:, :shared_I]
+                    su = shared_gate_up[:, shared_I:]
+                    shared = F.linear(F.silu(sg) * su,
+                                      self.shared_w2[layer])
+                    buf['hidden_buf'][:N_actual].copy_(
+                        buf['moe_residual_buf'][:N_actual]
+                        + combined[:N_actual] + shared)
+                else:
+                    buf['hidden_buf'][:N_actual].copy_(
+                        buf['moe_residual_buf'][:N_actual]
+                        + combined[:N_actual])
+                # Zero padding region for next layer's safety
+                if N_actual < graph_N:
+                    buf['hidden_buf'][N_actual:].zero_()
+            else:
+                # Original: stage4b CUDA graph replay
+                info['stage4b_graphs'][layer].replay()
             if _nvtx: torch.cuda.nvtx.range_pop()  # stage4b
             if _pt: _pt.after_stage4b(layer)
 

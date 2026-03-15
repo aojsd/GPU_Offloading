@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 import torch
+import torch.distributed as dist
 
 
 def pages_needed(seq_len: int, page_size: int) -> int:
@@ -202,6 +203,7 @@ class Scheduler:
         self.all_step_scheduling: list[dict] = []
         self._needs_advance: bool = False
         self._pending_events: list[dict] = []
+        self.ep_size = getattr(allocator, 'ep_size', 1)
 
     @property
     def engine(self):
@@ -635,71 +637,108 @@ class Scheduler:
         self.add_requests(requests)
 
         with torch.inference_mode():
-            while not self.is_done:
-                result = self.step()
-                if result.is_empty:
-                    continue
-
-                # 1. Decode tokens
-                if result.decode_requests:
-                    decode_token_ids = torch.tensor(
-                        [r.output_token_ids[-1] for r in result.decode_requests],
-                        dtype=torch.long, device=engine.device)
+            while True:
+                if not self.is_done:
+                    result = self.step()
                 else:
-                    decode_token_ids = torch.tensor(
-                        [], dtype=torch.long, device=engine.device)
+                    result = None
 
-                # 2. Prefill tokens
-                prefill_input_ids = []
-                for req in result.prefill_requests:
-                    eff = _get_effective_prompt_gpu(req, prompts_gpu)
-                    prefill_input_ids.append(
-                        eff[req.prefill_chunk_start:
-                            req.prefill_chunk_start + req.scheduled_chunk])
+                has_work = result is not None and not result.is_empty
 
-                # 3. Continuation tokens + offsets
-                continuation_input_ids = []
-                continuation_offsets = []
-                for req in result.continuation_requests:
-                    eff = _get_effective_prompt_gpu(req, prompts_gpu)
-                    continuation_input_ids.append(
-                        eff[req.prefill_chunk_start:
-                            req.prefill_chunk_start + req.scheduled_chunk])
-                    slot = self.request_to_slot[req.request_idx]
-                    continuation_offsets.append(
-                        engine._seq_lens_cpu[slot].item())
+                if has_work:
+                    # 1. Decode tokens
+                    if result.decode_requests:
+                        decode_token_ids = torch.tensor(
+                            [r.output_token_ids[-1]
+                             for r in result.decode_requests],
+                            dtype=torch.long, device=engine.device)
+                    else:
+                        decode_token_ids = torch.tensor(
+                            [], dtype=torch.long, device=engine.device)
 
-                # 4. GPU forward pass
-                logits = engine.step(
-                    decode_seq_ids=result.decode_seq_ids,
-                    decode_token_ids=decode_token_ids,
-                    prefill_seq_ids=result.prefill_seq_ids,
-                    prefill_input_ids=prefill_input_ids,
-                    continuation_seq_ids=result.continuation_seq_ids,
-                    continuation_input_ids=continuation_input_ids,
-                    continuation_offsets=continuation_offsets,
-                )
+                    # 2. Prefill tokens
+                    prefill_input_ids = []
+                    for req in result.prefill_requests:
+                        eff = _get_effective_prompt_gpu(req, prompts_gpu)
+                        prefill_input_ids.append(
+                            eff[req.prefill_chunk_start:
+                                req.prefill_chunk_start + req.scheduled_chunk])
 
-                # 5. Extract tokens
-                next_tokens = extract_next_tokens(
-                    logits, len(result.decode_requests),
-                    result.prefill_chunk_lengths,
-                    result.continuation_chunk_lengths,
-                )
+                    # 3. Continuation tokens + offsets
+                    continuation_input_ids = []
+                    continuation_offsets = []
+                    for req in result.continuation_requests:
+                        eff = _get_effective_prompt_gpu(req, prompts_gpu)
+                        continuation_input_ids.append(
+                            eff[req.prefill_chunk_start:
+                                req.prefill_chunk_start + req.scheduled_chunk])
+                        slot = self.request_to_slot[req.request_idx]
+                        continuation_offsets.append(
+                            engine._seq_lens_cpu[slot].item())
 
-                # 5b. EOS detection — must run BEFORE advance_state so that
-                # is_complete=True is visible in Phase 1 of the NEXT step.
-                eos_id = getattr(engine, 'eos_token_id', None)
-                if eos_id is not None:
-                    batch_order = (result.decode_requests
-                                   + result.prefill_requests
-                                   + result.continuation_requests)
-                    for _i, _req in enumerate(batch_order):
-                        if _i < len(next_tokens) and next_tokens[_i] == eos_id:
-                            _req.hit_eos = True
+                    # 4. GPU forward pass
+                    logits = engine.step(
+                        decode_seq_ids=result.decode_seq_ids,
+                        decode_token_ids=decode_token_ids,
+                        prefill_seq_ids=result.prefill_seq_ids,
+                        prefill_input_ids=prefill_input_ids,
+                        continuation_seq_ids=result.continuation_seq_ids,
+                        continuation_input_ids=continuation_input_ids,
+                        continuation_offsets=continuation_offsets,
+                    )
 
-                # 6. Advance state
-                self.advance_state(result, next_tokens)
+                    # 5. Extract tokens
+                    next_tokens = extract_next_tokens(
+                        logits, len(result.decode_requests),
+                        result.prefill_chunk_lengths,
+                        result.continuation_chunk_lengths,
+                    )
+
+                    # 5b. EOS detection — must run BEFORE advance_state so
+                    # that is_complete=True is visible in Phase 1 of NEXT step
+                    eos_id = getattr(engine, 'eos_token_id', None)
+                    if eos_id is not None:
+                        batch_order = (result.decode_requests
+                                       + result.prefill_requests
+                                       + result.continuation_requests)
+                        for _i, _req in enumerate(batch_order):
+                            if (_i < len(next_tokens)
+                                    and next_tokens[_i] == eos_id):
+                                _req.hit_eos = True
+
+                    # 6. Advance state
+                    self.advance_state(result, next_tokens)
+
+                elif self.ep_size > 1:
+                    # EP: dummy engine.step() keeps NCCL collectives in sync
+                    # when this rank has no work (empty step or already done).
+                    # Detach trace recorder so dummy steps don't increment it.
+                    _saved_rec = engine.trace_recorder
+                    engine.trace_recorder = None
+                    engine.step(
+                        decode_seq_ids=[],
+                        decode_token_ids=torch.tensor(
+                            [], dtype=torch.long, device=engine.device),
+                        prefill_seq_ids=[], prefill_input_ids=[])
+                    engine.trace_recorder = _saved_rec
+
+                # EP: check termination AFTER engine.step() on all ranks.
+                # Every iteration, all ranks call engine.step() (real or
+                # dummy above), so NCCL collectives stay matched.  Then
+                # this all_reduce checks if everyone is done.
+                if self.ep_size > 1:
+                    done_flag = torch.tensor(
+                        [1 if self.is_done else 0],
+                        dtype=torch.int32, device=engine.device)
+                    dist.all_reduce(done_flag, op=dist.ReduceOp.MIN,
+                                    group=engine.ep_group)
+                    if done_flag.item() == 1:
+                        break
+                elif self.is_done:
+                    break
+
+                if not has_work:
+                    continue
 
         engine.trace_recorder = _prev_recorder
 
@@ -802,6 +841,13 @@ class Scheduler:
             def get_sched(s):
                 return scheduling[s]
 
+        # EP: sync total_steps to max across ranks
+        if self.ep_size > 1:
+            ts = torch.tensor([total_steps], dtype=torch.int64,
+                              device=engine.device)
+            dist.all_reduce(ts, op=dist.ReduceOp.MAX, group=engine.ep_group)
+            total_steps = int(ts.item())
+
         # Per-request state
         free_seq_ids = set(range(self.max_seqs))
         request_to_slot: dict[int, int] = {}
@@ -818,6 +864,18 @@ class Scheduler:
             for step in range(total_steps):
                 sched = get_sched(step)
                 if sched is None:
+                    if self.ep_size > 1:
+                        _saved = (engine.trace_recorder,
+                                  engine.replay_controller)
+                        engine.trace_recorder = None
+                        engine.replay_controller = None
+                        engine.step(
+                            decode_seq_ids=[],
+                            decode_token_ids=torch.tensor(
+                                [], dtype=torch.long, device=engine.device),
+                            prefill_seq_ids=[], prefill_input_ids=[])
+                        engine.trace_recorder, engine.replay_controller = _saved
+                        continue
                     break
 
                 # 1. Process events
@@ -906,6 +964,17 @@ class Scheduler:
                         state['decode_step'] = di + 1
 
                 if not decode_sids and not prefill_sids and not cont_sids:
+                    if self.ep_size > 1:
+                        _saved = (engine.trace_recorder,
+                                  engine.replay_controller)
+                        engine.trace_recorder = None
+                        engine.replay_controller = None
+                        engine.step(
+                            decode_seq_ids=[],
+                            decode_token_ids=torch.tensor(
+                                [], dtype=torch.long, device=engine.device),
+                            prefill_seq_ids=[], prefill_input_ids=[])
+                        engine.trace_recorder, engine.replay_controller = _saved
                     continue
 
                 decode_tensor = torch.tensor(

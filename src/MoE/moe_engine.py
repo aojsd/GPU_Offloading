@@ -62,6 +62,13 @@ if _vllm_so.exists():
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 
+# Patch moe_align_block_size to remove the 1024-expert-slot limit.
+# This replaces the CUDA kernel with our version that uses a serial scan
+# fallback for >1024 experts, enabling unified caches larger than 992 slots.
+# The CUDA extension is JIT-compiled on first import (cached in cuda/build/).
+from cuda.patch_moe_align import patch_moe_align_block_size
+patch_moe_align_block_size()
+
 
 class MoEEngine:
     """Custom MoE inference engine — FlashInfer decode + torch.compile."""

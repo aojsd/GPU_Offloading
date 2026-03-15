@@ -1,11 +1,27 @@
 #!/usr/bin/env bash
-# Phase 1: GPU-based batched trace collection for Mixtral-8x7B.
+# Phase 1: GPU-based batched trace collection.
 # Collects expert traces with continuous batching, one run per cache fraction.
-# Each fraction constrains KV budget to match single-GPU replay memory.
 #
-# Auto-detects GPU configuration:
+# ── Relationship between cache%, KV budget, and EPL ──────────────────────
+#
+#   cache_pct  ──►  expert_cache_size  ──►  KV budget  ──►  optimal EPL
+#              │                        │               │
+#              │  cache_pct determines  │  GPU memory   │  EPL is the largest
+#              │  how many expert slots  │  remaining    │  value such that the
+#              │  reside on GPU during   │  after expert │  EPL-based buffer
+#              │  Phase 3 replay.       │  cache + non- │  (L*EPL + scratchpad)
+#              │                        │  expert model │  + the KV budget still
+#              │                        │  = KV budget. │  fits on GPU.
+#
+#   The KV budget controls batching and preemption in the scheduler.
+#   Trace collection (Phase 1) must use the SAME KV budget as replay (Phase 3)
+#   so that batch compositions are identical. EPL only affects the physical
+#   expert buffer during collection — it must be large enough for inference but
+#   small enough that the buffer + KV budget fit in GPU memory together.
+#
+# ── GPU configuration ────────────────────────────────────────────────────
+#   - Single large GPU (GH200): experts-per-layer offloading, default 70-97.5%
 #   - Multi-GPU (H100):  PP=NUM_GPUS, default cache percents 60,70,80
-#   - Single large GPU (GH200): experts-per-layer offloading, default 70,80,90
 #
 # Usage:
 #   bash scripts/01_collect_traces.sh                          # auto-detect defaults
@@ -52,18 +68,8 @@ print(mem_mib // 1024)
 echo "GPU memory: ${GPU_MEM_GB} GB, ${NUM_GPUS} GPU(s)"
 
 # Select mode based on GPU configuration
-# Single large GPU (e.g. GH200 96GB): use expert offloading for collection
-# Multi-GPU (e.g. 2x H100 80GB): use pipeline parallelism
 if [ "$NUM_GPUS" -eq 1 ] && [ "$GPU_MEM_GB" -ge 90 ]; then
     MODE="offload"
-    # experts_per_layer ≈ 60% of total experts (enough for collection, leaves room for KV)
-    EPL=$(python3 -c "
-import json, os
-cfg = json.load(open(os.path.join('$MODEL', 'config.json')))
-n_exp = cfg.get('n_routed_experts') or cfg.get('num_local_experts', 8)
-print(round(n_exp * 0.6))
-")
-    echo "experts_per_layer = $EPL (60% of total)"
     DEFAULT_CACHE_PCTS="70,80,90"
 else
     MODE="pp"
@@ -74,7 +80,7 @@ fi
 CACHE_PCTS="${USER_CACHE_PCTS:-$DEFAULT_CACHE_PCTS}"
 # Convert comma-separated percents to space-separated fractions
 CACHE_FRACTIONS=$(python3 -c "print(' '.join(str(float(p)/100) for p in '${CACHE_PCTS}'.split(',')))")
-echo "Mode: ${MODE}, cache percents: ${CACHE_PCTS}, fractions: ${CACHE_FRACTIONS}"
+echo "Mode: ${MODE}, cache percents: ${CACHE_PCTS}"
 
 for frac in $CACHE_FRACTIONS; do
     pct=$(python3 -c "v=$frac*100; print(int(v) if v==int(v) else f'{v:g}')")
@@ -94,6 +100,24 @@ for frac in $CACHE_FRACTIONS; do
         --resume
     )
     if [ "$MODE" = "offload" ]; then
+        # Compute optimal EPL for this cache fraction.
+        # Flow: cache_pct → KV budget (compute_replay_kv_budget) → optimal EPL.
+        # See collect_batched_traces.py:compute_optimal_epl for details.
+        EPL=$(python3 -c "
+import json, os, sys
+sys.path.insert(0, '.')
+from trace_construction.collect_batched_traces import (
+    compute_replay_kv_budget, compute_optimal_epl)
+cfg = json.load(open(os.path.join('$MODEL', 'config.json')))
+page_size = 64 if cfg.get('kv_lora_rank') is not None else 16
+mem = compute_replay_kv_budget(
+    os.path.join('$MODEL', 'config.json'),
+    cache_fraction=$frac, page_size=page_size,
+    gpu_memory_gb=$GPU_MEM_GB,
+)
+print(compute_optimal_epl(mem))
+")
+        echo "  cache ${pct}%: experts_per_layer=$EPL (derived from KV budget)"
         COLLECT_ARGS+=(--experts-per-layer "$EPL")
     else
         COLLECT_ARGS+=(--pp "$NUM_GPUS")

@@ -67,6 +67,35 @@ python scripts/run_all_policies.py --cache-pct 85
 
 | Script | Phase | Description |
 |--------|-------|-------------|
-| `01_collect_traces.sh` | 1 | GPU-based batched trace collection per cache fraction (GPU, PP=N) |
+| `full_pipeline.sh` | 1→3 | Runs all three phases for given `--cache-pct` values |
+| `01_collect_traces.sh` | 1 | GPU-based batched trace collection per cache fraction |
 | `02_policy_simulate.sh` | 2 | Run all policy simulations via `run_all_policies.py --parallel` (CPU) |
 | `03_gpu_replay.sh` | 3 | Dispatch GPU replay jobs across GPUs via `batched_replay.py` |
+
+### Memory model: cache% → KV budget → EPL
+
+The three-phase pipeline simulates expert offloading at different expert cache
+fractions.  The cache fraction determines the GPU memory layout during replay:
+
+```
+cache_pct  ──►  expert_cache_slots  ──►  KV page budget  ──►  optimal EPL
+           │                         │                    │
+           │  cache_pct × total      │  GPU memory left   │  Largest EPL such
+           │  routed experts =       │  after expert      │  that (L × EPL +
+           │  expert slots on GPU    │  cache + non-      │  scratchpad) expert
+           │  during Phase 3 replay. │  expert model +    │  buffer + KV budget
+           │                         │  graphs + overhead │  fits in GPU memory.
+```
+
+**Why this matters:** The KV page budget drives the continuous-batching
+scheduler's admission, preemption, and batch composition.  Phase 1 must use the
+*same* KV budget as Phase 3 so that traces capture identical batching patterns.
+
+**EPL (experts_per_layer)** is only used during Phase 1 trace collection, where
+the model runs with expert offloading.  It determines the physical expert buffer
+size (`num_layers × EPL + num_experts` scratchpad slots).  EPL does NOT affect
+the KV budget — it is derived FROM the KV budget to maximize cached experts
+while leaving enough GPU memory for the KV allocation.
+
+Both `compute_replay_kv_budget()` and `compute_optimal_epl()` live in
+`trace_construction/collect_batched_traces.py`.

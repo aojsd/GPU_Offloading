@@ -122,17 +122,24 @@ def compute_replay_kv_budget(
 ) -> dict:
     """Compute KV page budget for single-GPU replay with expert offloading.
 
-    Memory model: GPU = non_expert_model + expert_cache + graphs + KV + overhead.
-    KV gets whatever remains after the other components.
+    This models the **replay** (Phase 3) memory layout, where the expert cache
+    holds cache_fraction * total_experts slots on GPU.  The KV budget is whatever
+    GPU memory remains after expert cache + non-expert model + graphs + overhead.
+
+    Trace collection (Phase 1) must use the SAME KV budget so that its batching
+    and preemption patterns match replay exactly.  The experts_per_layer (EPL)
+    value used during collection is a separate concern: it must be large enough
+    that the EPL-based expert buffer + this KV budget both fit in GPU memory.
+    See 01_collect_traces.sh for the EPL derivation.
 
     Args:
         model_config_path: Path to model's config.json.
-        cache_fraction: Fraction of total experts to keep in GPU cache (0-1).
-        page_size: KV cache page size in tokens.
-        gpu_memory_gb: Total GPU memory (default: 80 for H100).
+        cache_fraction: Fraction of total routed experts kept on GPU during
+            replay (0-1).  Determines both expert cache size and KV budget.
+        page_size: KV cache page size in tokens (64 for FlashMLA, 16 otherwise).
+        gpu_memory_gb: Total GPU memory.
         overhead_gb: Fixed overhead for CUDA context, activations, etc.
         graph_sizes: CUDA graph sizes for replay (default: GRAPH_SIZES).
-            Used to estimate graph memory overhead.
         dtype_bytes: Bytes per parameter (2 for BF16).
 
     Returns:
@@ -163,31 +170,69 @@ def compute_replay_kv_budget(
     expert_params = 2 * expert_I * hidden_size + hidden_size * expert_I
     expert_bytes = expert_params * dtype_bytes
 
-    # Non-expert model: attention (Q/K/V/O proj) + norms + router + embeddings
-    per_layer_attn = (
-        (hidden_size * hidden_size) +                      # Q proj
-        (hidden_size * num_kv_heads * head_dim) +          # K proj
-        (hidden_size * num_kv_heads * head_dim) +          # V proj
-        (hidden_size * hidden_size) +                      # O proj
-        hidden_size * 2 +                                  # 2 RMS norms
-        num_experts * hidden_size                           # router
-    )
+    # Non-expert model: attention + norms + router + shared experts + embeddings
+    q_lora_rank = cfg.get('q_lora_rank')
+    kv_lora_rank = cfg.get('kv_lora_rank')
+    if q_lora_rank is not None and kv_lora_rank is not None:
+        # MLA (Multi-head Latent Attention) — DeepSeek-V2 style
+        qk_nope_head_dim = cfg.get('qk_nope_head_dim', 128)
+        qk_rope_head_dim = cfg.get('qk_rope_head_dim', 64)
+        v_head_dim = cfg.get('v_head_dim', 128)
+        per_layer_attn = (
+            hidden_size * q_lora_rank +                                     # q_a_proj
+            q_lora_rank +                                                   # q_a_layernorm
+            q_lora_rank * num_heads * (qk_nope_head_dim + qk_rope_head_dim) +  # q_b_proj
+            hidden_size * (kv_lora_rank + qk_rope_head_dim) +              # kv_a_proj_with_mqa
+            kv_lora_rank +                                                  # kv_a_layernorm
+            kv_lora_rank * num_heads * (qk_nope_head_dim + v_head_dim) +   # kv_b_proj
+            num_heads * v_head_dim * hidden_size                            # o_proj
+        )
+    else:
+        # Standard MHA / GQA — Mixtral/OLMoE style
+        per_layer_attn = (
+            (hidden_size * hidden_size) +                      # Q proj
+            (hidden_size * num_kv_heads * head_dim) +          # K proj
+            (hidden_size * num_kv_heads * head_dim) +          # V proj
+            (hidden_size * hidden_size) +                      # O proj
+            0
+        )
+    per_layer_attn += hidden_size * 2        # 2 RMS norms
+
+    # Router weights (only on MoE layers)
+    router_params = num_experts * hidden_size * num_moe_layers
+
+    # Dense MLP for non-MoE layers (e.g. first_k_dense_replace layers)
+    dense_I = cfg.get('intermediate_size', hidden_size * 4)
+    dense_mlp_params = first_k * 3 * dense_I * hidden_size  # gate + up + down
+
+    # Shared experts (always-on experts in MoE layers, not offloaded)
+    n_shared = cfg.get('n_shared_experts', 0)
+    shared_expert_params = num_moe_layers * n_shared * (3 * expert_I * hidden_size)
+
     non_expert_params = (
         per_layer_attn * num_layers +
+        router_params +
+        dense_mlp_params +
+        shared_expert_params +
         vocab_size * hidden_size +          # embed_tokens
         vocab_size * hidden_size +          # lm_head (conservative)
         hidden_size                         # final norm
     )
     non_expert_bytes = non_expert_params * dtype_bytes
 
-    # Expert cache (fraction applies to routed experts only)
+    # Expert cache: cache_fraction * total_experts slots on GPU during replay.
     cache_size = int(total_experts * cache_fraction)
     cache_bytes = cache_size * expert_bytes
 
-    # Graph overhead estimate
+    # Graph + capture overhead.  Measured on GH200 with DeepSeek-V2:
+    #   graph pool (private):     ~870 MiB
+    #   peak transient capture:  ~2.2 GiB total (shared pool, reused across sizes)
+    #   permanent after capture: ~2.0 GiB
+    # The graph pool shares memory across all sizes (piecewise capture), so
+    # total ≈ peak-single-size, NOT sum-of-all-sizes.
     if graph_sizes is None:
         graph_sizes = list(GRAPH_SIZES)
-    graph_overhead_bytes = len(graph_sizes) * 200 * 1024 ** 2  # ~200 MB per size
+    graph_overhead_bytes = int(2.5 * 1024 ** 3)  # 2.5 GiB covers pool + transient peak
 
     # KV per page per layer: use MLA formula when kv_lora_rank present
     kv_lora_rank = cfg.get('kv_lora_rank')
@@ -218,8 +263,54 @@ def compute_replay_kv_budget(
         'available_for_kv_gb': round(available_for_kv / 1024**3, 2),
         'kv_page_budget': kv_page_budget,
         'kv_capacity_tokens': kv_page_budget * page_size,
+        'kv_bytes_total': available_for_kv if available_for_kv > 0 else 0,
+        'expert_bytes_per_slot': expert_bytes,
+        'num_layers': num_layers,
+        'num_experts': num_experts,
         'page_size': page_size,
     }
+
+
+def compute_optimal_epl(mem: dict) -> int:
+    """Derive optimal experts_per_layer for trace collection from a replay budget.
+
+    Flow: cache_pct → KV budget (via compute_replay_kv_budget) → optimal EPL.
+
+    During trace collection, the GPU must fit:
+      (1) non-expert model weights  (fixed)
+      (2) EPL-based expert buffer   (L * EPL + num_experts scratchpad)
+      (3) KV cache                  (must match replay budget exactly)
+      (4) CUDA graphs + overhead    (fixed)
+
+    EPL is maximized subject to (1)+(2)+(3)+(4) ≤ GPU memory.  A higher EPL
+    means fewer on-demand expert loads during collection, but the KV budget
+    (which drives batching) is determined by the replay scenario, not EPL.
+
+    Args:
+        mem: Dict returned by compute_replay_kv_budget.
+
+    Returns:
+        Optimal experts_per_layer (minimum 4).
+    """
+    gpu_bytes = int(mem['gpu_memory_gb'] * 1024 ** 3)
+    non_expert_bytes = int(mem['non_expert_model_gb'] * 1024 ** 3)
+    kv_bytes = mem['kv_bytes_total']
+    graph_bytes = int(mem['graph_overhead_gb'] * 1024 ** 3)
+    overhead_bytes = int(mem['overhead_gb'] * 1024 ** 3)
+    expert_bytes = mem['expert_bytes_per_slot']
+    num_layers = mem['num_layers']
+    num_experts = mem['num_experts']
+
+    # GPU memory available for the EPL expert buffer
+    epl_budget = gpu_bytes - non_expert_bytes - kv_bytes - graph_bytes - overhead_bytes
+    max_slots = max(0, int(epl_budget / expert_bytes))
+    # Buffer layout: num_layers * epl + num_experts (scratchpad)
+    epl = (max_slots - num_experts) // num_layers
+
+    # No kernel cap — moe_align_block_size is patched to remove the 1024
+    # thread limit (see cuda/patch_moe_align.py, imported by moe_engine.py).
+
+    return max(4, epl)
 
 
 # ---------------------------------------------------------------------------
@@ -282,12 +373,13 @@ def main():
     import moe_engine as _moe_engine_mod  # noqa: F401
     from moe_engine import MoEEngine
     from transformers import AutoTokenizer
-    page_size = 16
-
     # Read model config
     model_config_path = str(Path(args.model) / "config.json")
     with open(model_config_path) as f:
         cfg = json.load(f)
+
+    # FlashMLA requires page_size=64; standard attention uses 16
+    page_size = 64 if cfg.get('kv_lora_rank') is not None else 16
     num_experts = (cfg.get("n_routed_experts") or cfg.get("num_experts")
                    or cfg.get("num_local_experts"))
     num_layers = cfg["num_hidden_layers"]
@@ -302,7 +394,9 @@ def main():
     mode_str = f"epl={epl}" if epl is not None else f"pp={pp_size}"
     print(f"Model: {model_name} ({num_layers}L, {num_experts}E, top-{top_k}, {mode_str})")
 
-    # Compute KV budget for single-GPU replay scenario
+    # Compute KV budget for the replay scenario at this cache fraction.
+    # This determines the KV budget that trace collection must match so that
+    # batching/preemption patterns are identical during Phase 3 replay.
     mem = compute_replay_kv_budget(
         model_config_path,
         cache_fraction=args.cache_fraction,

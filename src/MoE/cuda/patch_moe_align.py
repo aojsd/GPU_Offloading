@@ -29,10 +29,27 @@ def _build_extension():
     build_dir = os.path.join(cuda_dir, "build")
     os.makedirs(build_dir, exist_ok=True)
 
+    # ATen headers include cusparse.h, cublas_v2.h, etc. which live inside
+    # nvidia pip packages, not in /usr/local/cuda/include.  Discover all
+    # nvidia/*/include dirs so the compiler can find them.
+    nvidia_inc = []
+    try:
+        import nvidia
+        nv_root = os.path.dirname(nvidia.__path__[0])
+        nv_pkg = os.path.join(nv_root, "nvidia")
+        if os.path.isdir(nv_pkg):
+            for entry in os.listdir(nv_pkg):
+                inc = os.path.join(nv_pkg, entry, "include")
+                if os.path.isdir(inc):
+                    nvidia_inc.append(inc)
+    except ImportError:
+        pass
+
     ext = load(
         name="moe_align_ext",
         sources=[src],
         extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr", "-w"],
+        extra_include_paths=nvidia_inc,
         build_directory=build_dir,
         verbose=False,
     )
